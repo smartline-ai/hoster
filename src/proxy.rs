@@ -1,13 +1,13 @@
 use std::convert::Infallible;
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
-use hyper::header::{HeaderValue, CONNECTION, HOST, UPGRADE};
+use hyper::header::{CONNECTION, HOST, HeaderValue, UPGRADE};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
@@ -46,7 +46,10 @@ fn is_upgrade_request(req: &Request<Incoming>) -> bool {
         .headers()
         .get(CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+        .map(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        })
         .unwrap_or(false);
 
     connection_has_upgrade && req.headers().contains_key(UPGRADE)
@@ -167,7 +170,8 @@ pub async fn handle(
         // Both sides finish upgrading only after the 101 below is written, so
         // this waits off to the side.
         tokio::spawn(async move {
-            let (client_io, upstream_io) = match tokio::try_join!(client_upgrade, upstream_upgrade) {
+            let (client_io, upstream_io) = match tokio::try_join!(client_upgrade, upstream_upgrade)
+            {
                 Ok(pair) => pair,
                 Err(e) => {
                     tracing::debug!(error = %e, "upgrade failed");
@@ -178,9 +182,7 @@ pub async fn handle(
             let mut upstream_io = TokioIo::new(upstream_io);
             // From here it is opaque bytes in both directions until someone
             // hangs up. Errors are routine (tab closed) — log at debug.
-            if let Err(e) =
-                tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
-            {
+            if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await {
                 tracing::debug!(error = %e, "tunnel closed");
             }
         });

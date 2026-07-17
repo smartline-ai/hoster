@@ -99,7 +99,7 @@ pub async fn spawn_ws_upstream() -> SocketAddr {
                     if msg.is_text() {
                         let reply = format!("echo: {}", msg.into_text().unwrap());
                         if ws
-                            .send(tokio_tungstenite::tungstenite::Message::Text(reply.into()))
+                            .send(tokio_tungstenite::tungstenite::Message::Text(reply))
                             .await
                             .is_err()
                         {

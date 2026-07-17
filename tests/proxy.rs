@@ -24,7 +24,10 @@ async fn proxies_to_the_upstream_for_a_known_host() {
     let mut table = RoutingTable::new();
     table.insert(
         "backend-branch1.dev.example.com",
-        Route { upstream: upstream.addr, state: RouteState::Ready },
+        Route {
+            upstream: upstream.addr,
+            state: RouteState::Ready,
+        },
     );
     let base = spawn_proxy(SharedRoutes::new(table)).await;
 
@@ -51,11 +54,17 @@ async fn two_hosts_on_the_same_upstream_port_reach_different_branches() {
     let mut table = RoutingTable::new();
     table.insert(
         "backend-branch1.dev.example.com",
-        Route { upstream: branch1.addr, state: RouteState::Ready },
+        Route {
+            upstream: branch1.addr,
+            state: RouteState::Ready,
+        },
     );
     table.insert(
         "backend-branch2.dev.example.com",
-        Route { upstream: branch2.addr, state: RouteState::Ready },
+        Route {
+            upstream: branch2.addr,
+            state: RouteState::Ready,
+        },
     );
     let base = spawn_proxy(SharedRoutes::new(table)).await;
 
@@ -88,7 +97,10 @@ async fn preserves_the_original_host_header() {
     let mut table = RoutingTable::new();
     table.insert(
         "backend-branch1.dev.example.com",
-        Route { upstream: upstream.addr, state: RouteState::Ready },
+        Route {
+            upstream: upstream.addr,
+            state: RouteState::Ready,
+        },
     );
     let base = spawn_proxy(SharedRoutes::new(table)).await;
 
@@ -100,8 +112,14 @@ async fn preserves_the_original_host_header() {
         .unwrap();
 
     let seen = upstream.seen.lock().unwrap().clone();
-    assert_eq!(seen.host.as_deref(), Some("backend-branch1.dev.example.com"));
-    assert_eq!(seen.forwarded_host.as_deref(), Some("backend-branch1.dev.example.com"));
+    assert_eq!(
+        seen.host.as_deref(),
+        Some("backend-branch1.dev.example.com")
+    );
+    assert_eq!(
+        seen.forwarded_host.as_deref(),
+        Some("backend-branch1.dev.example.com")
+    );
     assert_eq!(seen.forwarded_proto.as_deref(), Some("http"));
 }
 
@@ -125,7 +143,10 @@ async fn starting_route_is_503() {
     let mut table = RoutingTable::new();
     table.insert(
         "backend-branch1.dev.example.com",
-        Route { upstream: upstream.addr, state: RouteState::Starting },
+        Route {
+            upstream: upstream.addr,
+            state: RouteState::Starting,
+        },
     );
     let base = spawn_proxy(SharedRoutes::new(table)).await;
 
@@ -150,7 +171,10 @@ async fn dead_upstream_is_502() {
     let mut table = RoutingTable::new();
     table.insert(
         "backend-branch1.dev.example.com",
-        Route { upstream: dead_addr, state: RouteState::Ready },
+        Route {
+            upstream: dead_addr,
+            state: RouteState::Ready,
+        },
     );
     let base = spawn_proxy(SharedRoutes::new(table)).await;
 
@@ -172,7 +196,10 @@ async fn swapping_the_table_changes_routing_without_restart() {
     let mut table = RoutingTable::new();
     table.insert(
         "backend-branch1.dev.example.com",
-        Route { upstream: first.addr, state: RouteState::Ready },
+        Route {
+            upstream: first.addr,
+            state: RouteState::Ready,
+        },
     );
     let routes = SharedRoutes::new(table);
     let base = spawn_proxy(routes.clone()).await;
@@ -191,7 +218,10 @@ async fn swapping_the_table_changes_routing_without_restart() {
     let mut next = RoutingTable::new();
     next.insert(
         "backend-branch1.dev.example.com",
-        Route { upstream: second.addr, state: RouteState::Ready },
+        Route {
+            upstream: second.addr,
+            state: RouteState::Ready,
+        },
     );
     routes.swap(next);
 

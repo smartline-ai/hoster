@@ -31,7 +31,9 @@ pub struct RoutingTable {
 
 impl RoutingTable {
     pub fn new() -> Self {
-        Self { routes: HashMap::new() }
+        Self {
+            routes: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, host: impl Into<String>, route: Route) {
@@ -102,38 +104,56 @@ mod tests {
 
     #[test]
     fn normalizes_case() {
-        assert_eq!(normalize_host("Backend-Foo.Dev.Example.Com"), "backend-foo.dev.example.com");
+        assert_eq!(
+            normalize_host("Backend-Foo.Dev.Example.Com"),
+            "backend-foo.dev.example.com"
+        );
     }
 
     #[test]
     fn normalizes_strips_port() {
-        assert_eq!(normalize_host("backend-foo.dev.example.com:443"), "backend-foo.dev.example.com");
+        assert_eq!(
+            normalize_host("backend-foo.dev.example.com:443"),
+            "backend-foo.dev.example.com"
+        );
     }
 
     #[test]
     fn normalizes_strips_trailing_dot() {
-        assert_eq!(normalize_host("backend-foo.dev.example.com."), "backend-foo.dev.example.com");
+        assert_eq!(
+            normalize_host("backend-foo.dev.example.com."),
+            "backend-foo.dev.example.com"
+        );
     }
 
     #[test]
     fn lookup_finds_inserted_route() {
         let mut table = RoutingTable::new();
         table.insert("backend-foo.dev.example.com", route(8080));
-        assert_eq!(table.lookup("backend-foo.dev.example.com"), Some(&route(8080)));
+        assert_eq!(
+            table.lookup("backend-foo.dev.example.com"),
+            Some(&route(8080))
+        );
     }
 
     #[test]
     fn lookup_normalizes_the_query() {
         let mut table = RoutingTable::new();
         table.insert("backend-foo.dev.example.com", route(8080));
-        assert_eq!(table.lookup("Backend-Foo.dev.example.com:443"), Some(&route(8080)));
+        assert_eq!(
+            table.lookup("Backend-Foo.dev.example.com:443"),
+            Some(&route(8080))
+        );
     }
 
     #[test]
     fn lookup_normalizes_the_insert() {
         let mut table = RoutingTable::new();
         table.insert("Backend-Foo.Dev.Example.Com.", route(8080));
-        assert_eq!(table.lookup("backend-foo.dev.example.com"), Some(&route(8080)));
+        assert_eq!(
+            table.lookup("backend-foo.dev.example.com"),
+            Some(&route(8080))
+        );
     }
 
     #[test]
@@ -148,8 +168,22 @@ mod tests {
         let mut table = RoutingTable::new();
         table.insert("backend-branch1.dev.example.com", route(8080));
         table.insert("backend-branch2.dev.example.com", route(8080));
-        assert_eq!(table.lookup("backend-branch1.dev.example.com").unwrap().upstream.port(), 8080);
-        assert_eq!(table.lookup("backend-branch2.dev.example.com").unwrap().upstream.port(), 8080);
+        assert_eq!(
+            table
+                .lookup("backend-branch1.dev.example.com")
+                .unwrap()
+                .upstream
+                .port(),
+            8080
+        );
+        assert_eq!(
+            table
+                .lookup("backend-branch2.dev.example.com")
+                .unwrap()
+                .upstream
+                .port(),
+            8080
+        );
         assert_eq!(table.len(), 2);
     }
 
