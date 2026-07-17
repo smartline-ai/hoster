@@ -29,6 +29,14 @@ pub struct DeployAccepted {
     pub urls: BTreeMap<String, String>,
 }
 
+/// One branch's deployment status and URLs, as reported by the control API.
+#[derive(serde::Serialize)]
+pub struct DeploymentInfo {
+    pub branch: String,
+    pub status: String,
+    pub urls: BTreeMap<String, String>,
+}
+
 /// Injectable readiness probe so tests need no real sockets.
 #[async_trait]
 pub trait ReadinessChecker: Send + Sync {
@@ -57,6 +65,7 @@ pub struct Engine<R: ContainerRuntime> {
     settings: Arc<Settings>,
     readiness: Arc<dyn ReadinessChecker>,
     status: Mutex<BTreeMap<String, DeployStatus>>,
+    urls: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
 }
 
 impl<R: ContainerRuntime> Engine<R> {
@@ -81,6 +90,7 @@ impl<R: ContainerRuntime> Engine<R> {
             settings,
             readiness,
             status: Mutex::new(BTreeMap::new()),
+            urls: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -153,6 +163,10 @@ impl<R: ContainerRuntime> Engine<R> {
         self.routes.swap(labels::routes_from_containers(&full));
 
         self.set_status(&branch, DeployStatus::Running);
+        self.urls
+            .lock()
+            .unwrap()
+            .insert(branch.clone(), urls.clone());
         Ok(DeployAccepted { branch, urls })
     }
 
@@ -232,7 +246,43 @@ impl<R: ContainerRuntime> Engine<R> {
     pub async fn teardown(&self, branch: &str) -> anyhow::Result<()> {
         self.remove_branch_resources(branch).await?;
         self.status.lock().unwrap().remove(&sanitize_branch(branch));
+        self.urls.lock().unwrap().remove(&sanitize_branch(branch));
         Ok(())
+    }
+
+    /// Compute the URLs a deploy of `req` would produce, without touching any
+    /// runtime state. Used by the control API to answer synchronously while
+    /// the actual deploy runs in the background.
+    pub fn plan_urls(&self, req: &DeployRequest) -> BTreeMap<String, String> {
+        let branch = sanitize_branch(&req.branch);
+        let mut urls = BTreeMap::new();
+        for (name, svc) in &req.config.services {
+            if let Some(exp) = &svc.expose {
+                let sub = exp.subdomain.clone().unwrap_or_else(|| name.clone());
+                let host = hostname_for(&self.settings.hostname_template, &sub, &branch);
+                urls.insert(name.clone(), format!("http://{host}"));
+            }
+        }
+        urls
+    }
+
+    /// Snapshot of every known branch's status and computed URLs, for the
+    /// control API's `GET /deployments`.
+    pub fn deployments(&self) -> Vec<DeploymentInfo> {
+        let status = self.status.lock().unwrap();
+        let urls = self.urls.lock().unwrap();
+        status
+            .iter()
+            .map(|(branch, st)| DeploymentInfo {
+                branch: branch.clone(),
+                status: match st {
+                    DeployStatus::Provisioning => "provisioning".into(),
+                    DeployStatus::Running => "running".into(),
+                    DeployStatus::Failed(m) => format!("failed: {m}"),
+                },
+                urls: urls.get(branch).cloned().unwrap_or_default(),
+            })
+            .collect()
     }
 
     pub async fn reconcile(&self) -> anyhow::Result<()> {
