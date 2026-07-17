@@ -1,4 +1,5 @@
 pub mod config;
+pub mod docker;
 pub mod engine;
 pub mod labels;
 pub mod proxy;
