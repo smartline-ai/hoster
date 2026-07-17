@@ -116,49 +116,26 @@ impl<R: ContainerRuntime> Engine<R> {
 
         let network = format!("hoster-{branch}");
 
-        // 2. full-replace teardown, then network
-        if let Err(e) = self.teardown(&branch).await {
-            tracing::warn!(%branch, error = %e, "teardown before deploy failed");
+        // 2. full-replace cleanup (resources only — must not clobber the
+        // Provisioning status just set above; that's the bug this fix closes).
+        if let Err(e) = self.remove_branch_resources(&branch).await {
+            tracing::warn!(%branch, error = %e, "resource cleanup before deploy failed");
         }
-        self.runtime
-            .create_network(&network, &branch_label(&branch))
-            .await?;
 
-        // 3. run each service
-        let mut exposed: Vec<(RunningContainer, u16, Option<String>)> = Vec::new();
-        for (name, svc) in &req.config.services {
-            let image = substitute(&svc.image, &vars).map_err(|m| anyhow::anyhow!(m))?;
-            let mut env = Vec::new();
-            for (k, v) in &svc.env {
-                env.push(format!(
-                    "{k}={}",
-                    substitute(v, &vars).map_err(|m| anyhow::anyhow!(m))?
-                ));
+        // 3. create network, then pull+run every service. Any failure here
+        // (e.g. partway through the service loop) must not leave orphaned
+        // resources or a stuck Provisioning status.
+        let exposed = match self
+            .create_and_run_services(&branch, &network, &vars, &req.config.services)
+            .await
+        {
+            Ok(exposed) => exposed,
+            Err(e) => {
+                self.set_status(&branch, DeployStatus::Failed(e.to_string()));
+                let _ = self.remove_branch_resources(&branch).await;
+                return Err(e);
             }
-            let mut labels = branch_label(&branch);
-            labels.insert(labels::SERVICE.to_string(), name.clone());
-            if let Some(exp) = &svc.expose {
-                let sub = exp.subdomain.clone().unwrap_or_else(|| name.clone());
-                labels.insert(labels::PORT.to_string(), exp.port.to_string());
-                labels.insert(
-                    labels::HOSTNAME.to_string(),
-                    hostname_for(&self.settings.hostname_template, &sub, &branch),
-                );
-            }
-            self.runtime.pull_image(&image).await?;
-            let spec = ContainerSpec {
-                name: format!("{branch}-{name}"),
-                image,
-                env,
-                network: network.clone(),
-                network_alias: name.clone(),
-                labels,
-            };
-            let c = self.runtime.run(&spec).await?;
-            if let Some(exp) = &svc.expose {
-                exposed.push((c, exp.port, exp.health.clone()));
-            }
-        }
+        };
 
         // 4. readiness gate
         for (c, port, health) in &exposed {
@@ -166,7 +143,7 @@ impl<R: ContainerRuntime> Engine<R> {
             if !self.readiness.ready(&ip, *port, health.as_deref()).await {
                 let msg = format!("service {} did not become ready", c.name);
                 self.set_status(&branch, DeployStatus::Failed(msg.clone()));
-                let _ = self.teardown(&branch).await;
+                let _ = self.remove_branch_resources(&branch).await;
                 anyhow::bail!(msg);
             }
         }
@@ -179,7 +156,62 @@ impl<R: ContainerRuntime> Engine<R> {
         Ok(DeployAccepted { branch, urls })
     }
 
-    pub async fn teardown(&self, branch: &str) -> anyhow::Result<()> {
+    /// Create the branch network and run every configured service, returning
+    /// the exposed containers for the readiness gate. Pure resource
+    /// provisioning — no status mutation, so callers decide how to react to
+    /// failure (see `deploy`'s Failed-status + cleanup handling).
+    async fn create_and_run_services(
+        &self,
+        branch: &str,
+        network: &str,
+        vars: &TemplateVars,
+        services: &BTreeMap<String, config::Service>,
+    ) -> anyhow::Result<Vec<(RunningContainer, u16, Option<String>)>> {
+        self.runtime
+            .create_network(network, &branch_label(branch))
+            .await?;
+
+        let mut exposed: Vec<(RunningContainer, u16, Option<String>)> = Vec::new();
+        for (name, svc) in services {
+            let image = substitute(&svc.image, vars).map_err(|m| anyhow::anyhow!(m))?;
+            let mut env = Vec::new();
+            for (k, v) in &svc.env {
+                env.push(format!(
+                    "{k}={}",
+                    substitute(v, vars).map_err(|m| anyhow::anyhow!(m))?
+                ));
+            }
+            let mut labels = branch_label(branch);
+            labels.insert(labels::SERVICE.to_string(), name.clone());
+            if let Some(exp) = &svc.expose {
+                let sub = exp.subdomain.clone().unwrap_or_else(|| name.clone());
+                labels.insert(labels::PORT.to_string(), exp.port.to_string());
+                labels.insert(
+                    labels::HOSTNAME.to_string(),
+                    hostname_for(&self.settings.hostname_template, &sub, branch),
+                );
+            }
+            self.runtime.pull_image(&image).await?;
+            let spec = ContainerSpec {
+                name: format!("{branch}-{name}"),
+                image,
+                env,
+                network: network.to_string(),
+                network_alias: name.clone(),
+                labels,
+            };
+            let c = self.runtime.run(&spec).await?;
+            if let Some(exp) = &svc.expose {
+                exposed.push((c, exp.port, exp.health.clone()));
+            }
+        }
+        Ok(exposed)
+    }
+
+    /// Resource cleanup + route rebuild only — no status mutation. Used by
+    /// `deploy`'s internal pre-create and failure-path cleanup so it doesn't
+    /// erase the `Provisioning`/`Failed` status it just set.
+    async fn remove_branch_resources(&self, branch: &str) -> anyhow::Result<()> {
         let branch = sanitize_branch(branch);
         let all = self.runtime.list_by_label(labels::BRANCH).await?;
         for c in all
@@ -192,9 +224,14 @@ impl<R: ContainerRuntime> Engine<R> {
             .runtime
             .remove_network(&format!("hoster-{branch}"))
             .await;
-        self.status.lock().unwrap().remove(&branch);
         let remaining = self.runtime.list_by_label(labels::BRANCH).await?;
         self.routes.swap(labels::routes_from_containers(&remaining));
+        Ok(())
+    }
+
+    pub async fn teardown(&self, branch: &str) -> anyhow::Result<()> {
+        self.remove_branch_resources(branch).await?;
+        self.status.lock().unwrap().remove(&sanitize_branch(branch));
         Ok(())
     }
 
@@ -342,6 +379,37 @@ mod tests {
         let r = eng.deploy(request("b1", TWO_SERVICE)).await;
         assert!(r.is_err());
         assert!(routes.load().is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_is_running_after_success() {
+        let rt = Arc::new(FakeRuntime::new());
+        let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
+        let eng = engine(rt.clone(), routes.clone());
+        eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+        assert_eq!(eng.status_of("b1"), Some(DeployStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn status_is_failed_after_readiness_timeout() {
+        let rt = Arc::new(FakeRuntime::new());
+        let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
+        let eng =
+            Engine::with_readiness(rt.clone(), routes.clone(), settings(), Arc::new(NeverReady));
+        let r = eng.deploy(request("b1", TWO_SERVICE)).await;
+        assert!(r.is_err());
+        assert!(matches!(eng.status_of("b1"), Some(DeployStatus::Failed(_))));
+        assert!(routes.load().is_empty());
+    }
+
+    #[tokio::test]
+    async fn teardown_clears_status() {
+        let rt = Arc::new(FakeRuntime::new());
+        let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
+        let eng = engine(rt.clone(), routes.clone());
+        eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+        eng.teardown("b1").await.unwrap();
+        assert_eq!(eng.status_of("b1"), None);
     }
 
     #[tokio::test]
