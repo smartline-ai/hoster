@@ -21,6 +21,8 @@ pub struct Seen {
     pub path: Option<String>,
     pub forwarded_host: Option<String>,
     pub forwarded_proto: Option<String>,
+    pub connection: Option<String>,
+    pub saw_smuggled: Option<String>,
 }
 
 pub struct Upstream {
@@ -58,6 +60,8 @@ pub async fn spawn_upstream(body: &'static str) -> Upstream {
                             path: Some(req.uri().path().to_string()),
                             forwarded_host: header("x-forwarded-host"),
                             forwarded_proto: header("x-forwarded-proto"),
+                            connection: header("connection"),
+                            saw_smuggled: header("x-smuggled"),
                         };
                         Ok::<_, Infallible>(
                             Response::builder()

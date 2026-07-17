@@ -189,6 +189,36 @@ async fn dead_upstream_is_502() {
 }
 
 #[tokio::test]
+async fn strips_hop_by_hop_headers() {
+    let upstream = support::spawn_upstream("ok").await;
+    let mut table = RoutingTable::new();
+    table.insert(
+        "backend-branch1.dev.example.com",
+        Route {
+            upstream: upstream.addr,
+            state: RouteState::Ready,
+        },
+    );
+    let base = spawn_proxy(SharedRoutes::new(table)).await;
+
+    client()
+        .get(&base)
+        .header("host", "backend-branch1.dev.example.com")
+        .header("connection", "x-smuggled")
+        .header("x-smuggled", "evil")
+        .send()
+        .await
+        .unwrap();
+
+    let seen = upstream.seen.lock().unwrap().clone();
+    assert_eq!(seen.saw_smuggled, None);
+    assert_eq!(
+        seen.forwarded_host.as_deref(),
+        Some("backend-branch1.dev.example.com")
+    );
+}
+
+#[tokio::test]
 async fn swapping_the_table_changes_routing_without_restart() {
     let first = support::spawn_upstream("first").await;
     let second = support::spawn_upstream("second").await;
