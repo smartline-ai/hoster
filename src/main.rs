@@ -34,10 +34,9 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let runtime = Arc::new(DockerRuntime::connect().context("connect to Docker")?);
-    runtime
-        .ping()
-        .await
-        .context("Docker daemon not reachable")?;
+    if let Err(e) = runtime.ping().await {
+        tracing::warn!(error = %e, "Docker daemon not reachable at startup; deploys will fail until it returns");
+    }
 
     let routes = SharedRoutes::new(RoutingTable::new());
     let engine = Arc::new(Engine::new(

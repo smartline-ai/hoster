@@ -31,7 +31,10 @@ impl ReadinessChecker for NetworkReadiness {
         while start.elapsed() < self.deadline {
             let ok = match health {
                 Some(path) => http_ok(&addr, path).await,
-                None => TcpStream::connect(&addr).await.is_ok(),
+                None => matches!(
+                    timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await,
+                    Ok(Ok(_))
+                ),
             };
             if ok {
                 return true;

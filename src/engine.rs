@@ -66,6 +66,11 @@ pub struct Engine<R: ContainerRuntime> {
     readiness: Arc<dyn ReadinessChecker>,
     status: Mutex<BTreeMap<String, DeployStatus>>,
     urls: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+    /// Serializes the list-by-label + routes.swap critical section so
+    /// concurrent deploys/teardowns can't interleave and drop each other's
+    /// routes (lost-update race). Held across the `.await` of the list call,
+    /// so it must be an async mutex, not a std one.
+    swap_lock: tokio::sync::Mutex<()>,
 }
 
 impl<R: ContainerRuntime> Engine<R> {
@@ -91,6 +96,7 @@ impl<R: ContainerRuntime> Engine<R> {
             readiness,
             status: Mutex::new(BTreeMap::new()),
             urls: Mutex::new(BTreeMap::new()),
+            swap_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -158,9 +164,14 @@ impl<R: ContainerRuntime> Engine<R> {
             }
         }
 
-        // 5. build routes from every branch's containers and swap
-        let full = self.runtime.list_by_label(labels::BRANCH).await?;
-        self.routes.swap(labels::routes_from_containers(&full));
+        // 5. build routes from every branch's containers and swap. The
+        // list+swap is a critical section: hold swap_lock across both so
+        // concurrent deploys can't interleave and lose each other's routes.
+        {
+            let _guard = self.swap_lock.lock().await;
+            let full = self.runtime.list_by_label(labels::BRANCH).await?;
+            self.routes.swap(labels::routes_from_containers(&full));
+        }
 
         self.set_status(&branch, DeployStatus::Running);
         self.urls
@@ -238,8 +249,13 @@ impl<R: ContainerRuntime> Engine<R> {
             .runtime
             .remove_network(&format!("hoster-{branch}"))
             .await;
-        let remaining = self.runtime.list_by_label(labels::BRANCH).await?;
-        self.routes.swap(labels::routes_from_containers(&remaining));
+        // Same list+swap critical section as `deploy` step 5 — container
+        // removals above don't need the lock, but the rebuild does.
+        {
+            let _guard = self.swap_lock.lock().await;
+            let remaining = self.runtime.list_by_label(labels::BRANCH).await?;
+            self.routes.swap(labels::routes_from_containers(&remaining));
+        }
         Ok(())
     }
 
@@ -286,8 +302,11 @@ impl<R: ContainerRuntime> Engine<R> {
     }
 
     pub async fn reconcile(&self) -> anyhow::Result<()> {
-        let all = self.runtime.list_by_label(labels::BRANCH).await?;
-        self.routes.swap(labels::routes_from_containers(&all));
+        {
+            let _guard = self.swap_lock.lock().await;
+            let all = self.runtime.list_by_label(labels::BRANCH).await?;
+            self.routes.swap(labels::routes_from_containers(&all));
+        }
         tracing::info!(
             routes = self.routes.load().len(),
             "reconciled routing table from labels"
@@ -473,5 +492,27 @@ mod tests {
         let eng2 = engine(rt.clone(), fresh.clone());
         eng2.reconcile().await.unwrap();
         assert!(fresh.load().lookup("backend-b1.dev.example.com").is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_deploys_keep_both_routes() {
+        let rt = Arc::new(FakeRuntime::new());
+        let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
+        let eng = Arc::new(engine(rt.clone(), routes.clone()));
+        let e1 = eng.clone();
+        let e2 = eng.clone();
+        let a = tokio::spawn(async move { e1.deploy(request("b1", TWO_SERVICE)).await });
+        let b = tokio::spawn(async move { e2.deploy(request("b2", TWO_SERVICE)).await });
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+        let t = routes.load();
+        assert!(
+            t.lookup("backend-b1.dev.example.com").is_some(),
+            "b1 route lost"
+        );
+        assert!(
+            t.lookup("backend-b2.dev.example.com").is_some(),
+            "b2 route lost"
+        );
     }
 }
