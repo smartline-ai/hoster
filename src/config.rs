@@ -47,10 +47,10 @@ pub fn validate(cfg: &DeployConfig) -> Result<(), String> {
                 "service name {name:?} must be a DNS label (lowercase letters, digits, hyphens; not leading/trailing hyphen)"
             ));
         }
-        if let Some(expose) = &svc.expose {
-            if expose.port == 0 {
-                return Err(format!("service {name:?}: expose.port must be non-zero"));
-            }
+        if let Some(expose) = &svc.expose
+            && expose.port == 0
+        {
+            return Err(format!("service {name:?}: expose.port must be non-zero"));
         }
     }
     Ok(())
@@ -63,14 +63,17 @@ pub(crate) fn is_dns_label(s: &str) -> bool {
         && s.len() <= 63
         && !s.starts_with('-')
         && !s.ends_with('-')
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg(json: &str) -> anyhow::Result<DeployConfig> { parse(json) }
+    fn cfg(json: &str) -> anyhow::Result<DeployConfig> {
+        parse(json)
+    }
 
     #[test]
     fn parses_minimal() {
@@ -96,7 +99,9 @@ mod tests {
 
     #[test]
     fn unknown_field_rejected() {
-        let err = cfg(r#"{"project":"p","services":{"a":{"image":"i","tls":true}}}"#).unwrap_err().to_string();
+        let err = cfg(r#"{"project":"p","services":{"a":{"image":"i","tls":true}}}"#)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("tls"), "got: {err}");
     }
 
@@ -114,13 +119,16 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_port() {
-        let c = cfg(r#"{"project":"p","services":{"a":{"image":"i","expose":{"port":0}}}}"#).unwrap();
+        let c =
+            cfg(r#"{"project":"p","services":{"a":{"image":"i","expose":{"port":0}}}}"#).unwrap();
         assert!(validate(&c).unwrap_err().contains("port"));
     }
 
     #[test]
     fn validate_accepts_good_config() {
-        let c = cfg(r#"{"project":"p","services":{"backend":{"image":"i","expose":{"port":8080}}}}"#).unwrap();
+        let c =
+            cfg(r#"{"project":"p","services":{"backend":{"image":"i","expose":{"port":8080}}}}"#)
+                .unwrap();
         assert!(validate(&c).is_ok());
     }
 }

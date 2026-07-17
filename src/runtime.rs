@@ -23,7 +23,11 @@ pub struct RunningContainer {
 
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync {
-    async fn create_network(&self, name: &str, labels: &BTreeMap<String, String>) -> anyhow::Result<()>;
+    async fn create_network(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> anyhow::Result<()>;
     async fn remove_network(&self, name: &str) -> anyhow::Result<()>;
     async fn pull_image(&self, image: &str) -> anyhow::Result<()>;
     async fn run(&self, spec: &ContainerSpec) -> anyhow::Result<RunningContainer>;
@@ -59,7 +63,11 @@ impl FakeRuntime {
 
 #[async_trait]
 impl ContainerRuntime for FakeRuntime {
-    async fn create_network(&self, name: &str, _labels: &BTreeMap<String, String>) -> anyhow::Result<()> {
+    async fn create_network(
+        &self,
+        name: &str,
+        _labels: &BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
         let mut s = self.inner.lock().unwrap();
         if !s.networks.iter().any(|n| n == name) {
             s.networks.push(name.to_string());
@@ -78,7 +86,7 @@ impl ContainerRuntime for FakeRuntime {
 
     async fn run(&self, spec: &ContainerSpec) -> anyhow::Result<RunningContainer> {
         let mut s = self.inner.lock().unwrap();
-        if !s.networks.iter().any(|n| *n == spec.network) {
+        if !s.networks.contains(&spec.network) {
             anyhow::bail!("network {} does not exist", spec.network);
         }
         s.next += 1;
@@ -142,7 +150,9 @@ mod tests {
     #[tokio::test]
     async fn run_then_inspect_returns_an_ip() {
         let rt = FakeRuntime::new();
-        rt.create_network("hoster-b1", &BTreeMap::new()).await.unwrap();
+        rt.create_network("hoster-b1", &BTreeMap::new())
+            .await
+            .unwrap();
         let c = rt.run(&spec("b1-backend", "b1")).await.unwrap();
         assert!(c.ip.is_some());
         let again = rt.inspect(&c.id).await.unwrap();
@@ -152,7 +162,9 @@ mod tests {
     #[tokio::test]
     async fn distinct_containers_get_distinct_ips() {
         let rt = FakeRuntime::new();
-        rt.create_network("hoster-b1", &BTreeMap::new()).await.unwrap();
+        rt.create_network("hoster-b1", &BTreeMap::new())
+            .await
+            .unwrap();
         let a = rt.run(&spec("b1-a", "b1")).await.unwrap();
         let b = rt.run(&spec("b1-b", "b1")).await.unwrap();
         assert_ne!(a.ip, b.ip);
@@ -161,7 +173,9 @@ mod tests {
     #[tokio::test]
     async fn list_by_label_filters() {
         let rt = FakeRuntime::new();
-        rt.create_network("hoster-b1", &BTreeMap::new()).await.unwrap();
+        rt.create_network("hoster-b1", &BTreeMap::new())
+            .await
+            .unwrap();
         rt.run(&spec("b1-a", "b1")).await.unwrap();
         let found = rt.list_by_label("hoster.branch").await.unwrap();
         assert_eq!(found.len(), 1);
@@ -171,7 +185,9 @@ mod tests {
     #[tokio::test]
     async fn remove_container_then_absent() {
         let rt = FakeRuntime::new();
-        rt.create_network("hoster-b1", &BTreeMap::new()).await.unwrap();
+        rt.create_network("hoster-b1", &BTreeMap::new())
+            .await
+            .unwrap();
         let c = rt.run(&spec("b1-a", "b1")).await.unwrap();
         rt.remove_container(&c.id).await.unwrap();
         assert!(rt.list_by_label("hoster.branch").await.unwrap().is_empty());

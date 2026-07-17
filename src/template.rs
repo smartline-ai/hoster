@@ -19,7 +19,9 @@ pub fn substitute(input: &str, vars: &TemplateVars) -> Result<String, String> {
     while let Some(start) = rest.find("{{") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
-        let end = after.find("}}").ok_or_else(|| "unclosed '{{' in template".to_string())?;
+        let end = after
+            .find("}}")
+            .ok_or_else(|| "unclosed '{{' in template".to_string())?;
         let name = after[..end].trim();
         out.push_str(&resolve(name, vars)?);
         rest = &after[end + 2..];
@@ -52,7 +54,10 @@ mod tests {
 
     fn vars() -> TemplateVars {
         let mut urls = BTreeMap::new();
-        urls.insert("backend".to_string(), "https://backend-b1.dev.example.com".to_string());
+        urls.insert(
+            "backend".to_string(),
+            "https://backend-b1.dev.example.com".to_string(),
+        );
         TemplateVars {
             registry: "reg.example.com".to_string(),
             tag: "abc123".to_string(),
@@ -64,22 +69,34 @@ mod tests {
 
     #[test]
     fn substitutes_simple_vars() {
-        assert_eq!(substitute("{{registry}}/app:{{tag}}", &vars()).unwrap(), "reg.example.com/app:abc123");
+        assert_eq!(
+            substitute("{{registry}}/app:{{tag}}", &vars()).unwrap(),
+            "reg.example.com/app:abc123"
+        );
     }
 
     #[test]
     fn substitutes_branch_and_sha() {
-        assert_eq!(substitute("{{branch}}-{{sha}}", &vars()).unwrap(), "b1-deadbeef");
+        assert_eq!(
+            substitute("{{branch}}-{{sha}}", &vars()).unwrap(),
+            "b1-deadbeef"
+        );
     }
 
     #[test]
     fn substitutes_url_of_exposed_service() {
-        assert_eq!(substitute("{{url.backend}}", &vars()).unwrap(), "https://backend-b1.dev.example.com");
+        assert_eq!(
+            substitute("{{url.backend}}", &vars()).unwrap(),
+            "https://backend-b1.dev.example.com"
+        );
     }
 
     #[test]
     fn no_placeholders_is_identity() {
-        assert_eq!(substitute("postgres://postgres:5432/app", &vars()).unwrap(), "postgres://postgres:5432/app");
+        assert_eq!(
+            substitute("postgres://postgres:5432/app", &vars()).unwrap(),
+            "postgres://postgres:5432/app"
+        );
     }
 
     #[test]

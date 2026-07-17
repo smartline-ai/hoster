@@ -26,7 +26,13 @@ pub fn routes_from_containers(containers: &[RunningContainer]) -> RoutingTable {
             tracing::warn!(container = %c.name, %ip, "unparseable container ip, skipping");
             continue;
         };
-        table.insert(hostname.clone(), crate::routing::Route { upstream, state: RouteState::Ready });
+        table.insert(
+            hostname.clone(),
+            crate::routing::Route {
+                upstream,
+                state: RouteState::Ready,
+            },
+        );
     }
     table
 }
@@ -41,14 +47,22 @@ mod tests {
             id: "id".to_string(),
             name: "n".to_string(),
             ip: ip.map(str::to_string),
-            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
         }
     }
 
     #[test]
     fn exposed_container_becomes_a_ready_route() {
         let c = container(
-            &[(BRANCH, "b1"), (SERVICE, "backend"), (HOSTNAME, "backend-b1.dev.example.com"), (PORT, "8080")],
+            &[
+                (BRANCH, "b1"),
+                (SERVICE, "backend"),
+                (HOSTNAME, "backend-b1.dev.example.com"),
+                (PORT, "8080"),
+            ],
             Some("10.42.0.5"),
         );
         let table = routes_from_containers(&[c]);
@@ -65,13 +79,24 @@ mod tests {
 
     #[test]
     fn container_without_ip_is_skipped() {
-        let c = container(&[(BRANCH, "b1"), (SERVICE, "backend"), (HOSTNAME, "h"), (PORT, "8080")], None);
+        let c = container(
+            &[
+                (BRANCH, "b1"),
+                (SERVICE, "backend"),
+                (HOSTNAME, "h"),
+                (PORT, "8080"),
+            ],
+            None,
+        );
         assert!(routes_from_containers(&[c]).is_empty());
     }
 
     #[test]
     fn bad_port_label_is_skipped() {
-        let c = container(&[(BRANCH, "b1"), (HOSTNAME, "h"), (PORT, "notaport")], Some("10.42.0.7"));
+        let c = container(
+            &[(BRANCH, "b1"), (HOSTNAME, "h"), (PORT, "notaport")],
+            Some("10.42.0.7"),
+        );
         assert!(routes_from_containers(&[c]).is_empty());
     }
 }
