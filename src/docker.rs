@@ -1,0 +1,183 @@
+//! The only module that touches bollard. Everything else speaks the
+//! `ContainerRuntime` trait.
+
+use std::collections::HashMap;
+
+use bollard::Docker;
+use bollard::container::{
+    Config, CreateContainerOptions, ListContainersOptions, NetworkingConfig, RemoveContainerOptions,
+};
+use bollard::image::CreateImageOptions;
+use bollard::models::{EndpointSettings, HostConfig};
+use bollard::network::CreateNetworkOptions;
+use futures_util::TryStreamExt;
+
+use crate::runtime::{ContainerRuntime, ContainerSpec, RunningContainer};
+
+pub struct DockerRuntime {
+    docker: Docker,
+}
+
+impl DockerRuntime {
+    /// Connect using standard Docker env (`DOCKER_HOST`, default socket).
+    pub fn connect() -> anyhow::Result<Self> {
+        let docker = Docker::connect_with_local_defaults()?;
+        Ok(Self { docker })
+    }
+
+    /// Probe the daemon; used by main to fail fast and by tests to self-skip.
+    pub async fn ping(&self) -> anyhow::Result<()> {
+        self.docker.ping().await?;
+        Ok(())
+    }
+}
+
+fn to_running(
+    name: String,
+    id: String,
+    labels: HashMap<String, String>,
+    ip: Option<String>,
+) -> RunningContainer {
+    RunningContainer {
+        id,
+        name,
+        ip,
+        labels: labels.into_iter().collect(),
+    }
+}
+
+#[async_trait::async_trait]
+impl ContainerRuntime for DockerRuntime {
+    async fn create_network(
+        &self,
+        name: &str,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
+        self.docker
+            .create_network(CreateNetworkOptions {
+                name: name.to_string(),
+                driver: "bridge".to_string(),
+                labels: labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                ..Default::default()
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_network(&self, name: &str) -> anyhow::Result<()> {
+        self.docker.remove_network(name).await?;
+        Ok(())
+    }
+
+    async fn pull_image(&self, image: &str) -> anyhow::Result<()> {
+        self.docker
+            .create_image(
+                Some(CreateImageOptions {
+                    from_image: image.to_string(),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
+
+    async fn run(&self, spec: &ContainerSpec) -> anyhow::Result<RunningContainer> {
+        let mut endpoints = HashMap::new();
+        endpoints.insert(
+            spec.network.clone(),
+            EndpointSettings {
+                aliases: Some(vec![spec.network_alias.clone()]),
+                ..Default::default()
+            },
+        );
+        let config: Config<String> = Config {
+            image: Some(spec.image.clone()),
+            env: Some(spec.env.clone()),
+            labels: Some(
+                spec.labels
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            host_config: Some(HostConfig {
+                ..Default::default()
+            }),
+            networking_config: Some(NetworkingConfig {
+                endpoints_config: endpoints,
+            }),
+            ..Default::default()
+        };
+        let created = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: spec.name.clone(),
+                    platform: None,
+                }),
+                config,
+            )
+            .await?;
+        self.docker
+            .start_container::<String>(&created.id, None)
+            .await?;
+        self.inspect(&created.id).await
+    }
+
+    async fn inspect(&self, id: &str) -> anyhow::Result<RunningContainer> {
+        let c = self.docker.inspect_container(id, None).await?;
+        let name = c
+            .name
+            .clone()
+            .unwrap_or_default()
+            .trim_start_matches('/')
+            .to_string();
+        let labels = c
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.labels.clone())
+            .unwrap_or_default();
+        let ip = c
+            .network_settings
+            .and_then(|ns| ns.networks)
+            .and_then(|nets| nets.into_values().find_map(|ep| ep.ip_address))
+            .filter(|s| !s.is_empty());
+        Ok(to_running(name, id.to_string(), labels, ip))
+    }
+
+    async fn remove_container(&self, id: &str) -> anyhow::Result<()> {
+        self.docker
+            .remove_container(
+                id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn list_by_label(&self, label_key: &str) -> anyhow::Result<Vec<RunningContainer>> {
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec![label_key.to_string()]);
+        let summaries = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            }))
+            .await?;
+        let mut out = Vec::new();
+        for s in summaries {
+            if let Some(id) = s.id {
+                out.push(self.inspect(&id).await?);
+            }
+        }
+        Ok(out)
+    }
+}
