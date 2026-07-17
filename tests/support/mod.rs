@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -75,4 +76,40 @@ pub async fn spawn_upstream(body: &'static str) -> Upstream {
     });
 
     Upstream { addr, seen }
+}
+
+/// Spawns an upstream that accepts a websocket handshake and echoes text
+/// frames back with an `echo: ` prefix.
+pub async fn spawn_ws_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                while let Some(Ok(msg)) = ws.next().await {
+                    if msg.is_text() {
+                        let reply = format!("echo: {}", msg.into_text().unwrap());
+                        if ws
+                            .send(tokio_tungstenite::tungstenite::Message::Text(reply.into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    addr
 }

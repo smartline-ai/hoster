@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{HeaderValue, HOST};
+use hyper::header::{HeaderValue, CONNECTION, HOST, UPGRADE};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -35,6 +35,21 @@ fn text(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
                 .boxed(),
         )
         .expect("static response is always valid")
+}
+
+/// True when the client asked to leave HTTP behind (websockets, mostly).
+///
+/// `Connection` is a comma-separated list and both header values are
+/// case-insensitive, so this cannot be an equality check.
+fn is_upgrade_request(req: &Request<Incoming>) -> bool {
+    let connection_has_upgrade = req
+        .headers()
+        .get(CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+        .unwrap_or(false);
+
+    connection_has_upgrade && req.headers().contains_key(UPGRADE)
 }
 
 /// Accept loop. Runs until the process ends.
@@ -126,11 +141,64 @@ pub async fn handle(
     req.headers_mut()
         .insert("x-forwarded-proto", HeaderValue::from_static("http"));
 
-    match client.request(req).await {
-        Ok(resp) => Ok(resp.map(|b| b.map_err(BoxError::from).boxed())),
+    let upgrading = is_upgrade_request(&req);
+
+    // Take the client's upgrade future out of the request before forwarding.
+    // It resolves only after we return the 101, so it must be captured now and
+    // awaited later.
+    let client_upgrade = upgrading.then(|| hyper::upgrade::on(&mut req));
+
+    let mut upstream_resp = match client.request(req).await {
+        Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(%host, upstream = %route.upstream, error = %e, "upstream failed");
-            Ok(text(StatusCode::BAD_GATEWAY, "upstream unavailable"))
+            return Ok(text(StatusCode::BAD_GATEWAY, "upstream unavailable"));
         }
+    };
+
+    if upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let Some(client_upgrade) = client_upgrade else {
+            // Upstream switched protocols on a request that never asked to.
+            tracing::warn!(%host, "unexpected 101 from upstream");
+            return Ok(text(StatusCode::BAD_GATEWAY, "upstream protocol error"));
+        };
+        let upstream_upgrade = hyper::upgrade::on(&mut upstream_resp);
+
+        // Both sides finish upgrading only after the 101 below is written, so
+        // this waits off to the side.
+        tokio::spawn(async move {
+            let (client_io, upstream_io) = match tokio::try_join!(client_upgrade, upstream_upgrade) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::debug!(error = %e, "upgrade failed");
+                    return;
+                }
+            };
+            let mut client_io = TokioIo::new(client_io);
+            let mut upstream_io = TokioIo::new(upstream_io);
+            // From here it is opaque bytes in both directions until someone
+            // hangs up. Errors are routine (tab closed) — log at debug.
+            if let Err(e) =
+                tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
+            {
+                tracing::debug!(error = %e, "tunnel closed");
+            }
+        });
+
+        // Hand the 101 back with the upstream's headers so the client agrees on
+        // the protocol. The body is empty: the bytes flow through the tunnel.
+        let mut resp = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+        for (name, value) in upstream_resp.headers() {
+            resp = resp.header(name, value);
+        }
+        return Ok(resp
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|never: Infallible| match never {})
+                    .boxed(),
+            )
+            .expect("101 response is always valid"));
     }
+
+    Ok(upstream_resp.map(|b| b.map_err(BoxError::from).boxed()))
 }
