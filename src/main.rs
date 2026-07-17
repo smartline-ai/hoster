@@ -1,9 +1,17 @@
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
+use hoster::docker::DockerRuntime;
+use hoster::engine::Engine;
 use hoster::proxy::serve;
-use hoster::routing::SharedRoutes;
+use hoster::readiness::NetworkReadiness;
+use hoster::routing::{RoutingTable, SharedRoutes};
+use hoster::settings::Settings;
 use tokio::net::TcpListener;
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,20 +22,50 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let routes_path: PathBuf = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "routes.example.toml".to_string())
-        .into();
-    let listen = std::env::var("HOSTER_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let settings = Arc::new(Settings {
+        listen: env_or("HOSTER_LISTEN", "127.0.0.1:8080"),
+        api_listen: env_or("HOSTER_API_LISTEN", "127.0.0.1:8081"),
+        hostname_template: env_or(
+            "HOSTER_HOSTNAME_TEMPLATE",
+            "{service}-{branch}.dev.example.com",
+        ),
+        registry: env_or("HOSTER_REGISTRY", "localhost:5000"),
+        token: std::env::var("HOSTER_TOKEN").context("HOSTER_TOKEN must be set")?,
+    });
 
-    let text = std::fs::read_to_string(&routes_path)
-        .with_context(|| format!("could not read routes file {}", routes_path.display()))?;
-    let table = hoster::routes_file::parse(&text)?;
-    tracing::info!(routes = table.len(), path = %routes_path.display(), "loaded routes");
-
-    let listener = TcpListener::bind(&listen)
+    let runtime = Arc::new(DockerRuntime::connect().context("connect to Docker")?);
+    runtime
+        .ping()
         .await
-        .with_context(|| format!("could not bind {listen}"))?;
+        .context("Docker daemon not reachable")?;
 
-    serve(listener, SharedRoutes::new(table)).await
+    let routes = SharedRoutes::new(RoutingTable::new());
+    let engine = Arc::new(Engine::new(
+        runtime,
+        routes.clone(),
+        settings.clone(),
+        Arc::new(NetworkReadiness::default()),
+    ));
+
+    // Rebuild routing from any containers a previous run left behind.
+    if let Err(e) = engine.reconcile().await {
+        tracing::warn!(error = %e, "startup reconcile failed; starting with empty routes");
+    }
+
+    let proxy_listener = TcpListener::bind(&settings.listen)
+        .await
+        .with_context(|| format!("bind proxy {}", settings.listen))?;
+    let api_listener = TcpListener::bind(&settings.api_listen)
+        .await
+        .with_context(|| format!("bind api {}", settings.api_listen))?;
+
+    tracing::info!(proxy = %settings.listen, api = %settings.api_listen, "hoster up");
+
+    let proxy = tokio::spawn(serve(proxy_listener, routes));
+    let api = tokio::spawn(hoster::api::serve_api(api_listener, engine, settings));
+
+    tokio::select! {
+        r = proxy => r.context("proxy task panicked")?,
+        r = api => r.context("api task panicked")?,
+    }
 }

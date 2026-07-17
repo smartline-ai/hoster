@@ -4,7 +4,7 @@ pub mod docker;
 pub mod engine;
 pub mod labels;
 pub mod proxy;
-pub mod routes_file;
+pub mod readiness;
 pub mod routing;
 pub mod runtime;
 pub mod settings;
