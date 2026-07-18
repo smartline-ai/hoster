@@ -374,30 +374,56 @@ impl<R: ContainerRuntime> Engine<R> {
 
     /// Every branch's deployment enriched with the config it was deployed from,
     /// reconstructed from container labels and grouped for the dashboard.
+    ///
+    /// URLs are read directly off each container's `SERVICE`/`HOSTNAME`
+    /// labels — the same source `labels::routes_from_containers` uses to
+    /// build the proxy's routing table — rather than recomputed from the
+    /// project's current hostname template. The template can be changed by
+    /// an operator at any time without redeploying; a running branch's real,
+    /// routable hostname is the one baked into its container labels at
+    /// deploy time, so that (not the live template) is the only correct
+    /// source here.
     pub async fn deployment_views(&self) -> anyhow::Result<Vec<DeploymentView>> {
         let containers = self.runtime.list_by_label(labels::PROJECT).await?;
-        // branch -> (project, config JSON), taking the first container per branch.
-        let mut by_branch: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+        // branch -> (project, config JSON, every container of that branch).
+        // Every container is kept (not just the first) because URLs are
+        // built from each container's own SERVICE/HOSTNAME labels below.
+        let mut by_branch: BTreeMap<String, (String, Option<String>, Vec<&RunningContainer>)> =
+            BTreeMap::new();
         for c in &containers {
             let (Some(branch), Some(project)) =
                 (c.labels.get(labels::BRANCH), c.labels.get(labels::PROJECT))
             else {
                 continue;
             };
-            by_branch
-                .entry(branch.clone())
-                .or_insert_with(|| (project.clone(), c.labels.get(labels::CONFIG).cloned()));
+            let entry = by_branch.entry(branch.clone()).or_insert_with(|| {
+                (
+                    project.clone(),
+                    c.labels.get(labels::CONFIG).cloned(),
+                    Vec::new(),
+                )
+            });
+            entry.2.push(c);
         }
 
         let mut out = Vec::new();
-        for (branch, (project, cfg_json)) in by_branch {
+        for (branch, (project, cfg_json, branch_containers)) in by_branch {
             let config = cfg_json
                 .as_deref()
                 .and_then(|j| serde_json::from_str::<DeployConfig>(j).ok());
-            let urls = config
-                .as_ref()
-                .map(|c| self.urls_for(&c.services, &branch, &project))
-                .unwrap_or_default();
+            // service -> http://hostname, straight off the labels written at
+            // deploy time. A container without a HOSTNAME label isn't
+            // exposed and contributes no URL.
+            let mut urls = BTreeMap::new();
+            for c in &branch_containers {
+                let (Some(service), Some(hostname)) = (
+                    c.labels.get(labels::SERVICE),
+                    c.labels.get(labels::HOSTNAME),
+                ) else {
+                    continue;
+                };
+                urls.insert(service.clone(), format!("http://{hostname}"));
+            }
             let status = match self.status_of(&branch) {
                 Some(DeployStatus::Provisioning) => "provisioning".to_string(),
                 Some(DeployStatus::Running) => "running".to_string(),
@@ -949,5 +975,71 @@ mod tests {
             "backend-main.old.example.com",
             "a running container's hostname must not change under it"
         );
+    }
+
+    #[tokio::test]
+    async fn deployment_views_report_the_hostname_the_branch_was_deployed_with() {
+        let (engine, _runtime, store) = engine_with_fake();
+        store
+            .set_hostname_template("myproj", "{service}-{branch}.old.example.com")
+            .unwrap();
+        let config = r#"{"project":"myproj","services":{
+            "backend":{"image":"img","expose":{"port":8080}}
+        }}"#;
+        deploy_config(&engine, "main", config).await.unwrap();
+
+        // Change the template without redeploying.
+        store
+            .set_hostname_template("myproj", "{service}-{branch}.new.example.com")
+            .unwrap();
+
+        // deployment_views() must report the hostname the branch was actually
+        // deployed with (from container labels), not one recomputed from the
+        // project's since-changed, live template — otherwise the dashboard and
+        // control API hand out URLs the proxy doesn't route.
+        let views = engine.deployment_views().await.unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.branch == "main")
+            .expect("view for main");
+        let url = v.urls.get("backend").expect("backend url");
+        assert!(url.contains("old.example.com"), "got {url}");
+        assert!(!url.contains("new.example.com"), "got {url}");
+    }
+
+    #[tokio::test]
+    async fn deployment_views_report_a_url_for_every_exposed_service() {
+        let (engine, _runtime, _store) = engine_with_fake();
+        let config = r#"{"project":"myproj","services":{
+            "postgres":{"image":"postgres:16"},
+            "backend":{"image":"img","expose":{"port":8080}},
+            "worker":{"image":"img2","expose":{"port":9090}}
+        }}"#;
+        deploy_config(&engine, "main", config).await.unwrap();
+
+        // Multi-service deployment: every exposed service must get a URL, and
+        // the regrouping in deployment_views() must not silently collapse to
+        // just one container's labels per branch.
+        let views = engine.deployment_views().await.unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.branch == "main")
+            .expect("view for main");
+        assert!(
+            v.urls.contains_key("backend"),
+            "missing backend url: {:?}",
+            v.urls
+        );
+        assert!(
+            v.urls.contains_key("worker"),
+            "missing worker url: {:?}",
+            v.urls
+        );
+        assert!(
+            !v.urls.contains_key("postgres"),
+            "postgres is not exposed and must have no url: {:?}",
+            v.urls
+        );
+        assert_eq!(v.urls.len(), 2, "got {:?}", v.urls);
     }
 }
