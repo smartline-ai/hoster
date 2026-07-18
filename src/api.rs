@@ -169,6 +169,14 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
             Ok(handle_teardown(engine, branch).await)
         }
         (Method::GET, "/projects") => Ok(handle_list_projects(&engine)),
+        (Method::PUT, p) if parse_registry_path(p).is_some() => {
+            let project = parse_registry_path(p).unwrap();
+            handle_set_registry(req, &engine, project).await
+        }
+        (Method::DELETE, p) if parse_registry_path(p).is_some() => {
+            let project = parse_registry_path(p).unwrap();
+            Ok(handle_delete_registry(&engine, &project))
+        }
         (Method::PUT, p) if parse_var_path(p).is_some() => {
             let (project, key) = parse_var_path(p).unwrap();
             handle_set_var(req, &engine, project, key).await
@@ -192,12 +200,31 @@ fn parse_var_path(path: &str) -> Option<(String, String)> {
     Some((project.to_string(), key.to_string()))
 }
 
+/// Extract `<project>` from `/projects/<project>/registry`, or `None` if the
+/// path isn't that shape.
+fn parse_registry_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/projects/")?;
+    let project = rest.strip_suffix("/registry")?;
+    if project.is_empty() || project.contains('/') {
+        return None;
+    }
+    Some(project.to_string())
+}
+
 /// The body of `PUT /projects/<project>/vars/<key>`.
 #[derive(Debug, Deserialize)]
 struct SetVarBody {
     value: String,
     #[serde(default)]
     services: Vec<String>,
+}
+
+/// The body of `PUT /projects/<project>/registry`.
+#[derive(Debug, Deserialize)]
+struct SetRegistryBody {
+    registry: String,
+    username: String,
+    password: String,
 }
 
 fn handle_list_projects<R: ContainerRuntime>(engine: &Engine<R>) -> Response<ApiBody> {
@@ -240,6 +267,41 @@ fn handle_delete_var<R: ContainerRuntime>(
     key: &str,
 ) -> Response<ApiBody> {
     let _ = engine.store().delete_var(project, key);
+    text(StatusCode::NO_CONTENT, "")
+}
+
+async fn handle_set_registry<R: ContainerRuntime>(
+    req: Request<Incoming>,
+    engine: &Engine<R>,
+    project: String,
+) -> Result<Response<ApiBody>, Infallible> {
+    let bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return Ok(text(StatusCode::BAD_REQUEST, "could not read request body")),
+    };
+    let body: SetRegistryBody = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(text_owned(
+                StatusCode::BAD_REQUEST,
+                format!("invalid request body: {e}"),
+            ));
+        }
+    };
+    match engine
+        .store()
+        .set_registry(&project, &body.registry, &body.username, &body.password)
+    {
+        Ok(()) => Ok(text(StatusCode::NO_CONTENT, "")),
+        Err(msg) => Ok(text_owned(StatusCode::BAD_REQUEST, msg)),
+    }
+}
+
+fn handle_delete_registry<R: ContainerRuntime>(
+    engine: &Engine<R>,
+    project: &str,
+) -> Response<ApiBody> {
+    let _ = engine.store().delete_registry(project);
     text(StatusCode::NO_CONTENT, "")
 }
 
@@ -550,4 +612,219 @@ fn url_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+// --- Unit tests for the bearer-token API routes ---
+//
+// These drive `handle_api` directly over an in-memory duplex connection (no
+// real TCP listener), which keeps them fast while still exercising the real
+// hyper request/response path end to end. `tests/api.rs` covers the same
+// surface at the integration level (real socket + reqwest); this module
+// exists for handler-level unit coverage such as the registry endpoints.
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use tokio::io::duplex;
+
+    use super::*;
+    use crate::engine::{AlwaysReady, Engine};
+    use crate::routing::{RoutingTable, SharedRoutes};
+    use crate::runtime::FakeRuntime;
+    use crate::secrets::Store;
+    use crate::session::Sessions;
+
+    /// A unique, non-existent store path per test, so tests never share state.
+    fn temp_store() -> Arc<Store> {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "hoster-api-unit-{}-{n}/projects.json",
+            std::process::id()
+        ));
+        Arc::new(Store::load(path).unwrap())
+    }
+
+    /// A fresh engine, settings, and session table for one test.
+    fn api_harness() -> (Arc<Engine<FakeRuntime>>, Arc<Settings>, Arc<Sessions>) {
+        let rt = Arc::new(FakeRuntime::new());
+        let settings = Arc::new(Settings {
+            listen: "127.0.0.1:0".into(),
+            api_listen: "127.0.0.1:0".into(),
+            hostname_template: "{service}-{branch}.dev.example.com".into(),
+            registry: "reg.example.com".into(),
+            token: "secret".into(),
+            dashboard_password: None,
+        });
+        let engine = Arc::new(Engine::with_readiness(
+            rt,
+            SharedRoutes::new(RoutingTable::new()),
+            settings.clone(),
+            Arc::new(AlwaysReady),
+            temp_store(),
+        ));
+        let sessions = Arc::new(Sessions::new());
+        (engine, settings, sessions)
+    }
+
+    /// Drive `handle_api` over an in-memory duplex connection and return its
+    /// response, with or without the bearer token attached.
+    async fn call_with_auth(
+        engine: &Arc<Engine<FakeRuntime>>,
+        settings: &Arc<Settings>,
+        sessions: &Arc<Sessions>,
+        method: Method,
+        path: &str,
+        body: &str,
+        token: Option<&str>,
+    ) -> Response<Incoming> {
+        let (client_io, server_io) = duplex(64 * 1024);
+
+        let engine = engine.clone();
+        let settings_for_server = settings.clone();
+        let sessions = sessions.clone();
+        tokio::spawn(async move {
+            let service = service_fn(move |req| {
+                handle_api(
+                    req,
+                    engine.clone(),
+                    settings_for_server.clone(),
+                    sessions.clone(),
+                )
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await;
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("client handshake failed");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost");
+        if let Some(t) = token {
+            builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let req = builder
+            .body(Full::new(Bytes::from(body.to_string())))
+            .expect("request is always valid");
+
+        sender.send_request(req).await.expect("request failed")
+    }
+
+    async fn call(
+        engine: &Arc<Engine<FakeRuntime>>,
+        settings: &Arc<Settings>,
+        sessions: &Arc<Sessions>,
+        method: Method,
+        path: &str,
+        body: &str,
+    ) -> Response<Incoming> {
+        let token = settings.token.clone();
+        call_with_auth(engine, settings, sessions, method, path, body, Some(&token)).await
+    }
+
+    async fn call_without_token(
+        engine: &Arc<Engine<FakeRuntime>>,
+        settings: &Arc<Settings>,
+        sessions: &Arc<Sessions>,
+        method: Method,
+        path: &str,
+        body: &str,
+    ) -> Response<Incoming> {
+        call_with_auth(engine, settings, sessions, method, path, body, None).await
+    }
+
+    async fn body_string(res: Response<Incoming>) -> String {
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn put_registry_stores_the_credential() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/projects/myproj/registry",
+            r#"{"registry":"ghcr.io","username":"bot","password":"ghp_secret"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let c = engine.store().registry_for("myproj").unwrap();
+        assert_eq!(c.registry, "ghcr.io");
+        assert_eq!(c.password, "ghp_secret");
+    }
+
+    #[tokio::test]
+    async fn get_projects_masks_the_registry_password() {
+        let (engine, settings, sessions) = api_harness();
+        engine
+            .store()
+            .set_registry("myproj", "ghcr.io", "bot", "ghp_topsecret")
+            .unwrap();
+        let res = call(&engine, &settings, &sessions, Method::GET, "/projects", "").await;
+        let body = body_string(res).await;
+        assert!(!body.contains("ghp_topsecret"), "password leaked: {body}");
+        assert!(body.contains("ghcr.io"));
+        assert!(body.contains("bot"));
+    }
+
+    #[tokio::test]
+    async fn delete_registry_removes_the_credential() {
+        let (engine, settings, sessions) = api_harness();
+        engine
+            .store()
+            .set_registry("myproj", "ghcr.io", "bot", "x")
+            .unwrap();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::DELETE,
+            "/projects/myproj/registry",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(engine.store().registry_for("myproj").is_none());
+    }
+
+    #[tokio::test]
+    async fn put_registry_rejects_an_empty_username() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/projects/myproj/registry",
+            r#"{"registry":"ghcr.io","username":"","password":"x"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn registry_endpoints_require_the_bearer_token() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call_without_token(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/projects/myproj/registry",
+            r#"{"registry":"ghcr.io","username":"bot","password":"x"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
 }
