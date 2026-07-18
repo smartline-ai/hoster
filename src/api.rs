@@ -8,11 +8,14 @@
 //! guard.
 
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::body::Incoming;
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+use hyper::body::{Frame, Incoming};
 use hyper::header::{AUTHORIZATION, COOKIE, LOCATION, SET_COOKIE};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -165,6 +168,13 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
         (&Method::POST, p) if p.starts_with("/ui/projects/") => {
             let sub = p.trim_start_matches("/ui/projects/").to_string();
             return Ok(ui_projects(req, engine, &settings, &sessions, sub).await);
+        }
+        (&Method::GET, p) if parse_logs_path(p).is_some() => {
+            let (project, branch, service) = parse_logs_path(p).unwrap();
+            return Ok(ui_logs(
+                &req, &engine, &settings, &sessions, &project, &branch, &service,
+            )
+            .await);
         }
         (&Method::GET, p) if p.starts_with("/p/") => {
             let rest = p.trim_start_matches("/p/");
@@ -543,6 +553,93 @@ async fn ui_project<R: ContainerRuntime>(
         StatusCode::OK,
         ui::project_page(project, &deployments, &env),
     )
+}
+
+/// Parse `/p/<project>/logs/<branch>/<service>` into its three segments.
+fn parse_logs_path(path: &str) -> Option<(String, String, String)> {
+    let rest = path.strip_prefix("/p/")?;
+    let (project, tail) = rest.split_once("/logs/")?;
+    let (branch, service) = tail.split_once('/')?;
+    if project.is_empty()
+        || branch.is_empty()
+        || service.is_empty()
+        || project.contains('/')
+        || branch.contains('/')
+        || service.contains('/')
+    {
+        return None;
+    }
+    Some((project.to_string(), branch.to_string(), service.to_string()))
+}
+
+/// Wraps a stream that is `Send` but not `Sync`. `LogStream` is a type-erased
+/// `Pin<Box<dyn Stream + Send>>` — the trait object drops the `Sync` marker
+/// even when the concrete stream would have had it — but `ApiBody`
+/// (`BoxBody`) requires its inner `Body` to be `Send + Sync`. `Mutex<S>` is
+/// `Sync` whenever `S: Send`, so wrapping the stream in one recovers the
+/// marker with no unsafe code. This is sound with no runtime cost in
+/// practice: hyper polls a body from exactly one task at a time, so the lock
+/// is never contended.
+struct SyncStream<S>(Mutex<S>);
+
+impl<S> SyncStream<S> {
+    fn new(inner: S) -> Self {
+        Self(Mutex::new(inner))
+    }
+}
+
+impl<S: futures_util::Stream + Unpin> futures_util::Stream for SyncStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut guard = self.get_mut().0.lock().expect("sse stream mutex poisoned");
+        Pin::new(&mut *guard).poll_next(cx)
+    }
+}
+
+/// `GET /p/<project>/logs/<branch>/<service>` — stream the service's container
+/// logs as Server-Sent Events. Cookie-authenticated; unauthenticated requests
+/// get 401 (EventSource cannot follow a login redirect).
+async fn ui_logs<R: ContainerRuntime>(
+    req: &Request<Incoming>,
+    engine: &Engine<R>,
+    settings: &Settings,
+    sessions: &Sessions,
+    project: &str,
+    branch: &str,
+    service: &str,
+) -> Response<ApiBody> {
+    if !dashboard_enabled(settings) {
+        return text(StatusCode::SERVICE_UNAVAILABLE, "dashboard not configured");
+    }
+    if !session_of(req, sessions) {
+        return text(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let stream = match engine
+        .service_logs(project, branch, service, true, 200)
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => return text(StatusCode::NOT_FOUND, "no such service"),
+    };
+    // Each log line becomes one SSE frame. Newlines within a line would break
+    // the framing, so any embedded newline splits into its own data field.
+    let frames = stream.map(|item| -> Result<Frame<Bytes>, BoxError> {
+        let line = item.map_err(|e| -> BoxError { e.into() })?;
+        let payload = line
+            .split('\n')
+            .map(|l| format!("data: {l}\n"))
+            .collect::<String>();
+        Ok(Frame::data(Bytes::from(format!("{payload}\n"))))
+    });
+    let body = BodyExt::boxed(StreamBody::new(SyncStream::new(frames)));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(body)
+        .expect("sse response is always valid")
 }
 
 async fn ui_settings<R: ContainerRuntime>(
@@ -1062,5 +1159,53 @@ mod tests {
             engine.store().env_for("myproj", "any").get("KEEP_ME"),
             Some(&"v".to_string())
         );
+    }
+
+    const LOG_CFG: &str =
+        r#"{"project":"p","services":{"backend":{"image":"img","expose":{"port":8080}}}}"#;
+
+    #[tokio::test]
+    async fn logs_endpoint_streams_event_stream_when_authenticated() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        let req = DeployRequest {
+            branch: "b1".into(),
+            tag: "t".into(),
+            sha: "s".into(),
+            config: config::parse(LOG_CFG).unwrap(),
+        };
+        engine.deploy(req).await.unwrap();
+
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::GET,
+            "/p/p/logs/b1/backend",
+            "",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        let body = body_string(res).await;
+        assert!(body.contains("data:"));
+    }
+
+    #[tokio::test]
+    async fn logs_endpoint_requires_authentication() {
+        let (engine, settings, sessions, _cookie) = dashboard_harness();
+        let res = call_without_token(
+            &engine,
+            &settings,
+            &sessions,
+            Method::GET,
+            "/p/p/logs/b1/backend",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }
