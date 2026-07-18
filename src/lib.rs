@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod dashboard;
 pub mod docker;
 pub mod engine;
 pub mod labels;
@@ -7,5 +8,6 @@ pub mod proxy;
 pub mod readiness;
 pub mod routing;
 pub mod runtime;
+pub mod session;
 pub mod settings;
 pub mod template;
