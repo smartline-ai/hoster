@@ -41,7 +41,7 @@ Deploy a branch or add environment variables to a project to get started.</div>"
 
     body.push_str("<div class=\"col-label\" style=\"margin-top:1.6rem\">All deployments</div>");
     for d in deployments {
-        let word = status_word(&d.status);
+        let word = html_escape(status_word(&d.status));
         let project = html_escape(&d.project);
         let branch = html_escape(&d.branch);
         let _ = write!(
@@ -95,7 +95,10 @@ mod tests {
         assert!(body.contains("href=\"/p/api\""));
         // aggregate running count is present
         assert!(body.contains("Running"));
+        // the computed running count (1) is rendered in the stat tile, not just the label
+        assert!(body.contains("<span class=\"n\">1</span>"));
         // a failed deploy still lists, its reason escaped/omitted from status word
         assert!(body.contains("failed"));
+        assert!(!body.contains("boom"));
     }
 }
