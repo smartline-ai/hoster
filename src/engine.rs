@@ -138,14 +138,7 @@ impl<R: ContainerRuntime> Engine<R> {
         self.set_status(&branch, DeployStatus::Provisioning);
 
         // 1. hostnames + urls for exposed services
-        let mut urls = BTreeMap::new();
-        for (name, svc) in &req.config.services {
-            if let Some(exp) = &svc.expose {
-                let sub = exp.subdomain.clone().unwrap_or_else(|| name.clone());
-                let host = hostname_for(&self.settings.hostname_template, &sub, &branch);
-                urls.insert(name.clone(), format!("http://{host}"));
-            }
-        }
+        let urls = self.urls_for(&req.config.services, &branch, &req.config.project);
         let vars = TemplateVars {
             registry: self.settings.registry.clone(),
             tag: req.tag.clone(),
@@ -263,7 +256,7 @@ impl<R: ContainerRuntime> Engine<R> {
                 labels.insert(labels::PORT.to_string(), exp.port.to_string());
                 labels.insert(
                     labels::HOSTNAME.to_string(),
-                    hostname_for(&self.settings.hostname_template, &sub, branch),
+                    hostname_for(&self.template_for(project), &sub, branch),
                 );
             }
             // Send the project's credential only to its own registry — a
@@ -327,15 +320,7 @@ impl<R: ContainerRuntime> Engine<R> {
     /// the actual deploy runs in the background.
     pub fn plan_urls(&self, req: &DeployRequest) -> BTreeMap<String, String> {
         let branch = sanitize_branch(&req.branch);
-        let mut urls = BTreeMap::new();
-        for (name, svc) in &req.config.services {
-            if let Some(exp) = &svc.expose {
-                let sub = exp.subdomain.clone().unwrap_or_else(|| name.clone());
-                let host = hostname_for(&self.settings.hostname_template, &sub, &branch);
-                urls.insert(name.clone(), format!("http://{host}"));
-            }
-        }
-        urls
+        self.urls_for(&req.config.services, &branch, &req.config.project)
     }
 
     /// Snapshot of every known branch's status and computed URLs, for the
@@ -357,19 +342,30 @@ impl<R: ContainerRuntime> Engine<R> {
             .collect()
     }
 
+    /// The hostname template for `project`: its own if it has one, otherwise
+    /// the operator's global default.
+    fn template_for(&self, project: &str) -> String {
+        self.store
+            .hostname_template_for(project)
+            .unwrap_or_else(|| self.settings.hostname_template.clone())
+    }
+
     /// Compute the public URLs for a service map on a branch — the URL of every
-    /// exposed service. Deterministic from config + branch, so it works for
-    /// views reconstructed from labels after a restart.
+    /// exposed service. Deterministic from config + branch + the project's
+    /// template, so it works for views reconstructed from labels after a
+    /// restart.
     fn urls_for(
         &self,
         services: &BTreeMap<String, config::Service>,
         branch: &str,
+        project: &str,
     ) -> BTreeMap<String, String> {
+        let template = self.template_for(project);
         let mut urls = BTreeMap::new();
         for (name, svc) in services {
             if let Some(exp) = &svc.expose {
                 let sub = exp.subdomain.clone().unwrap_or_else(|| name.clone());
-                let host = hostname_for(&self.settings.hostname_template, &sub, branch);
+                let host = hostname_for(&template, &sub, branch);
                 urls.insert(name.clone(), format!("http://{host}"));
             }
         }
@@ -400,7 +396,7 @@ impl<R: ContainerRuntime> Engine<R> {
                 .and_then(|j| serde_json::from_str::<DeployConfig>(j).ok());
             let urls = config
                 .as_ref()
-                .map(|c| self.urls_for(&c.services, &branch))
+                .map(|c| self.urls_for(&c.services, &branch, &project))
                 .unwrap_or_default();
             let status = match self.status_of(&branch) {
                 Some(DeployStatus::Provisioning) => "provisioning".to_string(),
@@ -823,5 +819,135 @@ mod tests {
         }}"#;
         deploy_config(&engine, "main", config).await.unwrap();
         assert_eq!(runtime.pull_cred_of("ghcr.io/org/backend:v1"), Some(None));
+    }
+
+    #[tokio::test]
+    async fn a_projects_template_overrides_the_global_default() {
+        let (engine, runtime, store) = engine_with_fake();
+        store
+            .set_hostname_template("myproj", "{service}-{branch}.demo.example.com")
+            .unwrap();
+
+        let config = r#"{"project":"myproj","services":{
+            "backend":{"image":"img","expose":{"port":8080}}
+        }}"#;
+        deploy_config(&engine, "main", config).await.unwrap();
+
+        let containers = runtime.list_by_label(crate::labels::BRANCH).await.unwrap();
+        let backend = containers
+            .iter()
+            .find(|c| c.name.ends_with("backend"))
+            .expect("backend container");
+        assert_eq!(
+            backend.labels[crate::labels::HOSTNAME],
+            "backend-main.demo.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_without_a_template_uses_the_global_default() {
+        let (engine, runtime, _store) = engine_with_fake();
+        let config = r#"{"project":"myproj","services":{
+            "backend":{"image":"img","expose":{"port":8080}}
+        }}"#;
+        deploy_config(&engine, "main", config).await.unwrap();
+
+        let containers = runtime.list_by_label(crate::labels::BRANCH).await.unwrap();
+        let backend = containers
+            .iter()
+            .find(|c| c.name.ends_with("backend"))
+            .expect("backend container");
+        assert_eq!(
+            backend.labels[crate::labels::HOSTNAME],
+            "backend-main.dev.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_projects_get_different_hostnames_for_the_same_branch() {
+        let (engine, runtime, store) = engine_with_fake();
+        store
+            .set_hostname_template("alpha", "{service}-{branch}.a.example.com")
+            .unwrap();
+        store
+            .set_hostname_template("beta", "{service}-{branch}.b.example.com")
+            .unwrap();
+
+        deploy_config(
+            &engine,
+            "main",
+            r#"{"project":"alpha","services":{"backend":{"image":"img","expose":{"port":8080}}}}"#,
+        )
+        .await
+        .unwrap();
+        deploy_config(
+            &engine,
+            "release",
+            r#"{"project":"beta","services":{"backend":{"image":"img","expose":{"port":8080}}}}"#,
+        )
+        .await
+        .unwrap();
+
+        let containers = runtime.list_by_label(crate::labels::BRANCH).await.unwrap();
+        let hosts: Vec<&str> = containers
+            .iter()
+            .filter_map(|c| c.labels.get(crate::labels::HOSTNAME))
+            .map(String::as_str)
+            .collect();
+        assert!(
+            hosts.contains(&"backend-main.a.example.com"),
+            "got {hosts:?}"
+        );
+        assert!(
+            hosts.contains(&"backend-release.b.example.com"),
+            "got {hosts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_urls_use_the_projects_template() {
+        let (engine, _runtime, store) = engine_with_fake();
+        store
+            .set_hostname_template("myproj", "{service}-{branch}.demo.example.com")
+            .unwrap();
+        let req = request(
+            "main",
+            r#"{"project":"myproj","services":{"backend":{"image":"img","expose":{"port":8080}}}}"#,
+        );
+        let urls = engine.plan_urls(&req);
+        assert_eq!(
+            urls.get("backend").map(String::as_str),
+            Some("http://backend-main.demo.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_branch_keeps_its_hostname_after_its_template_changes() {
+        let (engine, runtime, store) = engine_with_fake();
+        store
+            .set_hostname_template("myproj", "{service}-{branch}.old.example.com")
+            .unwrap();
+        let config = r#"{"project":"myproj","services":{
+            "backend":{"image":"img","expose":{"port":8080}}
+        }}"#;
+        deploy_config(&engine, "main", config).await.unwrap();
+
+        // Change the template without redeploying.
+        store
+            .set_hostname_template("myproj", "{service}-{branch}.new.example.com")
+            .unwrap();
+
+        // Views are rebuilt from container labels, so the running branch keeps
+        // the hostname it was deployed with.
+        let containers = runtime.list_by_label(crate::labels::BRANCH).await.unwrap();
+        let backend = containers
+            .iter()
+            .find(|c| c.name.ends_with("backend"))
+            .expect("backend container");
+        assert_eq!(
+            backend.labels[crate::labels::HOSTNAME],
+            "backend-main.old.example.com",
+            "a running container's hostname must not change under it"
+        );
     }
 }
