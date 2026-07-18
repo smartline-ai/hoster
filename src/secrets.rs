@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::is_dns_label;
+use crate::settings::validate_hostname_template;
 
 /// Largest accepted value, guarding against a runaway paste filling the store.
 pub const MAX_VALUE_LEN: usize = 32 * 1024;
@@ -41,6 +42,8 @@ struct ProjectData {
     vars: BTreeMap<String, Var>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     registry: Option<RegistryCred>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hostname_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +84,7 @@ pub struct MaskedProject {
     pub project: String,
     pub vars: Vec<MaskedVar>,
     pub registry: Option<MaskedRegistry>,
+    pub hostname_template: Option<String>,
 }
 
 /// Thread-safe, file-backed store. Persists on every mutation.
@@ -152,7 +156,7 @@ impl Store {
         let mut data = self.data.lock().unwrap();
         if let Some(p) = data.projects.get_mut(project) {
             p.vars.remove(key);
-            if p.vars.is_empty() && p.registry.is_none() {
+            if p.vars.is_empty() && p.registry.is_none() && p.hostname_template.is_none() {
                 data.projects.remove(project);
             }
         }
@@ -208,7 +212,7 @@ impl Store {
         let mut data = self.data.lock().unwrap();
         if let Some(p) = data.projects.get_mut(project) {
             p.registry = None;
-            if p.vars.is_empty() {
+            if p.vars.is_empty() && p.hostname_template.is_none() {
                 data.projects.remove(project);
             }
         }
@@ -219,6 +223,44 @@ impl Store {
     pub fn registry_for(&self, project: &str) -> Option<RegistryCred> {
         let data = self.data.lock().unwrap();
         data.projects.get(project).and_then(|p| p.registry.clone())
+    }
+
+    /// Set (replace) the project's hostname template. Validates the project
+    /// name and the template; nothing is stored when either is rejected.
+    pub fn set_hostname_template(&self, project: &str, template: &str) -> Result<(), String> {
+        if !is_project_name(project) {
+            return Err(format!(
+                "project name {project:?} must be non-empty and use only letters, digits, '.', '-', '_'"
+            ));
+        }
+        validate_hostname_template(template)?;
+        let mut data = self.data.lock().unwrap();
+        data.projects
+            .entry(project.to_string())
+            .or_default()
+            .hostname_template = Some(template.to_string());
+        self.persist(&data).map_err(|e| e.to_string())
+    }
+
+    /// Remove the project's hostname template, reverting it to the global
+    /// default. No error if it did not have one.
+    pub fn delete_hostname_template(&self, project: &str) -> anyhow::Result<()> {
+        let mut data = self.data.lock().unwrap();
+        if let Some(p) = data.projects.get_mut(project) {
+            p.hostname_template = None;
+            if p.vars.is_empty() && p.registry.is_none() {
+                data.projects.remove(project);
+            }
+        }
+        self.persist(&data)
+    }
+
+    /// The project's hostname template, if it has one.
+    pub fn hostname_template_for(&self, project: &str) -> Option<String> {
+        let data = self.data.lock().unwrap();
+        data.projects
+            .get(project)
+            .and_then(|p| p.hostname_template.clone())
     }
 
     /// The variables to inject into `service` of `project`: every var whose
@@ -254,6 +296,7 @@ impl Store {
                     registry: c.registry.clone(),
                     username: c.username.clone(),
                 }),
+                hostname_template: p.hostname_template.clone(),
             })
             .collect()
     }
@@ -589,5 +632,155 @@ mod tests {
         s.delete_registry("p").unwrap();
         assert!(s.registry_for("p").is_none());
         assert!(s.env_for("p", "backend").is_empty());
+    }
+
+    #[test]
+    fn set_then_hostname_template_for_returns_it() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_hostname_template("p", "{branch}.demo.example.com")
+            .unwrap();
+        assert_eq!(
+            s.hostname_template_for("p").as_deref(),
+            Some("{branch}.demo.example.com")
+        );
+    }
+
+    #[test]
+    fn hostname_template_for_unknown_project_is_none() {
+        let s = Store::load(temp_file()).unwrap();
+        assert!(s.hostname_template_for("nope").is_none());
+    }
+
+    #[test]
+    fn set_hostname_template_replaces_the_previous_one() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_hostname_template("p", "{branch}.a.example.com")
+            .unwrap();
+        s.set_hostname_template("p", "{branch}.b.example.com")
+            .unwrap();
+        assert_eq!(
+            s.hostname_template_for("p").as_deref(),
+            Some("{branch}.b.example.com")
+        );
+    }
+
+    #[test]
+    fn delete_hostname_template_removes_it_and_is_idempotent() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_hostname_template("p", "{branch}.demo.example.com")
+            .unwrap();
+        s.delete_hostname_template("p").unwrap();
+        assert!(s.hostname_template_for("p").is_none());
+        s.delete_hostname_template("p").unwrap();
+    }
+
+    #[test]
+    fn set_hostname_template_rejects_an_invalid_template() {
+        let s = Store::load(temp_file()).unwrap();
+        assert!(
+            s.set_hostname_template("p", "{service}.example.com")
+                .is_err()
+        );
+        assert!(s.set_hostname_template("p", "").is_err());
+        assert!(
+            s.hostname_template_for("p").is_none(),
+            "nothing should be stored on rejection"
+        );
+    }
+
+    #[test]
+    fn set_hostname_template_rejects_an_invalid_project_name() {
+        let s = Store::load(temp_file()).unwrap();
+        assert!(
+            s.set_hostname_template("bad/project", "{branch}.example.com")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn project_with_only_a_hostname_template_is_listed() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_hostname_template("p", "{branch}.demo.example.com")
+            .unwrap();
+        let masked = s.list_masked();
+        assert_eq!(masked.len(), 1);
+        assert_eq!(masked[0].project, "p");
+        assert_eq!(
+            masked[0].hostname_template.as_deref(),
+            Some("{branch}.demo.example.com")
+        );
+    }
+
+    #[test]
+    fn deleting_the_last_var_keeps_the_hostname_template() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_hostname_template("p", "{branch}.demo.example.com")
+            .unwrap();
+        s.set_var("p", "K", "v", vec![]).unwrap();
+        s.delete_var("p", "K").unwrap();
+        assert!(
+            s.hostname_template_for("p").is_some(),
+            "template pruned with the last var"
+        );
+    }
+
+    #[test]
+    fn deleting_the_registry_keeps_the_hostname_template() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_hostname_template("p", "{branch}.demo.example.com")
+            .unwrap();
+        s.set_registry("p", "ghcr.io", "bot", "x").unwrap();
+        s.delete_registry("p").unwrap();
+        assert!(
+            s.hostname_template_for("p").is_some(),
+            "template pruned with the registry"
+        );
+    }
+
+    #[test]
+    fn deleting_the_hostname_template_keeps_vars_and_registry() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_hostname_template("p", "{branch}.demo.example.com")
+            .unwrap();
+        s.set_var("p", "K", "v", vec![]).unwrap();
+        s.set_registry("p", "ghcr.io", "bot", "x").unwrap();
+        s.delete_hostname_template("p").unwrap();
+        assert_eq!(
+            s.env_for("p", "backend").get("K").map(String::as_str),
+            Some("v")
+        );
+        assert!(s.registry_for("p").is_some());
+    }
+
+    #[test]
+    fn hostname_template_persists_and_reloads_from_disk() {
+        let path = temp_file();
+        {
+            let s = Store::load(&path).unwrap();
+            s.set_hostname_template("p", "{branch}.demo.example.com")
+                .unwrap();
+        }
+        let s2 = Store::load(&path).unwrap();
+        assert_eq!(
+            s2.hostname_template_for("p").as_deref(),
+            Some("{branch}.demo.example.com")
+        );
+    }
+
+    #[test]
+    fn a_file_without_a_hostname_template_still_loads() {
+        let path = temp_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"projects":{"p":{"vars":{"K":{"value":"v","services":[]}}}}}"#,
+        )
+        .unwrap();
+        let s = Store::load(&path).unwrap();
+        assert_eq!(
+            s.env_for("p", "backend").get("K").map(String::as_str),
+            Some("v")
+        );
+        assert!(s.hostname_template_for("p").is_none());
     }
 }

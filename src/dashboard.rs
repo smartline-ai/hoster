@@ -483,6 +483,7 @@ mod tests {
                 })
                 .collect(),
             registry: None,
+            hostname_template: None,
         }
     }
 
@@ -494,6 +495,7 @@ mod tests {
                 registry: registry.to_string(),
                 username: username.to_string(),
             }),
+            hostname_template: None,
         }
     }
 
