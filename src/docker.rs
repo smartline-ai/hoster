@@ -6,14 +6,15 @@ use std::collections::HashMap;
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, NetworkingConfig, RemoveContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
+    NetworkingConfig, RemoveContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{EndpointSettings, HostConfig};
 use bollard::network::CreateNetworkOptions;
 use futures_util::TryStreamExt;
 
-use crate::runtime::{ContainerRuntime, ContainerSpec, RunningContainer};
+use crate::runtime::{ContainerRuntime, ContainerSpec, LogStream, RunningContainer};
 use crate::secrets::RegistryCred;
 
 pub struct DockerRuntime {
@@ -187,5 +188,35 @@ impl ContainerRuntime for DockerRuntime {
             }
         }
         Ok(out)
+    }
+
+    async fn logs(
+        &self,
+        container_id: &str,
+        follow: bool,
+        tail: usize,
+    ) -> anyhow::Result<LogStream> {
+        use futures_util::StreamExt;
+        let options = LogsOptions::<String> {
+            follow,
+            stdout: true,
+            stderr: true,
+            tail: tail.to_string(),
+            timestamps: false,
+            ..Default::default()
+        };
+        let raw = self.docker.logs(container_id, Some(options));
+        // Map each Docker log chunk to a UTF-8 line, dropping the trailing
+        // newline bollard includes. A stream error becomes a stream item error.
+        let mapped = raw.map(|chunk| {
+            chunk
+                .map(|out: LogOutput| {
+                    String::from_utf8_lossy(&out.into_bytes())
+                        .trim_end_matches('\n')
+                        .to_string()
+                })
+                .map_err(anyhow::Error::from)
+        });
+        Ok(Box::pin(mapped))
     }
 }

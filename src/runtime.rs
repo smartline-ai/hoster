@@ -5,6 +5,10 @@ use async_trait::async_trait;
 
 use crate::secrets::RegistryCred;
 
+/// A live stream of already-decoded log lines (no trailing newline per item).
+pub type LogStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = anyhow::Result<String>> + Send>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSpec {
     pub name: String,
@@ -36,6 +40,14 @@ pub trait ContainerRuntime: Send + Sync {
     async fn inspect(&self, id: &str) -> anyhow::Result<RunningContainer>;
     async fn remove_container(&self, id: &str) -> anyhow::Result<()>;
     async fn list_by_label(&self, label_key: &str) -> anyhow::Result<Vec<RunningContainer>>;
+    /// Stream a container's logs. `follow` keeps the stream open for new
+    /// output; `tail` is how many existing lines to replay first.
+    async fn logs(
+        &self,
+        container_id: &str,
+        follow: bool,
+        tail: usize,
+    ) -> anyhow::Result<LogStream>;
 }
 
 /// In-memory `ContainerRuntime` for tests. Public so engine and api tests
@@ -154,6 +166,23 @@ impl ContainerRuntime for FakeRuntime {
             .cloned()
             .collect())
     }
+
+    async fn logs(
+        &self,
+        container_id: &str,
+        _follow: bool,
+        _tail: usize,
+    ) -> anyhow::Result<LogStream> {
+        // A canned, finite stream so tests and no-Docker dev work without a
+        // daemon. The container id is echoed so callers can tell streams apart.
+        let lines = vec![
+            format!("[{container_id}] server listening on :8080"),
+            format!("[{container_id}] GET / 200"),
+            format!("[{container_id}] GET /health 200"),
+        ];
+        let stream = futures_util::stream::iter(lines.into_iter().map(Ok));
+        Ok(Box::pin(stream))
+    }
 }
 
 #[cfg(test)]
@@ -241,5 +270,18 @@ mod tests {
         assert_eq!(rt.pull_cred_of("ghcr.io/org/app:v1"), Some(Some(cred)));
         assert_eq!(rt.pull_cred_of("postgres:16"), Some(None));
         assert_eq!(rt.pull_cred_of("never-pulled"), None);
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_streams_canned_log_lines() {
+        use futures_util::StreamExt;
+        let rt = FakeRuntime::new();
+        let mut stream = rt.logs("fake-1", false, 100).await.unwrap();
+        let mut lines = Vec::new();
+        while let Some(item) = stream.next().await {
+            lines.push(item.unwrap());
+        }
+        assert!(!lines.is_empty());
+        assert!(lines.iter().any(|l| l.contains("listening")));
     }
 }
