@@ -18,8 +18,6 @@ pub fn html_escape(s: &str) -> String {
 }
 
 /// `1 branch` / `2 branches` — plain-English counts for meta lines.
-// First consumed by the overview/project views (later tasks); defined here now.
-#[allow(dead_code)]
 pub fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
