@@ -47,7 +47,9 @@ Task 3 deliberately includes a small refactor: `deploy`, `plan_urls`, and `urls_
 **Interfaces:**
 - Produces: `pub fn validate_hostname_template(template: &str) -> Result<(), String>` — `Ok(())` if the template is usable, else a human-readable message naming the problem.
 
-**Rules:** non-empty; contains `{branch}`; and substituting sample values yields a valid DNS name — total length ≤253, each dot-separated label 1–63 characters, each label made only of `[a-z0-9-]` and neither starting nor ending with `-`.
+**Rules:** non-empty; contains `{branch}`; **all placeholders confined to the template's first label**; and substituting sample values yields a valid DNS name — total length ≤253, each dot-separated label 1–63 characters, each label made only of `[a-z0-9-]` and neither starting nor ending with `-`.
+
+The first-label rule exists because a TLS wildcard matches exactly one label. `{service}-{branch}.dev.example.com` reduces to `*.dev.example.com`, but `{branch}.{service}.dev.example.com` would need `*.*.dev.example.com`, which Let's Encrypt will not issue. Enforcing it here means the certificate slice can always derive a usable wildcard.
 
 Uppercase is rejected rather than silently lowercased, so what the operator stores is exactly what gets served.
 
@@ -75,6 +77,22 @@ Append to the existing `mod tests` block in `src/settings.rs`:
     fn rejects_a_template_without_branch() {
         let err = validate_hostname_template("{service}.dev.example.com").unwrap_err();
         assert!(err.contains("{branch}"), "message should name the missing placeholder: {err}");
+    }
+
+    #[test]
+    fn rejects_placeholders_spanning_two_labels() {
+        // A TLS wildcard matches one label, so this could never be covered by
+        // a certificate for *.dev.example.com.
+        let err = validate_hostname_template("{branch}.{service}.dev.example.com").unwrap_err();
+        assert!(
+            err.contains("first label"),
+            "message should explain the one-label rule: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_placeholder_outside_the_first_label() {
+        assert!(validate_hostname_template("api.{branch}.dev.example.com").is_err());
     }
 
     #[test]
@@ -140,6 +158,17 @@ pub fn validate_hostname_template(template: &str) -> Result<(), String> {
         return Err(
             "hostname template must contain {branch}, or every branch of the project \
 would resolve to the same hostname"
+                .to_string(),
+        );
+    }
+    // A TLS wildcard matches exactly one label, so every placeholder must sit
+    // in the first label for `*.<rest>` to cover the hostnames produced here.
+    let first_label = template.split('.').next().unwrap_or("");
+    let rest = &template[first_label.len().min(template.len())..];
+    if rest.contains('{') {
+        return Err(
+            "every placeholder must be in the hostname template's first label, \
+because a TLS wildcard certificate matches only one label"
                 .to_string(),
         );
     }
