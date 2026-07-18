@@ -77,6 +77,7 @@ main{max-width:1080px;margin:0 auto;padding:clamp(1rem,3vw,2rem) clamp(1rem,4vw,
 .panel-body{display:grid;grid-template-columns:1.55fr 1fr;gap:0}
 .col{padding:1rem 1.2rem}
 .col.environment{border-left:1px solid var(--line);background:color-mix(in srgb,var(--panel-2) 55%,transparent)}
+.col.registry{grid-column:1/-1;border-top:1px solid var(--line)}
 .col-label{font-size:.68rem;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);font-weight:600;
   margin-bottom:.7rem;display:flex;align-items:center;gap:.5rem}
 .col-label .count{color:var(--faint);font-family:var(--mono);letter-spacing:0}
@@ -249,6 +250,7 @@ Deploy a branch or add environment variables to get started.</div>",
 
         render_deployments(&mut body, &deps);
         render_environment(&mut body, project, env);
+        render_registry(&mut body, project, env);
         body.push_str("</div></section>");
     }
 
@@ -409,11 +411,55 @@ onsubmit=\"return confirm('Delete this variable?')\">\
     );
 }
 
+/// The registry-credential block for one project: the stored host and
+/// username (password masked, never rendered) plus a form to set or replace
+/// it. A project has at most one credential, so this reuses `render_environment`'s
+/// `env-list`/`env-row` row shape for a single row instead of a multi-item list.
+fn render_registry(body: &mut String, project: &str, env: &[MaskedProject]) {
+    let cred = env
+        .iter()
+        .find(|p| p.project == project)
+        .and_then(|p| p.registry.as_ref());
+    let proj = html_escape(project);
+
+    body.push_str(
+        "<aside class=\"col registry\"><div class=\"col-label\">Registry credential</div>",
+    );
+
+    match cred {
+        None => {
+            body.push_str("<div class=\"empty\">No registry credential. Public images only.</div>")
+        }
+        Some(c) => {
+            let _ = write!(
+                body,
+                "<div class=\"env-list\"><div class=\"env-row\"><span class=\"k\">{registry}</span>\
+<form method=\"post\" action=\"/ui/projects/{proj}/registry/delete\" \
+onsubmit=\"return confirm('Remove this registry credential?')\">\
+<button class=\"icon-btn\" type=\"submit\" title=\"Remove registry credential\">\u{2715}</button></form>\
+<div class=\"env-meta\"><span class=\"val\">\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}</span>\
+<span class=\"tag\">{username}</span></div></div></div>",
+                registry = html_escape(&c.registry),
+                username = html_escape(&c.username),
+            );
+        }
+    }
+
+    let _ = write!(
+        body,
+        "<form class=\"add-var\" method=\"post\" action=\"/ui/projects/{proj}/registry\">\
+<input name=\"registry\" placeholder=\"ghcr.io\" required>\
+<input name=\"username\" placeholder=\"username\" required>\
+<input name=\"password\" type=\"password\" placeholder=\"token or password\" required>\
+<button class=\"btn primary\" type=\"submit\">Save credential</button></form></aside>",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config;
-    use crate::secrets::MaskedVar;
+    use crate::secrets::{MaskedRegistry, MaskedVar};
     use std::collections::BTreeMap;
 
     fn view(project: &str, branch: &str, status: &str, config_json: &str) -> DeploymentView {
@@ -437,6 +483,17 @@ mod tests {
                 })
                 .collect(),
             registry: None,
+        }
+    }
+
+    fn masked_with_registry(project: &str, registry: &str, username: &str) -> MaskedProject {
+        MaskedProject {
+            project: project.to_string(),
+            vars: vec![],
+            registry: Some(MaskedRegistry {
+                registry: registry.to_string(),
+                username: username.to_string(),
+            }),
         }
     }
 
@@ -520,5 +577,31 @@ mod tests {
     fn dashboard_empty_state() {
         let html = dashboard_page(&[], &[]);
         assert!(html.to_lowercase().contains("no projects"));
+    }
+
+    #[test]
+    fn registry_row_shows_host_and_username_but_masks_the_password() {
+        let env = [masked_with_registry("p", "ghcr.io", "bot")];
+        let html = dashboard_page(&[], &env);
+        assert!(html.contains("ghcr.io"));
+        assert!(html.contains("bot"));
+        assert!(html.contains("\u{2022}\u{2022}\u{2022}\u{2022}"));
+        assert!(html.contains("action=\"/ui/projects/p/registry/delete\""));
+    }
+
+    #[test]
+    fn project_without_a_registry_shows_the_empty_state_and_a_form() {
+        let env = [masked("p", &[("K", &[][..])])];
+        let html = dashboard_page(&[], &env);
+        assert!(html.contains("No registry credential"));
+        assert!(html.contains("action=\"/ui/projects/p/registry\""));
+    }
+
+    #[test]
+    fn registry_fields_are_html_escaped() {
+        let env = [masked_with_registry("p", "ghcr.io", "<script>x</script>")];
+        let html = dashboard_page(&[], &env);
+        assert!(!html.contains("<script>x</script>"));
+        assert!(html.contains("&lt;script&gt;"));
     }
 }

@@ -516,6 +516,8 @@ async fn ui_root<R: ContainerRuntime>(
 /// The dashboard's env-management POST routes, all cookie-authenticated:
 ///   `<project>/vars`              — set/replace a variable (form body)
 ///   `<project>/vars/<key>/delete` — delete a variable
+///   `<project>/registry`          — set/replace the registry credential (form body)
+///   `<project>/registry/delete`   — remove the registry credential
 ///   `<project>/delete`            — delete all of a project's variables
 async fn ui_projects<R: ContainerRuntime>(
     req: Request<Incoming>,
@@ -546,6 +548,34 @@ async fn ui_projects<R: ContainerRuntime>(
             .filter(|s| !s.is_empty())
             .collect();
         return match engine.store().set_var(&project, &key, &value, services) {
+            Ok(()) => redirect("/"),
+            Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
+        };
+    }
+
+    // Must be checked before the generic "/delete" block below:
+    // `strip_suffix("/registry")` would not match "<project>/registry/delete",
+    // so without this block first the generic "/delete" handler would catch
+    // it and mis-route into `delete_project`, wiping every stored variable
+    // for the project instead of just the credential.
+    if let Some(project) = sub.strip_suffix("/registry/delete") {
+        let _ = engine.store().delete_registry(project);
+        return redirect("/");
+    }
+
+    if let Some(project) = sub.strip_suffix("/registry") {
+        let project = project.to_string();
+        let bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return text(StatusCode::BAD_REQUEST, "could not read request body"),
+        };
+        let registry = form_field(&bytes, "registry").unwrap_or_default();
+        let username = form_field(&bytes, "username").unwrap_or_default();
+        let password = form_field(&bytes, "password").unwrap_or_default();
+        return match engine
+            .store()
+            .set_registry(&project, &registry, &username, &password)
+        {
             Ok(()) => redirect("/"),
             Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
         };
@@ -741,6 +771,84 @@ mod tests {
         call_with_auth(engine, settings, sessions, method, path, body, None).await
     }
 
+    /// A fresh engine/settings/sessions trio with the dashboard enabled, plus
+    /// a `Cookie` header value for an already-valid session — for exercising
+    /// the cookie-authenticated `/ui/*` routes.
+    fn dashboard_harness() -> (
+        Arc<Engine<FakeRuntime>>,
+        Arc<Settings>,
+        Arc<Sessions>,
+        String,
+    ) {
+        let rt = Arc::new(FakeRuntime::new());
+        let settings = Arc::new(Settings {
+            listen: "127.0.0.1:0".into(),
+            api_listen: "127.0.0.1:0".into(),
+            hostname_template: "{service}-{branch}.dev.example.com".into(),
+            registry: "reg.example.com".into(),
+            token: "secret".into(),
+            dashboard_password: Some("dashpw".into()),
+        });
+        let engine = Arc::new(Engine::with_readiness(
+            rt,
+            SharedRoutes::new(RoutingTable::new()),
+            settings.clone(),
+            Arc::new(AlwaysReady),
+            temp_store(),
+        ));
+        let sessions = Arc::new(Sessions::new());
+        let cookie = format!("{SESSION_COOKIE}={}", sessions.create());
+        (engine, settings, sessions, cookie)
+    }
+
+    /// Drive `handle_api` over an in-memory duplex connection with a session
+    /// `Cookie` header rather than a bearer token, for the `/ui/*` routes.
+    async fn call_with_cookie(
+        engine: &Arc<Engine<FakeRuntime>>,
+        settings: &Arc<Settings>,
+        sessions: &Arc<Sessions>,
+        method: Method,
+        path: &str,
+        body: &str,
+        cookie: &str,
+    ) -> Response<Incoming> {
+        let (client_io, server_io) = duplex(64 * 1024);
+
+        let engine = engine.clone();
+        let settings_for_server = settings.clone();
+        let sessions = sessions.clone();
+        tokio::spawn(async move {
+            let service = service_fn(move |req| {
+                handle_api(
+                    req,
+                    engine.clone(),
+                    settings_for_server.clone(),
+                    sessions.clone(),
+                )
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await;
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("client handshake failed");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost")
+            .header(COOKIE, cookie)
+            .body(Full::new(Bytes::from(body.to_string())))
+            .expect("request is always valid");
+
+        sender.send_request(req).await.expect("request failed")
+    }
+
     async fn body_string(res: Response<Incoming>) -> String {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
@@ -826,5 +934,80 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ui_projects_registry_sets_the_credential() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/projects/myproj/registry",
+            "registry=ghcr.io&username=bot&password=ghp_secret",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let c = engine.store().registry_for("myproj").unwrap();
+        assert_eq!(c.registry, "ghcr.io");
+        assert_eq!(c.username, "bot");
+        assert_eq!(c.password, "ghp_secret");
+    }
+
+    #[tokio::test]
+    async fn ui_projects_registry_delete_removes_the_credential() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        engine
+            .store()
+            .set_registry("myproj", "ghcr.io", "bot", "x")
+            .unwrap();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/projects/myproj/registry/delete",
+            "",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert!(engine.store().registry_for("myproj").is_none());
+    }
+
+    /// Regression guard for the route-ordering requirement: `/registry/delete`
+    /// must be matched before the generic `/delete` suffix (which routes to
+    /// `delete_project` and would wipe every stored variable), and before
+    /// `/registry` (whose `strip_suffix` wouldn't match the longer path
+    /// anyway, but the ordering is what keeps it that way on purpose).
+    #[tokio::test]
+    async fn ui_projects_registry_delete_does_not_wipe_the_projects_vars() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        engine
+            .store()
+            .set_var("myproj", "KEEP_ME", "v", vec![])
+            .unwrap();
+        engine
+            .store()
+            .set_registry("myproj", "ghcr.io", "bot", "x")
+            .unwrap();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/projects/myproj/registry/delete",
+            "",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert!(engine.store().registry_for("myproj").is_none());
+        assert_eq!(
+            engine.store().env_for("myproj", "any").get("KEEP_ME"),
+            Some(&"v".to_string())
+        );
     }
 }
