@@ -47,6 +47,9 @@ pub struct FakeRuntime {
 struct FakeState {
     networks: Vec<String>,
     containers: Vec<RunningContainer>,
+    /// Env passed to `run`, keyed by container name — env isn't part of
+    /// `RunningContainer`, so capture it here for test assertions.
+    env: BTreeMap<String, Vec<String>>,
     next: u32,
 }
 
@@ -58,6 +61,11 @@ impl FakeRuntime {
     /// Number of containers currently "running" — for test assertions.
     pub fn container_count(&self) -> usize {
         self.inner.lock().unwrap().containers.len()
+    }
+
+    /// The env `run` last received for a container name — for test assertions.
+    pub fn env_of(&self, container_name: &str) -> Option<Vec<String>> {
+        self.inner.lock().unwrap().env.get(container_name).cloned()
     }
 }
 
@@ -97,6 +105,7 @@ impl ContainerRuntime for FakeRuntime {
             ip: Some(format!("10.42.{}.{}", n / 256, n % 256)),
             labels: spec.labels.clone(),
         };
+        s.env.insert(spec.name.clone(), spec.env.clone());
         s.containers.push(c.clone());
         Ok(c)
     }

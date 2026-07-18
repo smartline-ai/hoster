@@ -5,6 +5,11 @@ pub const BRANCH: &str = "hoster.branch";
 pub const SERVICE: &str = "hoster.service";
 pub const PORT: &str = "hoster.port";
 pub const HOSTNAME: &str = "hoster.hostname";
+pub const PROJECT: &str = "hoster.project";
+/// JSON of the submitted deploy config (the repo's `hoster.json`), stored so the
+/// dashboard can show how a branch was deployed. Hoster-managed injected env is
+/// **not** in here — only what the caller submitted.
+pub const CONFIG: &str = "hoster.config";
 
 /// Rebuild a routing table from running containers. A container is routed only
 /// if it carries a hostname label, a parseable port label, and a known IP —

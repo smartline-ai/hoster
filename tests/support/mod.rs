@@ -6,6 +6,8 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
@@ -13,6 +15,18 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+
+/// A fresh, empty project env store backed by a unique temp file — one per
+/// spawned server so tests don't share state.
+pub fn temp_store() -> Arc<hoster::secrets::Store> {
+    static C: AtomicU32 = AtomicU32::new(0);
+    let n = C.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!(
+        "hoster-it-{}-{n}/projects.json",
+        std::process::id()
+    ));
+    Arc::new(hoster::secrets::Store::load(path).unwrap())
+}
 
 /// What the stub upstream saw on its most recent request.
 #[derive(Debug, Clone, Default)]

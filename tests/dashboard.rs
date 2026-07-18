@@ -4,8 +4,20 @@ use hoster::api::serve_api;
 use hoster::engine::{AlwaysReady, Engine};
 use hoster::routing::{RoutingTable, SharedRoutes};
 use hoster::runtime::FakeRuntime;
+use hoster::secrets::Store;
 use hoster::settings::Settings;
 use tokio::net::TcpListener;
+
+fn temp_store() -> Arc<Store> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static C: AtomicU32 = AtomicU32::new(0);
+    let n = C.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!(
+        "hoster-dash-it-{}-{n}/projects.json",
+        std::process::id()
+    ));
+    Arc::new(Store::load(path).unwrap())
+}
 
 fn settings(password: Option<&str>) -> Arc<Settings> {
     Arc::new(Settings {
@@ -25,6 +37,7 @@ async fn spawn(password: Option<&str>) -> (String, Arc<FakeRuntime>) {
         SharedRoutes::new(RoutingTable::new()),
         settings(password),
         Arc::new(AlwaysReady),
+        temp_store(),
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

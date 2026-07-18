@@ -7,6 +7,7 @@ use crate::config::{self, DeployConfig};
 use crate::labels;
 use crate::routing::SharedRoutes;
 use crate::runtime::{ContainerRuntime, ContainerSpec, RunningContainer};
+use crate::secrets::Store;
 use crate::settings::{Settings, hostname_for, sanitize_branch};
 use crate::template::{TemplateVars, substitute};
 
@@ -64,6 +65,7 @@ pub struct Engine<R: ContainerRuntime> {
     routes: SharedRoutes,
     settings: Arc<Settings>,
     readiness: Arc<dyn ReadinessChecker>,
+    store: Arc<Store>,
     status: Mutex<BTreeMap<String, DeployStatus>>,
     urls: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
     /// Serializes the list-by-label + routes.swap critical section so
@@ -79,8 +81,9 @@ impl<R: ContainerRuntime> Engine<R> {
         routes: SharedRoutes,
         settings: Arc<Settings>,
         readiness: Arc<dyn ReadinessChecker>,
+        store: Arc<Store>,
     ) -> Self {
-        Self::with_readiness(runtime, routes, settings, readiness)
+        Self::with_readiness(runtime, routes, settings, readiness, store)
     }
 
     pub fn with_readiness(
@@ -88,12 +91,14 @@ impl<R: ContainerRuntime> Engine<R> {
         routes: SharedRoutes,
         settings: Arc<Settings>,
         readiness: Arc<dyn ReadinessChecker>,
+        store: Arc<Store>,
     ) -> Self {
         Self {
             runtime,
             routes,
             settings,
             readiness,
+            store,
             status: Mutex::new(BTreeMap::new()),
             urls: Mutex::new(BTreeMap::new()),
             swap_lock: tokio::sync::Mutex::new(()),
@@ -141,8 +146,20 @@ impl<R: ContainerRuntime> Engine<R> {
         // 3. create network, then pull+run every service. Any failure here
         // (e.g. partway through the service loop) must not leave orphaned
         // resources or a stuck Provisioning status.
+        // Snapshot of the submitted config, stored as a label so the dashboard
+        // can show how the branch was deployed. Injected store secrets are
+        // merged into the real env below and never enter this JSON.
+        let config_json = serde_json::to_string(&req.config)?;
+
         let exposed = match self
-            .create_and_run_services(&branch, &network, &vars, &req.config.services)
+            .create_and_run_services(
+                &branch,
+                &network,
+                &vars,
+                &req.config.project,
+                &config_json,
+                &req.config.services,
+            )
             .await
         {
             Ok(exposed) => exposed,
@@ -190,6 +207,8 @@ impl<R: ContainerRuntime> Engine<R> {
         branch: &str,
         network: &str,
         vars: &TemplateVars,
+        project: &str,
+        config_json: &str,
         services: &BTreeMap<String, config::Service>,
     ) -> anyhow::Result<Vec<(RunningContainer, u16, Option<String>)>> {
         self.runtime
@@ -199,15 +218,24 @@ impl<R: ContainerRuntime> Engine<R> {
         let mut exposed: Vec<(RunningContainer, u16, Option<String>)> = Vec::new();
         for (name, svc) in services {
             let image = substitute(&svc.image, vars).map_err(|m| anyhow::anyhow!(m))?;
-            let mut env = Vec::new();
+            // Build env from hoster.json (template-substituted), then overlay the
+            // hoster-managed store vars verbatim — stored values win on conflict
+            // and are never template-substituted (a `{{` in a secret is literal).
+            let mut env_map: BTreeMap<String, String> = BTreeMap::new();
             for (k, v) in &svc.env {
-                env.push(format!(
-                    "{k}={}",
-                    substitute(v, vars).map_err(|m| anyhow::anyhow!(m))?
-                ));
+                env_map.insert(
+                    k.clone(),
+                    substitute(v, vars).map_err(|m| anyhow::anyhow!(m))?,
+                );
             }
+            for (k, v) in self.store.env_for(project, name) {
+                env_map.insert(k, v);
+            }
+            let env: Vec<String> = env_map.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
             let mut labels = branch_label(branch);
             labels.insert(labels::SERVICE.to_string(), name.clone());
+            labels.insert(labels::PROJECT.to_string(), project.to_string());
+            labels.insert(labels::CONFIG.to_string(), config_json.to_string());
             if let Some(exp) = &svc.expose {
                 let sub = exp.subdomain.clone().unwrap_or_else(|| name.clone());
                 labels.insert(labels::PORT.to_string(), exp.port.to_string());
@@ -340,9 +368,28 @@ mod tests {
         })
     }
 
+    fn empty_store() -> Arc<Store> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let n = C.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "hoster-engine-test-{}-{n}/projects.json",
+            std::process::id()
+        ));
+        Arc::new(Store::load(path).unwrap())
+    }
+
     fn engine(rt: Arc<FakeRuntime>, routes: SharedRoutes) -> Engine<FakeRuntime> {
         // AlwaysReady checker: no real TCP/HTTP in unit tests.
-        Engine::with_readiness(rt, routes, settings(), Arc::new(AlwaysReady))
+        Engine::with_readiness(rt, routes, settings(), Arc::new(AlwaysReady), empty_store())
+    }
+
+    fn engine_with_store(
+        rt: Arc<FakeRuntime>,
+        routes: SharedRoutes,
+        store: Arc<Store>,
+    ) -> Engine<FakeRuntime> {
+        Engine::with_readiness(rt, routes, settings(), Arc::new(AlwaysReady), store)
     }
 
     fn request(branch: &str, json: &str) -> DeployRequest {
@@ -379,6 +426,50 @@ mod tests {
         assert_eq!(accepted.urls["backend"], format!("http://{host}"));
         // internal postgres has no route
         assert_eq!(routes.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stored_env_overrides_hoster_json_and_targets_only_listed_service() {
+        let rt = Arc::new(FakeRuntime::new());
+        let store = empty_store();
+        store
+            .set_var("p", "GOOGLE_API_KEY", "from-hoster", vec!["backend".into()])
+            .unwrap();
+        store.set_var("p", "DATABASE_URL", "stored-wins", vec![]).unwrap();
+        let eng = engine_with_store(rt.clone(), SharedRoutes::new(crate::routing::RoutingTable::new()), store);
+        eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+
+        let backend = rt.env_of("b1-backend").unwrap();
+        // Targeted secret reaches backend.
+        assert!(backend.iter().any(|e| e == "GOOGLE_API_KEY=from-hoster"));
+        // Stored value overrides the hoster.json DATABASE_URL for the same key.
+        assert!(backend.iter().any(|e| e == "DATABASE_URL=stored-wins"));
+        assert!(!backend.iter().any(|e| e == "DATABASE_URL=postgres://postgres:5432/app"));
+
+        // postgres is not a target of GOOGLE_API_KEY, but is of the all-services var.
+        let pg = rt.env_of("b1-postgres").unwrap();
+        assert!(!pg.iter().any(|e| e.starts_with("GOOGLE_API_KEY=")));
+        assert!(pg.iter().any(|e| e == "DATABASE_URL=stored-wins"));
+    }
+
+    #[tokio::test]
+    async fn containers_carry_project_and_config_labels_without_secrets() {
+        let rt = Arc::new(FakeRuntime::new());
+        let store = empty_store();
+        store.set_var("p", "SECRET_KEY", "topsecret", vec![]).unwrap();
+        let eng = engine_with_store(rt.clone(), SharedRoutes::new(crate::routing::RoutingTable::new()), store);
+        eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+
+        let cs = rt.list_by_label(crate::labels::PROJECT).await.unwrap();
+        let backend = cs.iter().find(|c| c.name == "b1-backend").unwrap();
+        assert_eq!(backend.labels[crate::labels::PROJECT], "p");
+        let cfg = &backend.labels[crate::labels::CONFIG];
+        // The submitted config round-trips…
+        assert!(cfg.contains("\"backend\""));
+        assert!(cfg.contains("\"project\":\"p\"") || cfg.contains("\"project\": \"p\""));
+        // …but the injected secret is never written into the config label.
+        assert!(!cfg.contains("topsecret"), "secret leaked into config label: {cfg}");
+        assert!(!cfg.contains("SECRET_KEY"), "secret key leaked into config label: {cfg}");
     }
 
     #[tokio::test]
@@ -445,7 +536,13 @@ mod tests {
         let rt = Arc::new(FakeRuntime::new());
         let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
         let eng =
-            Engine::with_readiness(rt.clone(), routes.clone(), settings(), Arc::new(NeverReady));
+            Engine::with_readiness(
+                rt.clone(),
+                routes.clone(),
+                settings(),
+                Arc::new(NeverReady),
+                empty_store(),
+            );
         let r = eng.deploy(request("b1", TWO_SERVICE)).await;
         assert!(r.is_err());
         assert!(routes.load().is_empty());
@@ -465,7 +562,13 @@ mod tests {
         let rt = Arc::new(FakeRuntime::new());
         let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
         let eng =
-            Engine::with_readiness(rt.clone(), routes.clone(), settings(), Arc::new(NeverReady));
+            Engine::with_readiness(
+                rt.clone(),
+                routes.clone(),
+                settings(),
+                Arc::new(NeverReady),
+                empty_store(),
+            );
         let r = eng.deploy(request("b1", TWO_SERVICE)).await;
         assert!(r.is_err());
         assert!(matches!(eng.status_of("b1"), Some(DeployStatus::Failed(_))));
