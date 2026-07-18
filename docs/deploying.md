@@ -173,6 +173,30 @@ referencing an internal service is a validation error.
 
 ---
 
+## Project environment & secrets
+
+Keep secrets — API keys, tokens — **out** of `hoster.json` and the image. Store
+them in hoster instead, per project, and hoster injects them into that project's
+services on every deploy. Set them in the dashboard's **Environment** section
+(grouped under your project) or via the control API:
+
+```bash
+# set/replace a variable; "services":[] targets every service
+curl -fsS -X PUT "http://hoster.internal:8081/projects/myapp/vars/GOOGLE_API_KEY" \
+  -H "Authorization: Bearer $HOSTER_TOKEN" \
+  -d '{"value":"AIza…","services":["backend"]}'
+```
+
+- The `project` in the path must match `project` in your `hoster.json`.
+- **Precedence:** on a key conflict the stored value wins over `hoster.json`.
+  Stored values are injected verbatim — no `{{…}}` templating.
+- **Masked:** `GET /projects` and the dashboard show keys and target services,
+  never values.
+- The injected value is present in the container's environment (visible via
+  `docker inspect` on the host); it never appears in labels or logs.
+
+---
+
 ## The control API
 
 All requests except `GET /healthz` require the header

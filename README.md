@@ -40,6 +40,7 @@ the HTTP `Host` header, and keeps each branch on its own Docker network.
   - [Wildcard DNS](#wildcard-dns)
   - [HTTPS with a reverse proxy](#https-with-a-reverse-proxy)
   - [The dashboard](#the-dashboard)
+  - [Project environment & secrets](#project-environment--secrets)
 - [Verifying your setup](#verifying-your-setup)
 - [Deploying a project](#deploying-a-project)
 - [Releasing (maintainers)](#releasing-maintainers)
@@ -164,6 +165,7 @@ the only required one. The installer keeps them in `/etc/hoster/hoster.env`.
 | `HOSTER_HOSTNAME_TEMPLATE` | `{service}-{branch}.dev.example.com` | How public hostnames are built. `{service}` and `{branch}` are substituted. |
 | `HOSTER_REGISTRY` | `localhost:5000` | Registry base used for the `{{registry}}` template variable in image refs. |
 | `HOSTER_DASHBOARD_PASSWORD` | *(unset)* | Set a non-empty value to enable the web [dashboard](#the-dashboard). Unset disables it. |
+| `HOSTER_PROJECTS_FILE` | `/etc/hoster/projects.json` | Where [project environment variables](#project-environment--secrets) are stored (`0600`). |
 | `DOCKER_HOST` | *(Docker default)* | Socket selection, honoured by the Docker client. Set it if your socket is non-standard. |
 | `RUST_LOG` | `hoster=info` | Log filter (`tracing`/`env_filter` syntax), e.g. `hoster=debug`. |
 
@@ -248,12 +250,16 @@ Redirect `:80` to `:443` in a separate server block if you want to force HTTPS.
 ### The dashboard
 
 Setting `HOSTER_DASHBOARD_PASSWORD` enables a small server-rendered web
-dashboard that lists deployments and lets you tear a branch down. It is served
-on the **control API listener** (`HOSTER_API_LISTEN`) at:
+dashboard, **grouped by project**. Each project card shows its deployments
+(branch, status, URLs, and an expandable **config** view of the `hoster.json`
+each branch was deployed from) and its [managed environment](#project-environment--secrets).
+It is served on the **control API listener** (`HOSTER_API_LISTEN`) at:
 
 - `GET /login`, `POST /login` — password login (sets a session cookie)
-- `GET /` — the dashboard (lists branches, status, and URLs)
+- `GET /` — the project-grouped dashboard
 - `POST /ui/destroy/<branch>` — tear a branch down from the UI
+- `POST /ui/projects/<project>/vars` — add/replace a managed env var
+- `POST /ui/projects/<project>/vars/<key>/delete` — delete one
 - `POST /logout`
 
 Because it lives on the private API listener, reach it the same way you reach
@@ -261,6 +267,46 @@ the control API: over your VPN/private interface, an SSH tunnel, or behind a
 separate TLS-terminating, access-controlled vhost. Leave
 `HOSTER_DASHBOARD_PASSWORD` unset to disable the dashboard entirely (its routes
 then return `503 dashboard not configured`).
+
+### Project environment & secrets
+
+hoster can hold environment variables for a project — API keys, tokens, and
+other config you don't want baked into an image or committed to `hoster.json`.
+It injects them into that project's services on **every** deploy. Set them once
+in the dashboard's **Environment** section (or via the API below); they persist
+in `HOSTER_PROJECTS_FILE` (`/etc/hoster/projects.json`, mode `0600`).
+
+- **Targeting.** Each variable targets specific services (a comma-separated
+  list), or **all** services when left blank. A `GOOGLE_API_KEY` can go to
+  `backend` only.
+- **Precedence.** On a key conflict, the stored value **wins** over the same key
+  in `hoster.json` — so central rotation always takes effect and a branch can't
+  shadow a secret. Stored values are injected verbatim (no `{{…}}` templating).
+- **Masking.** Values are write-only: the dashboard and API show a variable's
+  key and target services but **never** its value.
+- **The `project` must match.** Use the same name as `project` in the branch's
+  `hoster.json`.
+
+> **Trust note.** An injected value does end up in the target container's
+> environment, so it's visible via `docker inspect` on the host — inherent, and
+> consistent with hoster's "host access = full access" model. It never appears
+> in container labels or logs.
+
+JSON API (bearer token), for CI-driven rotation:
+
+```bash
+# set/replace a variable (services: [] = all services)
+curl -fsS -X PUT "$API/projects/odinvestor/vars/GOOGLE_API_KEY" \
+  -H "Authorization: Bearer $HOSTER_TOKEN" \
+  -d '{"value":"AIza…","services":["backend"]}'
+
+# list (masked — values are never returned)
+curl -fsS "$API/projects" -H "Authorization: Bearer $HOSTER_TOKEN"
+
+# delete
+curl -fsS -X DELETE "$API/projects/odinvestor/vars/GOOGLE_API_KEY" \
+  -H "Authorization: Bearer $HOSTER_TOKEN"
+```
 
 ---
 
