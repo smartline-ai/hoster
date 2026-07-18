@@ -789,6 +789,11 @@ mod tests {
         store
             .set_registry("myproj", "ghcr.io", "bot", "ghp_secret")
             .unwrap();
+        let expected = crate::secrets::RegistryCred {
+            registry: "ghcr.io".to_string(),
+            username: "bot".to_string(),
+            password: "ghp_secret".to_string(),
+        };
 
         let config = r#"{"project":"myproj","services":{
             "postgres":{"image":"postgres:16"},
@@ -798,9 +803,9 @@ mod tests {
 
         let sent = runtime.pull_cred_of("ghcr.io/org/backend:v1").unwrap();
         assert_eq!(
-            sent.as_ref().map(|c| c.username.as_str()),
-            Some("bot"),
-            "credential should be sent to its own registry"
+            sent,
+            Some(expected),
+            "the exact stored credential (registry, username, password) should be sent to its own registry"
         );
 
         let public = runtime.pull_cred_of("postgres:16").unwrap();
