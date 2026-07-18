@@ -569,13 +569,15 @@ async fn ui_root<R: ContainerRuntime>(
     let env = engine.store().list_masked();
     html(
         StatusCode::OK,
-        dashboard::dashboard_page(&deployments, &env),
+        dashboard::dashboard_page(&deployments, &env, &settings.hostname_template),
     )
 }
 
 /// The dashboard's env-management POST routes, all cookie-authenticated:
 ///   `<project>/vars`              — set/replace a variable (form body)
 ///   `<project>/vars/<key>/delete` — delete a variable
+///   `<project>/domain/delete`     — revert the project to the global default domain
+///   `<project>/domain`            — set/replace the project's hostname template (form body)
 ///   `<project>/registry`          — set/replace the registry credential (form body)
 ///   `<project>/registry/delete`   — remove the registry credential
 ///   `<project>/delete`            — delete all of a project's variables
@@ -608,6 +610,28 @@ async fn ui_projects<R: ContainerRuntime>(
             .filter(|s| !s.is_empty())
             .collect();
         return match engine.store().set_var(&project, &key, &value, services) {
+            Ok(()) => redirect("/"),
+            Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
+        };
+    }
+
+    // Must be checked before the generic "/delete" block below, for the same
+    // reason as "/registry/delete" below it: without this block first, the
+    // generic "/delete" handler would catch "<project>/domain/delete" and
+    // mis-route into `delete_project` instead of reverting the domain.
+    if let Some(project) = sub.strip_suffix("/domain/delete") {
+        let _ = engine.store().delete_hostname_template(project);
+        return redirect("/");
+    }
+
+    if let Some(project) = sub.strip_suffix("/domain") {
+        let project = project.to_string();
+        let bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return text(StatusCode::BAD_REQUEST, "could not read request body"),
+        };
+        let template = form_field(&bytes, "hostname_template").unwrap_or_default();
+        return match engine.store().set_hostname_template(&project, &template) {
             Ok(()) => redirect("/"),
             Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
         };
@@ -1151,5 +1175,87 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ui_projects_domain_sets_the_template() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/projects/myproj/domain",
+            "hostname_template={branch}.demo.example.com",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            engine.store().hostname_template_for("myproj").as_deref(),
+            Some("{branch}.demo.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_projects_domain_delete_reverts_to_the_default() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        engine
+            .store()
+            .set_hostname_template("myproj", "{branch}.demo.example.com")
+            .unwrap();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/projects/myproj/domain/delete",
+            "",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert!(engine.store().hostname_template_for("myproj").is_none());
+    }
+
+    /// Regression guard for the route-ordering requirement: `/domain/delete`
+    /// must be matched before the generic `/delete` suffix. If it isn't, a
+    /// revert request falls through to `delete_project` instead of
+    /// `delete_hostname_template`, so the template is never cleared — and,
+    /// were "myproj" itself ever named such that the mis-routed key matched,
+    /// the project's variables would be wiped along with it.
+    #[tokio::test]
+    async fn ui_projects_domain_delete_does_not_wipe_the_projects_vars() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        engine
+            .store()
+            .set_var("myproj", "KEEP_ME", "v", vec![])
+            .unwrap();
+        engine
+            .store()
+            .set_hostname_template("myproj", "{branch}.demo.example.com")
+            .unwrap();
+
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/projects/myproj/domain/delete",
+            "",
+            &cookie,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert!(
+            engine.store().hostname_template_for("myproj").is_none(),
+            "reverting the domain must actually clear the template"
+        );
+        assert_eq!(
+            engine.store().env_for("myproj", "backend").get("KEEP_ME"),
+            Some(&"v".to_string()),
+            "reverting the domain must not delete the project's variables"
+        );
     }
 }

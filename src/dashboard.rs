@@ -78,6 +78,7 @@ main{max-width:1080px;margin:0 auto;padding:clamp(1rem,3vw,2rem) clamp(1rem,4vw,
 .col{padding:1rem 1.2rem}
 .col.environment{border-left:1px solid var(--line);background:color-mix(in srgb,var(--panel-2) 55%,transparent)}
 .col.registry{grid-column:1/-1;border-top:1px solid var(--line)}
+.col.domain{grid-column:1/-1;border-top:1px solid var(--line)}
 .col-label{font-size:.68rem;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);font-weight:600;
   margin-bottom:.7rem;display:flex;align-items:center;gap:.5rem}
 .col-label .count{color:var(--faint);font-family:var(--mono);letter-spacing:0}
@@ -193,8 +194,14 @@ fn is_running(status: &str) -> bool {
 
 /// The dashboard: deployments and hoster-managed environment, grouped by
 /// project. `env` carries only masked variables (keys + target services) —
-/// values are never passed in, so they cannot be rendered.
-pub fn dashboard_page(deployments: &[DeploymentView], env: &[MaskedProject]) -> String {
+/// values are never passed in, so they cannot be rendered. `default_template`
+/// is the global hostname template, shown for any project that has not set
+/// its own.
+pub fn dashboard_page(
+    deployments: &[DeploymentView],
+    env: &[MaskedProject],
+    default_template: &str,
+) -> String {
     let mut projects: BTreeSet<&str> = BTreeSet::new();
     for d in deployments {
         projects.insert(d.project.as_str());
@@ -250,6 +257,7 @@ Deploy a branch or add environment variables to get started.</div>",
 
         render_deployments(&mut body, &deps);
         render_environment(&mut body, project, env);
+        render_domain(&mut body, project, env, default_template);
         render_registry(&mut body, project, env);
         body.push_str("</div></section>");
     }
@@ -411,6 +419,52 @@ onsubmit=\"return confirm('Delete this variable?')\">\
     );
 }
 
+/// The domain block for one project: the effective hostname template — the
+/// project's own, or the global default marked as inherited — plus a form to
+/// set or replace it. The template is not a secret, so unlike the environment
+/// and registry rows it is rendered in full rather than masked. Like
+/// `render_registry`, this reuses `render_environment`'s `env-list`/`env-row`
+/// row shape for a single row instead of a multi-item list.
+fn render_domain(body: &mut String, project: &str, env: &[MaskedProject], default_template: &str) {
+    let own = env
+        .iter()
+        .find(|p| p.project == project)
+        .and_then(|p| p.hostname_template.as_deref());
+    let proj = html_escape(project);
+
+    body.push_str(
+        "<aside class=\"col domain\"><div class=\"col-label\">Domain</div><div class=\"env-list\">",
+    );
+    match own {
+        None => {
+            let _ = write!(
+                body,
+                "<div class=\"env-row\"><span class=\"k\">{}</span>\
+<div class=\"env-meta\"><span class=\"tag all\">default</span></div></div>",
+                html_escape(default_template),
+            );
+        }
+        Some(t) => {
+            let _ = write!(
+                body,
+                "<div class=\"env-row\"><span class=\"k\">{}</span>\
+<form method=\"post\" action=\"/ui/projects/{proj}/domain/delete\" \
+onsubmit=\"return confirm('Revert this project to the default domain?')\">\
+<button class=\"icon-btn\" type=\"submit\" title=\"Revert to default\">\u{2715}</button></form></div>",
+                html_escape(t),
+            );
+        }
+    }
+    body.push_str("</div>");
+
+    let _ = write!(
+        body,
+        "<form class=\"add-var\" method=\"post\" action=\"/ui/projects/{proj}/domain\">\
+<input name=\"hostname_template\" placeholder=\"{{branch}}.demo.example.com\" required>\
+<button class=\"btn primary\" type=\"submit\">Save domain</button></form></aside>",
+    );
+}
+
 /// The registry-credential block for one project: the stored host and
 /// username (password masked, never rendered) plus a form to set or replace
 /// it. A project has at most one credential, so this reuses `render_environment`'s
@@ -499,6 +553,17 @@ mod tests {
         }
     }
 
+    fn masked_with_template(project: &str, template: &str) -> MaskedProject {
+        MaskedProject {
+            project: project.to_string(),
+            vars: vec![],
+            registry: None,
+            hostname_template: Some(template.to_string()),
+        }
+    }
+
+    const DEFAULT_TEMPLATE: &str = "{service}-{branch}.dev.example.com";
+
     const CFG: &str = r#"{"project":"odinvestor","services":{
         "backend":{"image":"reg/backend:abc","env":{"PORT":"8080"},"expose":{"port":8080}}
     }}"#;
@@ -529,6 +594,7 @@ mod tests {
         let html = dashboard_page(
             &[view("odinvestor", "b1", "running", CFG)],
             &[masked("odinvestor", &[("GOOGLE_API_KEY", &["backend"])])],
+            DEFAULT_TEMPLATE,
         );
         assert!(html.contains("odinvestor"));
         assert!(html.contains("b1"));
@@ -540,7 +606,11 @@ mod tests {
 
     #[test]
     fn shows_service_image_and_env_from_config() {
-        let html = dashboard_page(&[view("odinvestor", "b1", "running", CFG)], &[]);
+        let html = dashboard_page(
+            &[view("odinvestor", "b1", "running", CFG)],
+            &[],
+            DEFAULT_TEMPLATE,
+        );
         assert!(html.contains("reg/backend:abc"));
         assert!(html.contains("PORT"));
         assert!(html.contains("8080"));
@@ -548,7 +618,7 @@ mod tests {
 
     #[test]
     fn masked_var_shows_key_not_value_and_has_forms() {
-        let html = dashboard_page(&[], &[masked("p", &[("SECRET", &[])])]);
+        let html = dashboard_page(&[], &[masked("p", &[("SECRET", &[])])], DEFAULT_TEMPLATE);
         assert!(html.contains("SECRET"));
         assert!(html.contains("action=\"/ui/projects/p/vars\""));
         assert!(html.contains("/ui/projects/p/vars/SECRET/delete"));
@@ -560,7 +630,11 @@ mod tests {
 
     #[test]
     fn project_with_only_env_still_renders() {
-        let html = dashboard_page(&[], &[masked("secretsonly", &[("K", &[])])]);
+        let html = dashboard_page(
+            &[],
+            &[masked("secretsonly", &[("K", &[])])],
+            DEFAULT_TEMPLATE,
+        );
         assert!(html.contains("secretsonly"));
         assert!(html.contains("No deployments"));
     }
@@ -570,6 +644,7 @@ mod tests {
         let html = dashboard_page(
             &[view("p", "b", "failed: <script>alert(1)</script>", CFG)],
             &[],
+            DEFAULT_TEMPLATE,
         );
         assert!(!html.contains("<script>alert(1)"));
         assert!(html.contains("&lt;script&gt;"));
@@ -577,14 +652,14 @@ mod tests {
 
     #[test]
     fn dashboard_empty_state() {
-        let html = dashboard_page(&[], &[]);
+        let html = dashboard_page(&[], &[], DEFAULT_TEMPLATE);
         assert!(html.to_lowercase().contains("no projects"));
     }
 
     #[test]
     fn registry_row_shows_host_and_username_but_masks_the_password() {
         let env = [masked_with_registry("p", "ghcr.io", "bot")];
-        let html = dashboard_page(&[], &env);
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
         assert!(html.contains("ghcr.io"));
         assert!(html.contains("bot"));
         assert!(html.contains("\u{2022}\u{2022}\u{2022}\u{2022}"));
@@ -594,7 +669,7 @@ mod tests {
     #[test]
     fn project_without_a_registry_shows_the_empty_state_and_a_form() {
         let env = [masked("p", &[("K", &[][..])])];
-        let html = dashboard_page(&[], &env);
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
         assert!(html.contains("No registry credential"));
         assert!(html.contains("action=\"/ui/projects/p/registry\""));
     }
@@ -602,7 +677,35 @@ mod tests {
     #[test]
     fn registry_fields_are_html_escaped() {
         let env = [masked_with_registry("p", "ghcr.io", "<script>x</script>")];
-        let html = dashboard_page(&[], &env);
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
+        assert!(!html.contains("<script>x</script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn shows_a_projects_own_domain_with_a_reset_control() {
+        let env = [masked_with_template("p", "{branch}.demo.example.com")];
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
+        assert!(html.contains("demo.example.com"));
+        assert!(html.contains("/ui/projects/p/domain/delete"));
+    }
+
+    #[test]
+    fn shows_the_global_default_as_inherited_when_unset() {
+        let env = [masked("p", &[("K", &[][..])])];
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
+        assert!(html.contains("dev.example.com"));
+        assert!(
+            html.to_lowercase().contains("default"),
+            "an inherited domain should be labelled as the default"
+        );
+        assert!(html.contains("action=\"/ui/projects/p/domain\""));
+    }
+
+    #[test]
+    fn domain_is_html_escaped() {
+        let env = [masked_with_template("p", "{branch}.<script>x</script>.com")];
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
         assert!(!html.contains("<script>x</script>"));
         assert!(html.contains("&lt;script&gt;"));
     }
