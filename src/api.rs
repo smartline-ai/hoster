@@ -2,8 +2,10 @@
 //! deploying, tearing down, and listing branch environments.
 //!
 //! This runs on its own listener (`settings.api_listen`), separate from the
-//! proxy's listener, and is never entered into the routing table — it is not
-//! meant to be reachable from outside the operator's network.
+//! proxy's listener. It is served publicly (behind TLS at
+//! hoster.odinvestor.net) and every bearer route is guarded by the shared
+//! token; the cookie-authenticated UI routes below have their own, separate
+//! guard.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -65,16 +67,21 @@ fn json_bytes(status: StatusCode, bytes: Vec<u8>) -> Response<ApiBody> {
         .expect("static response is always valid")
 }
 
-/// A single shared secret over a trusted, unrouted port — a plain
-/// byte-for-byte comparison is an acceptable and simplest-possible check
-/// here, no `subtle`-style constant-time compare needed.
+/// Bearer-token check against a publicly reachable listener — compared in
+/// constant time so response timing can't leak how much of the token a
+/// guess got right.
 fn is_authorized(req: &Request<Incoming>, settings: &Settings) -> bool {
-    let expected = format!("Bearer {}", settings.token);
-    req.headers()
+    match req
+        .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == expected)
-        .unwrap_or(false)
+    {
+        Some(got) => {
+            let expected = format!("Bearer {}", settings.token);
+            constant_time_eq(got.as_bytes(), expected.as_bytes())
+        }
+        None => false,
+    }
 }
 
 /// Accept loop for the control API. Runs until the process ends. Mirrors
@@ -138,10 +145,10 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
         (&Method::GET, "/") => return Ok(ui_root(&req, &engine, &settings, &sessions)),
         (&Method::GET, "/login") => return Ok(ui_login_page(&settings, None)),
         (&Method::POST, "/login") => return Ok(ui_login_submit(req, &settings, &sessions).await),
-        (&Method::POST, "/logout") => return Ok(ui_logout(&req, &sessions)),
+        (&Method::POST, "/logout") => return Ok(ui_logout(&req, &settings, &sessions)),
         (&Method::POST, p) if p.starts_with("/ui/destroy/") => {
             let branch = p.trim_start_matches("/ui/destroy/").to_string();
-            return Ok(ui_destroy(&req, engine, &sessions, branch).await);
+            return Ok(ui_destroy(&req, engine, &settings, &sessions, branch).await);
         }
         _ => {}
     }
@@ -264,9 +271,18 @@ fn session_of(req: &Request<Incoming>, sessions: &Sessions) -> bool {
         .unwrap_or(false)
 }
 
+/// The dashboard password, or None if unset OR empty. An empty password never
+/// enables the dashboard (an empty form field would otherwise match it).
+fn dashboard_password(settings: &Settings) -> Option<&str> {
+    settings
+        .dashboard_password
+        .as_deref()
+        .filter(|p| !p.is_empty())
+}
+
 /// None → the dashboard is not configured; every UI route answers 503.
 fn dashboard_enabled(settings: &Settings) -> bool {
-    settings.dashboard_password.is_some()
+    dashboard_password(settings).is_some()
 }
 
 fn ui_login_page(settings: &Settings, error: Option<&str>) -> Response<ApiBody> {
@@ -281,7 +297,7 @@ async fn ui_login_submit(
     settings: &Settings,
     sessions: &Sessions,
 ) -> Response<ApiBody> {
-    let Some(expected) = settings.dashboard_password.as_ref() else {
+    let Some(expected) = dashboard_password(settings) else {
         return text(StatusCode::SERVICE_UNAVAILABLE, "dashboard not configured");
     };
     let bytes = match req.into_body().collect().await {
@@ -313,7 +329,14 @@ async fn ui_login_submit(
     )
 }
 
-fn ui_logout(req: &Request<Incoming>, sessions: &Sessions) -> Response<ApiBody> {
+fn ui_logout(
+    req: &Request<Incoming>,
+    settings: &Settings,
+    sessions: &Sessions,
+) -> Response<ApiBody> {
+    if !dashboard_enabled(settings) {
+        return text(StatusCode::SERVICE_UNAVAILABLE, "dashboard not configured");
+    }
     if let Some(tok) = req
         .headers()
         .get(COOKIE)
@@ -354,9 +377,13 @@ fn ui_root<R: ContainerRuntime>(
 async fn ui_destroy<R: ContainerRuntime>(
     req: &Request<Incoming>,
     engine: Arc<Engine<R>>,
+    settings: &Settings,
     sessions: &Sessions,
     branch: String,
 ) -> Response<ApiBody> {
+    if !dashboard_enabled(settings) {
+        return text(StatusCode::SERVICE_UNAVAILABLE, "dashboard not configured");
+    }
     if !session_of(req, sessions) {
         return redirect("/login");
     }

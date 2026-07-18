@@ -92,7 +92,7 @@ pub fn dashboard_page(deployments: &[DeploymentInfo]) -> String {
 <td class=\"status {status_class}\">{}</td>\
 <td>{links}</td>\
 <td><form method=\"post\" action=\"/ui/destroy/{branch}\" \
-onsubmit=\"return confirm('Destroy {branch}?')\">\
+onsubmit=\"return confirm('Destroy this branch?')\">\
 <button class=\"destroy\" type=\"submit\">Destroy</button></form></td></tr>",
             html_escape(&d.status),
         );

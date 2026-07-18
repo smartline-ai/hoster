@@ -151,6 +151,35 @@ async fn ui_disabled_when_no_password() {
 }
 
 #[tokio::test]
+async fn empty_password_disables_dashboard() {
+    let (base, _) = spawn(Some("")).await;
+    let c = client();
+    let get = c.get(format!("{base}/login")).send().await.unwrap();
+    assert_eq!(get.status(), 503);
+
+    let post = c
+        .post(format!("{base}/login"))
+        .form(&[("password", "")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post.status(), 503);
+}
+
+#[tokio::test]
+async fn bearer_only_on_root_redirects_to_login() {
+    let (base, _) = spawn(Some("pw")).await;
+    let resp = client()
+        .get(&base)
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(resp.headers()["location"], "/login");
+}
+
+#[tokio::test]
 async fn bearer_api_still_works_and_ignores_cookies() {
     let (base, _) = spawn(Some("pw")).await;
     let resp = client()
