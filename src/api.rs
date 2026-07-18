@@ -142,13 +142,17 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
 
     // --- UI routes (cookie auth), matched before the bearer gate ---
     match (&method, path.as_str()) {
-        (&Method::GET, "/") => return Ok(ui_root(&req, &engine, &settings, &sessions)),
+        (&Method::GET, "/") => return Ok(ui_root(&req, &engine, &settings, &sessions).await),
         (&Method::GET, "/login") => return Ok(ui_login_page(&settings, None)),
         (&Method::POST, "/login") => return Ok(ui_login_submit(req, &settings, &sessions).await),
         (&Method::POST, "/logout") => return Ok(ui_logout(&req, &settings, &sessions)),
         (&Method::POST, p) if p.starts_with("/ui/destroy/") => {
             let branch = p.trim_start_matches("/ui/destroy/").to_string();
             return Ok(ui_destroy(&req, engine, &settings, &sessions, branch).await);
+        }
+        (&Method::POST, p) if p.starts_with("/ui/projects/") => {
+            let sub = p.trim_start_matches("/ui/projects/").to_string();
+            return Ok(ui_projects(req, engine, &settings, &sessions, sub).await);
         }
         _ => {}
     }
@@ -164,8 +168,79 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
             let branch = p.trim_start_matches("/deploy/").to_string();
             Ok(handle_teardown(engine, branch).await)
         }
+        (Method::GET, "/projects") => Ok(handle_list_projects(&engine)),
+        (Method::PUT, p) if parse_var_path(p).is_some() => {
+            let (project, key) = parse_var_path(p).unwrap();
+            handle_set_var(req, &engine, project, key).await
+        }
+        (Method::DELETE, p) if parse_var_path(p).is_some() => {
+            let (project, key) = parse_var_path(p).unwrap();
+            Ok(handle_delete_var(&engine, &project, &key))
+        }
         _ => Ok(text(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+/// Split `/projects/<project>/vars/<key>` into its two segments, or `None` if
+/// the path isn't that shape or a segment is empty.
+fn parse_var_path(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix("/projects/")?;
+    let (project, key) = rest.split_once("/vars/")?;
+    if project.is_empty() || key.is_empty() || key.contains('/') {
+        return None;
+    }
+    Some((project.to_string(), key.to_string()))
+}
+
+/// The body of `PUT /projects/<project>/vars/<key>`.
+#[derive(Debug, Deserialize)]
+struct SetVarBody {
+    value: String,
+    #[serde(default)]
+    services: Vec<String>,
+}
+
+fn handle_list_projects<R: ContainerRuntime>(engine: &Engine<R>) -> Response<ApiBody> {
+    let masked = engine.store().list_masked();
+    let bytes = serde_json::to_vec(&masked).unwrap_or_default();
+    json_bytes(StatusCode::OK, bytes)
+}
+
+async fn handle_set_var<R: ContainerRuntime>(
+    req: Request<Incoming>,
+    engine: &Engine<R>,
+    project: String,
+    key: String,
+) -> Result<Response<ApiBody>, Infallible> {
+    let bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return Ok(text(StatusCode::BAD_REQUEST, "could not read request body")),
+    };
+    let body: SetVarBody = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(text_owned(
+                StatusCode::BAD_REQUEST,
+                format!("invalid request body: {e}"),
+            ));
+        }
+    };
+    match engine
+        .store()
+        .set_var(&project, &key, &body.value, body.services)
+    {
+        Ok(()) => Ok(text(StatusCode::NO_CONTENT, "")),
+        Err(msg) => Ok(text_owned(StatusCode::BAD_REQUEST, msg)),
+    }
+}
+
+fn handle_delete_var<R: ContainerRuntime>(
+    engine: &Engine<R>,
+    project: &str,
+    key: &str,
+) -> Response<ApiBody> {
+    let _ = engine.store().delete_var(project, key);
+    text(StatusCode::NO_CONTENT, "")
 }
 
 /// Validate synchronously, then hand the actual provisioning to a background
@@ -356,7 +431,7 @@ fn ui_logout(
         .expect("logout redirect is always valid")
 }
 
-fn ui_root<R: ContainerRuntime>(
+async fn ui_root<R: ContainerRuntime>(
     req: &Request<Incoming>,
     engine: &Engine<R>,
     settings: &Settings,
@@ -368,10 +443,62 @@ fn ui_root<R: ContainerRuntime>(
     if !session_of(req, sessions) {
         return redirect("/login");
     }
+    let deployments = engine.deployment_views().await.unwrap_or_default();
+    let env = engine.store().list_masked();
     html(
         StatusCode::OK,
-        dashboard::dashboard_page(&engine.deployments()),
+        dashboard::dashboard_page(&deployments, &env),
     )
+}
+
+/// The dashboard's env-management POST routes, all cookie-authenticated:
+///   `<project>/vars`              — set/replace a variable (form body)
+///   `<project>/vars/<key>/delete` — delete a variable
+///   `<project>/delete`            — delete all of a project's variables
+async fn ui_projects<R: ContainerRuntime>(
+    req: Request<Incoming>,
+    engine: Arc<Engine<R>>,
+    settings: &Settings,
+    sessions: &Sessions,
+    sub: String,
+) -> Response<ApiBody> {
+    if !dashboard_enabled(settings) {
+        return text(StatusCode::SERVICE_UNAVAILABLE, "dashboard not configured");
+    }
+    if !session_of(&req, sessions) {
+        return redirect("/login");
+    }
+
+    if let Some(project) = sub.strip_suffix("/vars") {
+        let project = project.to_string();
+        let bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return text(StatusCode::BAD_REQUEST, "could not read request body"),
+        };
+        let key = form_field(&bytes, "key").unwrap_or_default();
+        let value = form_field(&bytes, "value").unwrap_or_default();
+        let services = form_field(&bytes, "services")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        return match engine.store().set_var(&project, &key, &value, services) {
+            Ok(()) => redirect("/"),
+            Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
+        };
+    }
+
+    if let Some(head) = sub.strip_suffix("/delete") {
+        if let Some((project, key)) = head.split_once("/vars/") {
+            let _ = engine.store().delete_var(project, key);
+        } else {
+            let _ = engine.store().delete_project(head);
+        }
+        return redirect("/");
+    }
+
+    text(StatusCode::NOT_FOUND, "not found")
 }
 
 async fn ui_destroy<R: ContainerRuntime>(

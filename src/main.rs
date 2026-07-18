@@ -41,8 +41,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "Docker daemon not reachable at startup; deploys will fail until it returns");
     }
 
-    let projects_file =
-        env_or("HOSTER_PROJECTS_FILE", "/etc/hoster/projects.json");
+    let projects_file = env_or("HOSTER_PROJECTS_FILE", "/etc/hoster/projects.json");
     let store = Arc::new(
         hoster::secrets::Store::load(&projects_file)
             .with_context(|| format!("load project env store {projects_file}"))?,

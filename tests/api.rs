@@ -80,6 +80,77 @@ async fn deploy_happy_path_returns_202_and_urls() {
 }
 
 #[tokio::test]
+async fn project_env_set_list_delete_via_json_api() {
+    let (base, _) = spawn().await;
+    // Set a var.
+    let r = client()
+        .put(format!("{base}/projects/odinvestor/vars/GOOGLE_API_KEY"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"value":"AIzaSECRET","services":["backend"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "set failed: {}", r.status());
+
+    // List is masked: key + target visible, value never.
+    let r = client()
+        .get(format!("{base}/projects"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("odinvestor"));
+    assert!(body.contains("GOOGLE_API_KEY"));
+    assert!(body.contains("backend"));
+    assert!(!body.contains("AIzaSECRET"), "value leaked: {body}");
+
+    // Delete it.
+    let r = client()
+        .delete(format!("{base}/projects/odinvestor/vars/GOOGLE_API_KEY"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let body = client()
+        .get(format!("{base}/projects"))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!body.contains("GOOGLE_API_KEY"));
+}
+
+#[tokio::test]
+async fn projects_api_requires_token() {
+    let (base, _) = spawn().await;
+    let r = client()
+        .get(format!("{base}/projects"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+}
+
+#[tokio::test]
+async fn set_var_with_invalid_key_is_400() {
+    let (base, _) = spawn().await;
+    let r = client()
+        .put(format!("{base}/projects/p/vars/1BAD"))
+        .bearer_auth("secret")
+        .json(&serde_json::json!({"value":"x","services":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+}
+
+#[tokio::test]
 async fn invalid_config_is_400() {
     let (base, _) = spawn().await;
     let bad = r#"{"branch":"b","tag":"t","sha":"s","config":{"project":"p","services":{}}}"#;

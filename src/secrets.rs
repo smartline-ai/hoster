@@ -100,9 +100,7 @@ impl Store {
             ));
         }
         if !is_env_key(key) {
-            return Err(format!(
-                "env key {key:?} must match [A-Za-z_][A-Za-z0-9_]*"
-            ));
+            return Err(format!("env key {key:?} must match [A-Za-z_][A-Za-z0-9_]*"));
         }
         if value.len() > MAX_VALUE_LEN {
             return Err(format!("value too long (max {MAX_VALUE_LEN} bytes)"));
@@ -115,13 +113,17 @@ impl Store {
             }
         }
         let mut data = self.data.lock().unwrap();
-        data.projects.entry(project.to_string()).or_default().vars.insert(
-            key.to_string(),
-            Var {
-                value: value.to_string(),
-                services,
-            },
-        );
+        data.projects
+            .entry(project.to_string())
+            .or_default()
+            .vars
+            .insert(
+                key.to_string(),
+                Var {
+                    value: value.to_string(),
+                    services,
+                },
+            );
         self.persist(&data).map_err(|e| e.to_string())
     }
 
@@ -236,7 +238,10 @@ mod tests {
         s.set_var("odinvestor", "GOOGLE_API_KEY", "AIza123", vec![])
             .unwrap();
         let env = s.env_for("odinvestor", "backend");
-        assert_eq!(env.get("GOOGLE_API_KEY").map(String::as_str), Some("AIza123"));
+        assert_eq!(
+            env.get("GOOGLE_API_KEY").map(String::as_str),
+            Some("AIza123")
+        );
     }
 
     #[test]

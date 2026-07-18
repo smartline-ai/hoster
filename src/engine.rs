@@ -38,6 +38,19 @@ pub struct DeploymentInfo {
     pub urls: BTreeMap<String, String>,
 }
 
+/// A branch deployment enriched with the config it was deployed from, for the
+/// dashboard's project-grouped view. `config` is the submitted `hoster.json`
+/// (decoded from the container label) — it never contains hoster-managed
+/// injected secrets.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeploymentView {
+    pub project: String,
+    pub branch: String,
+    pub status: String,
+    pub urls: BTreeMap<String, String>,
+    pub config: Option<DeployConfig>,
+}
+
 /// Injectable readiness probe so tests need no real sockets.
 #[async_trait]
 pub trait ReadinessChecker: Send + Sync {
@@ -103,6 +116,11 @@ impl<R: ContainerRuntime> Engine<R> {
             urls: Mutex::new(BTreeMap::new()),
             swap_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The project environment store, for the control API's project routes.
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
     }
 
     pub fn status_of(&self, branch: &str) -> Option<DeployStatus> {
@@ -231,7 +249,10 @@ impl<R: ContainerRuntime> Engine<R> {
             for (k, v) in self.store.env_for(project, name) {
                 env_map.insert(k, v);
             }
-            let env: Vec<String> = env_map.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let env: Vec<String> = env_map
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
             let mut labels = branch_label(branch);
             labels.insert(labels::SERVICE.to_string(), name.clone());
             labels.insert(labels::PROJECT.to_string(), project.to_string());
@@ -327,6 +348,70 @@ impl<R: ContainerRuntime> Engine<R> {
                 urls: urls.get(branch).cloned().unwrap_or_default(),
             })
             .collect()
+    }
+
+    /// Compute the public URLs for a service map on a branch — the URL of every
+    /// exposed service. Deterministic from config + branch, so it works for
+    /// views reconstructed from labels after a restart.
+    fn urls_for(
+        &self,
+        services: &BTreeMap<String, config::Service>,
+        branch: &str,
+    ) -> BTreeMap<String, String> {
+        let mut urls = BTreeMap::new();
+        for (name, svc) in services {
+            if let Some(exp) = &svc.expose {
+                let sub = exp.subdomain.clone().unwrap_or_else(|| name.clone());
+                let host = hostname_for(&self.settings.hostname_template, &sub, branch);
+                urls.insert(name.clone(), format!("http://{host}"));
+            }
+        }
+        urls
+    }
+
+    /// Every branch's deployment enriched with the config it was deployed from,
+    /// reconstructed from container labels and grouped for the dashboard.
+    pub async fn deployment_views(&self) -> anyhow::Result<Vec<DeploymentView>> {
+        let containers = self.runtime.list_by_label(labels::PROJECT).await?;
+        // branch -> (project, config JSON), taking the first container per branch.
+        let mut by_branch: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+        for c in &containers {
+            let (Some(branch), Some(project)) =
+                (c.labels.get(labels::BRANCH), c.labels.get(labels::PROJECT))
+            else {
+                continue;
+            };
+            by_branch
+                .entry(branch.clone())
+                .or_insert_with(|| (project.clone(), c.labels.get(labels::CONFIG).cloned()));
+        }
+
+        let mut out = Vec::new();
+        for (branch, (project, cfg_json)) in by_branch {
+            let config = cfg_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<DeployConfig>(j).ok());
+            let urls = config
+                .as_ref()
+                .map(|c| self.urls_for(&c.services, &branch))
+                .unwrap_or_default();
+            let status = match self.status_of(&branch) {
+                Some(DeployStatus::Provisioning) => "provisioning".to_string(),
+                Some(DeployStatus::Running) => "running".to_string(),
+                Some(DeployStatus::Failed(m)) => format!("failed: {m}"),
+                // Labels present but no in-process status (e.g. after a restart)
+                // ⇒ the containers exist, so treat it as running.
+                None => "running".to_string(),
+            };
+            out.push(DeploymentView {
+                project,
+                branch,
+                status,
+                urls,
+                config,
+            });
+        }
+        Ok(out)
     }
 
     pub async fn reconcile(&self) -> anyhow::Result<()> {
@@ -435,8 +520,14 @@ mod tests {
         store
             .set_var("p", "GOOGLE_API_KEY", "from-hoster", vec!["backend".into()])
             .unwrap();
-        store.set_var("p", "DATABASE_URL", "stored-wins", vec![]).unwrap();
-        let eng = engine_with_store(rt.clone(), SharedRoutes::new(crate::routing::RoutingTable::new()), store);
+        store
+            .set_var("p", "DATABASE_URL", "stored-wins", vec![])
+            .unwrap();
+        let eng = engine_with_store(
+            rt.clone(),
+            SharedRoutes::new(crate::routing::RoutingTable::new()),
+            store,
+        );
         eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
 
         let backend = rt.env_of("b1-backend").unwrap();
@@ -444,7 +535,11 @@ mod tests {
         assert!(backend.iter().any(|e| e == "GOOGLE_API_KEY=from-hoster"));
         // Stored value overrides the hoster.json DATABASE_URL for the same key.
         assert!(backend.iter().any(|e| e == "DATABASE_URL=stored-wins"));
-        assert!(!backend.iter().any(|e| e == "DATABASE_URL=postgres://postgres:5432/app"));
+        assert!(
+            !backend
+                .iter()
+                .any(|e| e == "DATABASE_URL=postgres://postgres:5432/app")
+        );
 
         // postgres is not a target of GOOGLE_API_KEY, but is of the all-services var.
         let pg = rt.env_of("b1-postgres").unwrap();
@@ -456,8 +551,14 @@ mod tests {
     async fn containers_carry_project_and_config_labels_without_secrets() {
         let rt = Arc::new(FakeRuntime::new());
         let store = empty_store();
-        store.set_var("p", "SECRET_KEY", "topsecret", vec![]).unwrap();
-        let eng = engine_with_store(rt.clone(), SharedRoutes::new(crate::routing::RoutingTable::new()), store);
+        store
+            .set_var("p", "SECRET_KEY", "topsecret", vec![])
+            .unwrap();
+        let eng = engine_with_store(
+            rt.clone(),
+            SharedRoutes::new(crate::routing::RoutingTable::new()),
+            store,
+        );
         eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
 
         let cs = rt.list_by_label(crate::labels::PROJECT).await.unwrap();
@@ -468,8 +569,43 @@ mod tests {
         assert!(cfg.contains("\"backend\""));
         assert!(cfg.contains("\"project\":\"p\"") || cfg.contains("\"project\": \"p\""));
         // …but the injected secret is never written into the config label.
-        assert!(!cfg.contains("topsecret"), "secret leaked into config label: {cfg}");
-        assert!(!cfg.contains("SECRET_KEY"), "secret key leaked into config label: {cfg}");
+        assert!(
+            !cfg.contains("topsecret"),
+            "secret leaked into config label: {cfg}"
+        );
+        assert!(
+            !cfg.contains("SECRET_KEY"),
+            "secret key leaked into config label: {cfg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_views_expose_project_and_config_without_secrets() {
+        let rt = Arc::new(FakeRuntime::new());
+        let store = empty_store();
+        store
+            .set_var("p", "SECRET_KEY", "topsecret", vec![])
+            .unwrap();
+        let eng = engine_with_store(
+            rt.clone(),
+            SharedRoutes::new(crate::routing::RoutingTable::new()),
+            store,
+        );
+        eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+
+        let views = eng.deployment_views().await.unwrap();
+        assert_eq!(views.len(), 1);
+        let v = &views[0];
+        assert_eq!(v.project, "p");
+        assert_eq!(v.branch, "b1");
+        assert_eq!(v.status, "running");
+        assert_eq!(v.urls["backend"], "http://backend-b1.dev.example.com");
+        let cfg = v.config.as_ref().expect("config decoded from label");
+        assert!(cfg.services.contains_key("backend"));
+        assert!(cfg.services.contains_key("postgres"));
+        assert!(cfg.services["backend"].env.contains_key("DATABASE_URL"));
+        // The injected secret is never part of the shown config.
+        assert!(!cfg.services["backend"].env.contains_key("SECRET_KEY"));
     }
 
     #[tokio::test]
@@ -535,14 +671,13 @@ mod tests {
     async fn failed_readiness_marks_failed_and_leaves_no_route() {
         let rt = Arc::new(FakeRuntime::new());
         let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
-        let eng =
-            Engine::with_readiness(
-                rt.clone(),
-                routes.clone(),
-                settings(),
-                Arc::new(NeverReady),
-                empty_store(),
-            );
+        let eng = Engine::with_readiness(
+            rt.clone(),
+            routes.clone(),
+            settings(),
+            Arc::new(NeverReady),
+            empty_store(),
+        );
         let r = eng.deploy(request("b1", TWO_SERVICE)).await;
         assert!(r.is_err());
         assert!(routes.load().is_empty());
@@ -561,14 +696,13 @@ mod tests {
     async fn status_is_failed_after_readiness_timeout() {
         let rt = Arc::new(FakeRuntime::new());
         let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
-        let eng =
-            Engine::with_readiness(
-                rt.clone(),
-                routes.clone(),
-                settings(),
-                Arc::new(NeverReady),
-                empty_store(),
-            );
+        let eng = Engine::with_readiness(
+            rt.clone(),
+            routes.clone(),
+            settings(),
+            Arc::new(NeverReady),
+            empty_store(),
+        );
         let r = eng.deploy(request("b1", TWO_SERVICE)).await;
         assert!(r.is_err());
         assert!(matches!(eng.status_of("b1"), Some(DeployStatus::Failed(_))));

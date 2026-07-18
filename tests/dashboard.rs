@@ -134,6 +134,66 @@ async fn login_then_dashboard_then_destroy() {
 }
 
 #[tokio::test]
+async fn ui_set_var_appears_masked_then_deletes() {
+    let (base, _) = spawn(Some("pw")).await;
+    let c = client();
+    c.post(format!("{base}/login"))
+        .form(&[("password", "pw")])
+        .send()
+        .await
+        .unwrap();
+
+    // Add a variable through the dashboard form.
+    let set = c
+        .post(format!("{base}/ui/projects/odinvestor/vars"))
+        .form(&[
+            ("key", "GOOGLE_API_KEY"),
+            ("value", "AIzaSECRET"),
+            ("services", "backend"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), 303);
+
+    // Dashboard shows the project + key, targets, but never the value.
+    let html = c.get(&base).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("odinvestor"));
+    assert!(html.contains("GOOGLE_API_KEY"));
+    assert!(html.contains("backend"));
+    assert!(
+        !html.contains("AIzaSECRET"),
+        "secret value leaked into dashboard HTML"
+    );
+
+    // Delete it through the UI.
+    let del = c
+        .post(format!(
+            "{base}/ui/projects/odinvestor/vars/GOOGLE_API_KEY/delete"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), 303);
+    let html = c.get(&base).send().await.unwrap().text().await.unwrap();
+    assert!(!html.contains("GOOGLE_API_KEY"));
+}
+
+#[tokio::test]
+async fn ui_set_var_requires_cookie() {
+    let (base, _) = spawn(Some("pw")).await;
+    // No login → the set must be rejected and nothing stored.
+    let resp = client()
+        .post(format!("{base}/ui/projects/p/vars"))
+        .form(&[("key", "K"), ("value", "v"), ("services", "")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    assert_eq!(resp.headers()["location"], "/login");
+}
+
+#[tokio::test]
 async fn destroy_without_cookie_is_rejected() {
     let (base, rt) = spawn(Some("pw")).await;
     let c = client();
