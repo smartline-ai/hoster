@@ -560,4 +560,34 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn deleting_registry_keeps_the_var() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_var("p", "K", "v", vec![]).unwrap();
+        s.set_registry("p", "ghcr.io", "bot", "x").unwrap();
+        s.delete_registry("p").unwrap();
+        assert!(s.registry_for("p").is_none());
+        assert_eq!(
+            s.env_for("p", "backend").get("K").map(String::as_str),
+            Some("v"),
+            "var was pruned along with the credential"
+        );
+    }
+
+    #[test]
+    fn deleting_var_then_registry_fully_cleans_up_a_mixed_project() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_var("p", "K", "v", vec![]).unwrap();
+        s.set_registry("p", "ghcr.io", "bot", "x").unwrap();
+        s.delete_var("p", "K").unwrap();
+        assert!(s.env_for("p", "backend").is_empty());
+        assert!(
+            s.registry_for("p").is_some(),
+            "credential was pruned along with the only var"
+        );
+        s.delete_registry("p").unwrap();
+        assert!(s.registry_for("p").is_none());
+        assert!(s.env_for("p", "backend").is_empty());
+    }
 }
