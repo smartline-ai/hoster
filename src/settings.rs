@@ -5,6 +5,7 @@ pub struct Settings {
     pub hostname_template: String,
     pub registry: String,
     pub token: String,
+    pub dashboard_password: Option<String>,
 }
 
 /// Turn an arbitrary git branch into a DNS label: lowercase, non-alphanumeric

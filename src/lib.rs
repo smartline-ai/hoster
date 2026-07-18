@@ -8,5 +8,6 @@ pub mod proxy;
 pub mod readiness;
 pub mod routing;
 pub mod runtime;
+pub mod session;
 pub mod settings;
 pub mod template;

@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         registry: env_or("HOSTER_REGISTRY", "localhost:5000"),
         token: std::env::var("HOSTER_TOKEN").context("HOSTER_TOKEN must be set")?,
+        dashboard_password: None,
     });
 
     let runtime = Arc::new(DockerRuntime::connect().context("connect to Docker")?);

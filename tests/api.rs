@@ -15,6 +15,7 @@ async fn spawn() -> (String, Arc<FakeRuntime>) {
         hostname_template: "{service}-{branch}.dev.example.com".into(),
         registry: "reg.example.com".into(),
         token: "secret".into(),
+        dashboard_password: None,
     });
     let engine = Arc::new(Engine::with_readiness(
         rt.clone(),

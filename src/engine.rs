@@ -336,6 +336,7 @@ mod tests {
             hostname_template: "{service}-{branch}.dev.example.com".into(),
             registry: "reg.example.com".into(),
             token: "t".into(),
+            dashboard_password: None,
         })
     }
 
