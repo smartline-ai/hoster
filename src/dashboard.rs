@@ -436,6 +436,7 @@ mod tests {
                     services: svcs.iter().map(|s| s.to_string()).collect(),
                 })
                 .collect(),
+            registry: None,
         }
     }
 
