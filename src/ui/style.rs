@@ -46,7 +46,6 @@ code{font-family:var(--mono)}h1,h2,h3{margin:0}button{font-family:inherit;cursor
 .icon-btn{background:transparent;border:1px solid transparent;color:var(--faint);width:26px;height:26px;
   border-radius:7px;display:grid;place-items:center;transition:.14s;font-size:.85rem}
 .icon-btn:hover{color:var(--fail);border-color:var(--fail)}
-main{max-width:1080px;margin:0 auto;padding:clamp(1rem,3vw,2rem) clamp(1rem,4vw,2.4rem) 4rem}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);margin-top:1.4rem;overflow:hidden}
 .panel-head{display:flex;align-items:baseline;gap:.8rem;flex-wrap:wrap;padding:1rem 1.2rem;
   border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--panel-2),transparent)}
@@ -145,7 +144,7 @@ details.config>summary::-webkit-details-marker{display:none}
 .nav-item .glyph{color:var(--faint);font-size:.9rem;width:1rem;text-align:center}
 .nav-spacer{flex:1}
 .rail form{margin:0}
-.content{min-width:0;padding:clamp(1rem,3vw,2.2rem) clamp(1rem,4vw,2.6rem) 4rem;max-width:1100px}
+.content{min-width:0;width:100%;padding:clamp(1rem,3vw,2.2rem) clamp(1rem,4vw,2.6rem) 4rem;max-width:1100px}
 .page-head{display:flex;align-items:baseline;gap:.8rem;flex-wrap:wrap;margin-bottom:.4rem}
 .page-head h1{font-size:1.4rem;letter-spacing:-.02em;font-weight:660}
 .page-sub{color:var(--muted);font-size:.85rem}
