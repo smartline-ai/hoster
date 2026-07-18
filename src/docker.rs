@@ -206,16 +206,34 @@ impl ContainerRuntime for DockerRuntime {
             ..Default::default()
         };
         let raw = self.docker.logs(container_id, Some(options));
-        // Map each Docker log chunk to a UTF-8 line, dropping the trailing
-        // newline bollard includes. A stream error becomes a stream item error.
-        let mapped = raw.map(|chunk| {
-            chunk
-                .map(|out: LogOutput| {
-                    String::from_utf8_lossy(&out.into_bytes())
-                        .trim_end_matches('\n')
-                        .to_string()
-                })
-                .map_err(anyhow::Error::from)
+        // A single Docker log frame can carry several `\n`-separated lines
+        // (e.g. a multi-line stack trace written in one syscall), but the
+        // `LogStream` contract is one decoded line per item. Split each
+        // frame into its lines and flatten with `stream::iter` so the
+        // output stream stays a uniform `anyhow::Result<String>` (no
+        // `Either`/`left_stream`/`right_stream` needed). A stream error
+        // still surfaces as exactly one `Err` item. Note: a line split
+        // across two frames (rare) may surface as two items — an accepted
+        // limitation for a live tail.
+        let mapped = raw.flat_map(|chunk: Result<LogOutput, bollard::errors::Error>| {
+            let items: Vec<anyhow::Result<String>> = match chunk {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(&out.into_bytes()).into_owned();
+                    let mut lines: Vec<String> = text
+                        .split('\n')
+                        .map(|l| l.trim_end_matches('\r').to_string())
+                        .collect();
+                    // split() on a trailing '\n' leaves a final empty
+                    // element — drop it so a terminal newline doesn't
+                    // produce a spurious empty item.
+                    if lines.last().is_some_and(|s| s.is_empty()) {
+                        lines.pop();
+                    }
+                    lines.into_iter().map(Ok).collect()
+                }
+                Err(e) => vec![Err(anyhow::Error::from(e))],
+            };
+            futures_util::stream::iter(items)
         });
         Ok(Box::pin(mapped))
     }
