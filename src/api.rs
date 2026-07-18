@@ -637,7 +637,7 @@ async fn ui_logs<R: ContainerRuntime>(
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
-        .header("connection", "keep-alive")
+        .header("x-accel-buffering", "no")
         .body(body)
         .expect("sse response is always valid")
 }
@@ -1207,5 +1207,29 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logs_endpoint_404_for_unknown_service() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        let req = DeployRequest {
+            branch: "b1".into(),
+            tag: "t".into(),
+            sha: "s".into(),
+            config: config::parse(LOG_CFG).unwrap(),
+        };
+        engine.deploy(req).await.unwrap();
+
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::GET,
+            "/p/p/logs/b1/nope",
+            "",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }
