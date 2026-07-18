@@ -11,7 +11,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, COOKIE, LOCATION, SET_COOKIE};
 use hyper::service::service_fn;
@@ -27,10 +27,19 @@ use crate::runtime::ContainerRuntime;
 use crate::session::{Sessions, constant_time_eq, cookie_value};
 use crate::settings::{Settings, sanitize_branch};
 
-/// Response body type. Every response this API produces is small enough to
-/// buffer whole, so there is no need for the boxed streaming body the proxy
-/// uses.
-pub type ApiBody = Full<Bytes>;
+/// Boxed response body. Buffered responses wrap `Full`; the SSE log endpoint
+/// wraps a `StreamBody`. Boxing lets both share one `Response<ApiBody>` type.
+pub type ApiBody = BoxBody<Bytes, BoxError>;
+
+/// Error type carried by streaming bodies (e.g. a Docker log stream failing
+/// mid-flight). Buffered `Full` bodies are infallible and never produce one.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Wrap buffered bytes as a boxed body. `Full` is infallible, so its `Never`
+/// error is mapped away.
+fn full(bytes: Bytes) -> ApiBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
+}
 
 /// The `POST /deploy` request shape. `config` reuses `DeployConfig`'s own
 /// `Deserialize` impl (and its `deny_unknown_fields`), so malformed configs
@@ -47,7 +56,7 @@ fn text(status: StatusCode, body: &'static str) -> Response<ApiBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
+        .body(full(Bytes::from(body)))
         .expect("static response is always valid")
 }
 
@@ -55,7 +64,7 @@ fn text_owned(status: StatusCode, body: String) -> Response<ApiBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
+        .body(full(Bytes::from(body)))
         .expect("static response is always valid")
 }
 
@@ -63,7 +72,7 @@ fn json_bytes(status: StatusCode, bytes: Vec<u8>) -> Response<ApiBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(bytes)))
+        .body(full(Bytes::from(bytes)))
         .expect("static response is always valid")
 }
 
@@ -371,7 +380,7 @@ async fn handle_teardown<R: ContainerRuntime>(
     let _ = engine.teardown(&branch).await;
     Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .body(Full::new(Bytes::new()))
+        .body(full(Bytes::new()))
         .expect("static response is always valid")
 }
 
@@ -388,7 +397,7 @@ fn html(status: StatusCode, body: String) -> Response<ApiBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/html; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
+        .body(full(Bytes::from(body)))
         .expect("html response is always valid")
 }
 
@@ -396,7 +405,7 @@ fn redirect(location: &str) -> Response<ApiBody> {
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(LOCATION, location)
-        .body(Full::new(Bytes::new()))
+        .body(full(Bytes::new()))
         .expect("redirect is always valid")
 }
 
@@ -457,7 +466,7 @@ async fn ui_login_submit(
             .status(StatusCode::SEE_OTHER)
             .header(LOCATION, "/")
             .header(SET_COOKIE, cookie)
-            .body(Full::new(Bytes::new()))
+            .body(full(Bytes::new()))
             .expect("login redirect is always valid");
     }
     html(
@@ -489,7 +498,7 @@ fn ui_logout(
             SET_COOKIE,
             format!("{SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0"),
         )
-        .body(Full::new(Bytes::new()))
+        .body(full(Bytes::new()))
         .expect("logout redirect is always valid")
 }
 
@@ -742,7 +751,7 @@ mod tests {
             builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
         }
         let req = builder
-            .body(Full::new(Bytes::from(body.to_string())))
+            .body(full(Bytes::from(body.to_string())))
             .expect("request is always valid");
 
         sender.send_request(req).await.expect("request failed")
@@ -843,7 +852,7 @@ mod tests {
             .uri(path)
             .header("host", "localhost")
             .header(COOKIE, cookie)
-            .body(Full::new(Bytes::from(body.to_string())))
+            .body(full(Bytes::from(body.to_string())))
             .expect("request is always valid");
 
         sender.send_request(req).await.expect("request failed")
