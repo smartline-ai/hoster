@@ -185,6 +185,14 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
             let (project, key) = parse_var_path(p).unwrap();
             Ok(handle_delete_var(&engine, &project, &key))
         }
+        (Method::PUT, p) if parse_domain_path(p).is_some() => {
+            let project = parse_domain_path(p).unwrap();
+            handle_set_domain(req, &engine, project).await
+        }
+        (Method::DELETE, p) if parse_domain_path(p).is_some() => {
+            let project = parse_domain_path(p).unwrap();
+            Ok(handle_delete_domain(&engine, &project))
+        }
         _ => Ok(text(StatusCode::NOT_FOUND, "not found")),
     }
 }
@@ -211,6 +219,17 @@ fn parse_registry_path(path: &str) -> Option<String> {
     Some(project.to_string())
 }
 
+/// Extract `<project>` from `/projects/<project>/domain`, or `None` if the
+/// path isn't that shape.
+fn parse_domain_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/projects/")?;
+    let project = rest.strip_suffix("/domain")?;
+    if project.is_empty() || project.contains('/') {
+        return None;
+    }
+    Some(project.to_string())
+}
+
 /// The body of `PUT /projects/<project>/vars/<key>`.
 #[derive(Debug, Deserialize)]
 struct SetVarBody {
@@ -225,6 +244,12 @@ struct SetRegistryBody {
     registry: String,
     username: String,
     password: String,
+}
+
+/// The body of `PUT /projects/<project>/domain`.
+#[derive(Debug, Deserialize)]
+struct SetDomainBody {
+    hostname_template: String,
 }
 
 fn handle_list_projects<R: ContainerRuntime>(engine: &Engine<R>) -> Response<ApiBody> {
@@ -302,6 +327,41 @@ fn handle_delete_registry<R: ContainerRuntime>(
     project: &str,
 ) -> Response<ApiBody> {
     let _ = engine.store().delete_registry(project);
+    text(StatusCode::NO_CONTENT, "")
+}
+
+async fn handle_set_domain<R: ContainerRuntime>(
+    req: Request<Incoming>,
+    engine: &Engine<R>,
+    project: String,
+) -> Result<Response<ApiBody>, Infallible> {
+    let bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return Ok(text(StatusCode::BAD_REQUEST, "could not read request body")),
+    };
+    let body: SetDomainBody = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(text_owned(
+                StatusCode::BAD_REQUEST,
+                format!("invalid request body: {e}"),
+            ));
+        }
+    };
+    match engine
+        .store()
+        .set_hostname_template(&project, &body.hostname_template)
+    {
+        Ok(()) => Ok(text(StatusCode::NO_CONTENT, "")),
+        Err(msg) => Ok(text_owned(StatusCode::BAD_REQUEST, msg)),
+    }
+}
+
+fn handle_delete_domain<R: ContainerRuntime>(
+    engine: &Engine<R>,
+    project: &str,
+) -> Response<ApiBody> {
+    let _ = engine.store().delete_hostname_template(project);
     text(StatusCode::NO_CONTENT, "")
 }
 
@@ -1009,5 +1069,87 @@ mod tests {
             engine.store().env_for("myproj", "any").get("KEEP_ME"),
             Some(&"v".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn put_domain_stores_the_template() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/projects/myproj/domain",
+            r#"{"hostname_template":"{branch}.demo.example.com"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            engine.store().hostname_template_for("myproj").as_deref(),
+            Some("{branch}.demo.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_projects_includes_the_template() {
+        let (engine, settings, sessions) = api_harness();
+        engine
+            .store()
+            .set_hostname_template("myproj", "{branch}.demo.example.com")
+            .unwrap();
+        let res = call(&engine, &settings, &sessions, Method::GET, "/projects", "").await;
+        let body = body_string(res).await;
+        assert!(body.contains("demo.example.com"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn delete_domain_reverts_to_the_default() {
+        let (engine, settings, sessions) = api_harness();
+        engine
+            .store()
+            .set_hostname_template("myproj", "{branch}.demo.example.com")
+            .unwrap();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::DELETE,
+            "/projects/myproj/domain",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(engine.store().hostname_template_for("myproj").is_none());
+    }
+
+    #[tokio::test]
+    async fn put_domain_rejects_a_template_without_branch() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/projects/myproj/domain",
+            r#"{"hostname_template":"{service}.demo.example.com"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(engine.store().hostname_template_for("myproj").is_none());
+    }
+
+    #[tokio::test]
+    async fn domain_endpoints_require_the_bearer_token() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call_without_token(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/projects/myproj/domain",
+            r#"{"hostname_template":"{branch}.demo.example.com"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }
