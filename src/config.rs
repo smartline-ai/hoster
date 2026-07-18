@@ -47,10 +47,17 @@ pub fn validate(cfg: &DeployConfig) -> Result<(), String> {
                 "service name {name:?} must be a DNS label (lowercase letters, digits, hyphens; not leading/trailing hyphen)"
             ));
         }
-        if let Some(expose) = &svc.expose
-            && expose.port == 0
-        {
-            return Err(format!("service {name:?}: expose.port must be non-zero"));
+        if let Some(expose) = &svc.expose {
+            if expose.port == 0 {
+                return Err(format!("service {name:?}: expose.port must be non-zero"));
+            }
+            if let Some(sub) = &expose.subdomain
+                && !is_dns_label(sub)
+            {
+                return Err(format!(
+                    "service {name:?}: expose.subdomain {sub:?} must be a DNS label (lowercase letters, digits, hyphens; not leading/trailing hyphen)"
+                ));
+            }
         }
     }
     Ok(())
@@ -129,6 +136,82 @@ mod tests {
         let c =
             cfg(r#"{"project":"p","services":{"backend":{"image":"i","expose":{"port":8080}}}}"#)
                 .unwrap();
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_a_good_subdomain() {
+        let c = cfg(
+            r#"{"project":"p","services":{"backend":{"image":"i","expose":{"port":8080,"subdomain":"api-v2"}}}}"#,
+        )
+        .unwrap();
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_an_uppercase_subdomain() {
+        let c = cfg(
+            r#"{"project":"p","services":{"backend":{"image":"i","expose":{"port":8080,"subdomain":"API"}}}}"#,
+        )
+        .unwrap();
+        let err = validate(&c).unwrap_err();
+        assert!(err.contains("subdomain"), "got: {err}");
+        assert!(err.contains("API"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_a_subdomain_with_a_leading_hyphen() {
+        let c = cfg(
+            r#"{"project":"p","services":{"backend":{"image":"i","expose":{"port":8080,"subdomain":"-api"}}}}"#,
+        )
+        .unwrap();
+        assert!(validate(&c).unwrap_err().contains("subdomain"));
+    }
+
+    #[test]
+    fn validate_rejects_a_subdomain_with_a_trailing_hyphen() {
+        let c = cfg(
+            r#"{"project":"p","services":{"backend":{"image":"i","expose":{"port":8080,"subdomain":"api-"}}}}"#,
+        )
+        .unwrap();
+        assert!(validate(&c).unwrap_err().contains("subdomain"));
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_subdomain() {
+        let c = cfg(
+            r#"{"project":"p","services":{"backend":{"image":"i","expose":{"port":8080,"subdomain":""}}}}"#,
+        )
+        .unwrap();
+        assert!(validate(&c).unwrap_err().contains("subdomain"));
+    }
+
+    #[test]
+    fn validate_rejects_an_over_long_subdomain() {
+        let long = "a".repeat(64);
+        let c = cfg(&format!(
+            r#"{{"project":"p","services":{{"backend":{{"image":"i","expose":{{"port":8080,"subdomain":"{long}"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert!(validate(&c).unwrap_err().contains("subdomain"));
+    }
+
+    #[test]
+    fn validate_rejects_an_underscore_in_a_subdomain() {
+        let c = cfg(
+            r#"{"project":"p","services":{"backend":{"image":"i","expose":{"port":8080,"subdomain":"api_v2"}}}}"#,
+        )
+        .unwrap();
+        assert!(validate(&c).unwrap_err().contains("subdomain"));
+    }
+
+    #[test]
+    fn validate_accepts_a_subdomain_of_exactly_63() {
+        let ok = "a".repeat(63);
+        let c = cfg(&format!(
+            r#"{{"project":"p","services":{{"backend":{{"image":"i","expose":{{"port":8080,"subdomain":"{ok}"}}}}}}}}"#
+        ))
+        .unwrap();
         assert!(validate(&c).is_ok());
     }
 }
