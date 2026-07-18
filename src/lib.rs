@@ -3,6 +3,7 @@ pub mod config;
 pub mod dashboard;
 pub mod docker;
 pub mod engine;
+pub mod imageref;
 pub mod labels;
 pub mod proxy;
 pub mod readiness;
