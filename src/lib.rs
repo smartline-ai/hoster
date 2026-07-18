@@ -1,6 +1,5 @@
 pub mod api;
 pub mod config;
-pub mod dashboard;
 pub mod docker;
 pub mod engine;
 pub mod imageref;

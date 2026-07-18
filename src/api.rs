@@ -21,11 +21,11 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 
 use crate::config::{self, DeployConfig};
-use crate::dashboard;
 use crate::engine::{DeployRequest, Engine};
 use crate::runtime::ContainerRuntime;
 use crate::session::{Sessions, constant_time_eq, cookie_value};
 use crate::settings::{Settings, sanitize_branch};
+use crate::ui;
 
 /// Boxed response body. Buffered responses wrap `Full`; the SSE log endpoint
 /// wraps a `StreamBody`. Boxing lets both share one `Response<ApiBody>` type.
@@ -151,7 +151,10 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
 
     // --- UI routes (cookie auth), matched before the bearer gate ---
     match (&method, path.as_str()) {
-        (&Method::GET, "/") => return Ok(ui_root(&req, &engine, &settings, &sessions).await),
+        (&Method::GET, "/") => return Ok(ui_overview(&req, &engine, &settings, &sessions).await),
+        (&Method::GET, "/settings") => {
+            return Ok(ui_settings(&req, &engine, &settings, &sessions).await);
+        }
         (&Method::GET, "/login") => return Ok(ui_login_page(&settings, None)),
         (&Method::POST, "/login") => return Ok(ui_login_submit(req, &settings, &sessions).await),
         (&Method::POST, "/logout") => return Ok(ui_logout(&req, &settings, &sessions)),
@@ -162,6 +165,14 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
         (&Method::POST, p) if p.starts_with("/ui/projects/") => {
             let sub = p.trim_start_matches("/ui/projects/").to_string();
             return Ok(ui_projects(req, engine, &settings, &sessions, sub).await);
+        }
+        (&Method::GET, p) if p.starts_with("/p/") => {
+            let rest = p.trim_start_matches("/p/");
+            // Only the bare project page here; the logs sub-path (added in
+            // Task 9) is matched by its own, earlier arm.
+            if !rest.is_empty() && !rest.contains('/') {
+                return Ok(ui_project(&req, &engine, &settings, &sessions, rest).await);
+            }
         }
         _ => {}
     }
@@ -435,7 +446,7 @@ fn ui_login_page(settings: &Settings, error: Option<&str>) -> Response<ApiBody> 
     if !dashboard_enabled(settings) {
         return text(StatusCode::SERVICE_UNAVAILABLE, "dashboard not configured");
     }
-    html(StatusCode::OK, dashboard::login_page(error))
+    html(StatusCode::OK, ui::login_page(error))
 }
 
 async fn ui_login_submit(
@@ -449,10 +460,7 @@ async fn ui_login_submit(
     let bytes = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
         Err(_) => {
-            return html(
-                StatusCode::BAD_REQUEST,
-                dashboard::login_page(Some("Bad request")),
-            );
+            return html(StatusCode::BAD_REQUEST, ui::login_page(Some("Bad request")));
         }
     };
     // form body: password=...
@@ -469,10 +477,7 @@ async fn ui_login_submit(
             .body(full(Bytes::new()))
             .expect("login redirect is always valid");
     }
-    html(
-        StatusCode::OK,
-        dashboard::login_page(Some("Invalid password")),
-    )
+    html(StatusCode::OK, ui::login_page(Some("Invalid password")))
 }
 
 fn ui_logout(
@@ -502,7 +507,45 @@ fn ui_logout(
         .expect("logout redirect is always valid")
 }
 
-async fn ui_root<R: ContainerRuntime>(
+async fn ui_overview<R: ContainerRuntime>(
+    req: &Request<Incoming>,
+    engine: &Engine<R>,
+    settings: &Settings,
+    sessions: &Sessions,
+) -> Response<ApiBody> {
+    if !dashboard_enabled(settings) {
+        return text(StatusCode::SERVICE_UNAVAILABLE, "dashboard not configured");
+    }
+    if !session_of(req, sessions) {
+        return redirect("/login");
+    }
+    let deployments = engine.deployment_views().await.unwrap_or_default();
+    let env = engine.store().list_masked();
+    html(StatusCode::OK, ui::overview_page(&deployments, &env))
+}
+
+async fn ui_project<R: ContainerRuntime>(
+    req: &Request<Incoming>,
+    engine: &Engine<R>,
+    settings: &Settings,
+    sessions: &Sessions,
+    project: &str,
+) -> Response<ApiBody> {
+    if !dashboard_enabled(settings) {
+        return text(StatusCode::SERVICE_UNAVAILABLE, "dashboard not configured");
+    }
+    if !session_of(req, sessions) {
+        return redirect("/login");
+    }
+    let deployments = engine.deployment_views().await.unwrap_or_default();
+    let env = engine.store().list_masked();
+    html(
+        StatusCode::OK,
+        ui::project_page(project, &deployments, &env),
+    )
+}
+
+async fn ui_settings<R: ContainerRuntime>(
     req: &Request<Incoming>,
     engine: &Engine<R>,
     settings: &Settings,
@@ -518,7 +561,7 @@ async fn ui_root<R: ContainerRuntime>(
     let env = engine.store().list_masked();
     html(
         StatusCode::OK,
-        dashboard::dashboard_page(&deployments, &env),
+        ui::settings_page(settings, &deployments, &env),
     )
 }
 
@@ -557,7 +600,7 @@ async fn ui_projects<R: ContainerRuntime>(
             .filter(|s| !s.is_empty())
             .collect();
         return match engine.store().set_var(&project, &key, &value, services) {
-            Ok(()) => redirect("/"),
+            Ok(()) => redirect(&format!("/p/{project}")),
             Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
         };
     }
@@ -569,7 +612,7 @@ async fn ui_projects<R: ContainerRuntime>(
     // for the project instead of just the credential.
     if let Some(project) = sub.strip_suffix("/registry/delete") {
         let _ = engine.store().delete_registry(project);
-        return redirect("/");
+        return redirect(&format!("/p/{project}"));
     }
 
     if let Some(project) = sub.strip_suffix("/registry") {
@@ -585,7 +628,7 @@ async fn ui_projects<R: ContainerRuntime>(
             .store()
             .set_registry(&project, &registry, &username, &password)
         {
-            Ok(()) => redirect("/"),
+            Ok(()) => redirect(&format!("/p/{project}")),
             Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
         };
     }
@@ -593,6 +636,7 @@ async fn ui_projects<R: ContainerRuntime>(
     if let Some(head) = sub.strip_suffix("/delete") {
         if let Some((project, key)) = head.split_once("/vars/") {
             let _ = engine.store().delete_var(project, key);
+            return redirect(&format!("/p/{project}"));
         } else {
             let _ = engine.store().delete_project(head);
         }

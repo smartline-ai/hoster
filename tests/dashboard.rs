@@ -156,8 +156,15 @@ async fn ui_set_var_appears_masked_then_deletes() {
         .unwrap();
     assert_eq!(set.status(), 303);
 
-    // Dashboard shows the project + key, targets, but never the value.
-    let html = c.get(&base).send().await.unwrap().text().await.unwrap();
+    // Project page shows the project + key, targets, but never the value.
+    let html = c
+        .get(format!("{base}/p/odinvestor"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(html.contains("odinvestor"));
     assert!(html.contains("GOOGLE_API_KEY"));
     assert!(html.contains("backend"));
@@ -175,7 +182,14 @@ async fn ui_set_var_appears_masked_then_deletes() {
         .await
         .unwrap();
     assert_eq!(del.status(), 303);
-    let html = c.get(&base).send().await.unwrap().text().await.unwrap();
+    let html = c
+        .get(format!("{base}/p/odinvestor"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(!html.contains("GOOGLE_API_KEY"));
 }
 
