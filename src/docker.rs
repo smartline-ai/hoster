@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use bollard::Docker;
+use bollard::auth::DockerCredentials;
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, NetworkingConfig, RemoveContainerOptions,
 };
@@ -13,6 +14,7 @@ use bollard::network::CreateNetworkOptions;
 use futures_util::TryStreamExt;
 
 use crate::runtime::{ContainerRuntime, ContainerSpec, RunningContainer};
+use crate::secrets::RegistryCred;
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -69,7 +71,13 @@ impl ContainerRuntime for DockerRuntime {
         Ok(())
     }
 
-    async fn pull_image(&self, image: &str) -> anyhow::Result<()> {
+    async fn pull_image(&self, image: &str, cred: Option<&RegistryCred>) -> anyhow::Result<()> {
+        let auth = cred.map(|c| DockerCredentials {
+            username: Some(c.username.clone()),
+            password: Some(c.password.clone()),
+            serveraddress: Some(c.registry.clone()),
+            ..Default::default()
+        });
         self.docker
             .create_image(
                 Some(CreateImageOptions {
@@ -77,7 +85,7 @@ impl ContainerRuntime for DockerRuntime {
                     ..Default::default()
                 }),
                 None,
-                None,
+                auth,
             )
             .try_collect::<Vec<_>>()
             .await?;

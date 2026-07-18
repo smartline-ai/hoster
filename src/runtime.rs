@@ -3,6 +3,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::secrets::RegistryCred;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSpec {
     pub name: String,
@@ -29,7 +31,7 @@ pub trait ContainerRuntime: Send + Sync {
         labels: &BTreeMap<String, String>,
     ) -> anyhow::Result<()>;
     async fn remove_network(&self, name: &str) -> anyhow::Result<()>;
-    async fn pull_image(&self, image: &str) -> anyhow::Result<()>;
+    async fn pull_image(&self, image: &str, cred: Option<&RegistryCred>) -> anyhow::Result<()>;
     async fn run(&self, spec: &ContainerSpec) -> anyhow::Result<RunningContainer>;
     async fn inspect(&self, id: &str) -> anyhow::Result<RunningContainer>;
     async fn remove_container(&self, id: &str) -> anyhow::Result<()>;
@@ -50,6 +52,9 @@ struct FakeState {
     /// Env passed to `run`, keyed by container name — env isn't part of
     /// `RunningContainer`, so capture it here for test assertions.
     env: BTreeMap<String, Vec<String>>,
+    /// Credential passed to `pull_image`, keyed by image ref — for test
+    /// assertions that a token reached only its own registry.
+    pull_creds: BTreeMap<String, Option<RegistryCred>>,
     next: u32,
 }
 
@@ -66,6 +71,13 @@ impl FakeRuntime {
     /// The env `run` last received for a container name — for test assertions.
     pub fn env_of(&self, container_name: &str) -> Option<Vec<String>> {
         self.inner.lock().unwrap().env.get(container_name).cloned()
+    }
+
+    /// What `pull_image` was given for an image: `None` if it was never
+    /// pulled, `Some(None)` if pulled anonymously, `Some(Some(c))` if
+    /// authenticated.
+    pub fn pull_cred_of(&self, image: &str) -> Option<Option<RegistryCred>> {
+        self.inner.lock().unwrap().pull_creds.get(image).cloned()
     }
 }
 
@@ -88,7 +100,12 @@ impl ContainerRuntime for FakeRuntime {
         Ok(())
     }
 
-    async fn pull_image(&self, _image: &str) -> anyhow::Result<()> {
+    async fn pull_image(&self, image: &str, cred: Option<&RegistryCred>) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pull_creds
+            .insert(image.to_string(), cred.cloned());
         Ok(())
     }
 
@@ -206,5 +223,23 @@ mod tests {
     async fn run_without_network_errors() {
         let rt = FakeRuntime::new();
         assert!(rt.run(&spec("b1-a", "b1")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fake_runtime_records_the_pull_credential() {
+        let rt = FakeRuntime::new();
+        let cred = crate::secrets::RegistryCred {
+            registry: "ghcr.io".into(),
+            username: "bot".into(),
+            password: "x".into(),
+        };
+        rt.pull_image("ghcr.io/org/app:v1", Some(&cred))
+            .await
+            .unwrap();
+        rt.pull_image("postgres:16", None).await.unwrap();
+
+        assert_eq!(rt.pull_cred_of("ghcr.io/org/app:v1"), Some(Some(cred)));
+        assert_eq!(rt.pull_cred_of("postgres:16"), Some(None));
+        assert_eq!(rt.pull_cred_of("never-pulled"), None);
     }
 }

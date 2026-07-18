@@ -52,7 +52,7 @@ async fn network_run_inspect_and_cleanup() {
     let _ = rt.remove_network(net).await; // clean slate
 
     rt.create_network(net, &BTreeMap::new()).await.unwrap();
-    rt.pull_image("alpine:3.20").await.unwrap();
+    rt.pull_image("alpine:3.20", None).await.unwrap();
 
     let spec = ContainerSpec {
         name: "hoster-itest-1-web".to_string(),

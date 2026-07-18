@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::config::{self, DeployConfig};
+use crate::imageref::registry_host;
 use crate::labels;
 use crate::routing::SharedRoutes;
 use crate::runtime::{ContainerRuntime, ContainerSpec, RunningContainer};
@@ -265,7 +266,13 @@ impl<R: ContainerRuntime> Engine<R> {
                     hostname_for(&self.settings.hostname_template, &sub, branch),
                 );
             }
-            self.runtime.pull_image(&image).await?;
+            // Send the project's credential only to its own registry — a
+            // ghcr.io token must never travel to Docker Hub on a public pull.
+            let cred = self
+                .store
+                .registry_for(project)
+                .filter(|c| c.registry == registry_host(&image));
+            self.runtime.pull_image(&image, cred.as_ref()).await?;
             let spec = ContainerSpec {
                 name: format!("{branch}-{name}"),
                 image,
@@ -484,6 +491,26 @@ mod tests {
             sha: "sha".to_string(),
             config: config::parse(json).unwrap(),
         }
+    }
+
+    /// Fresh `Engine<FakeRuntime>` plus its runtime and store handles, for
+    /// tests that need to inspect what the fake runtime recorded.
+    fn engine_with_fake() -> (Engine<FakeRuntime>, Arc<FakeRuntime>, Arc<Store>) {
+        let rt = Arc::new(FakeRuntime::new());
+        let store = empty_store();
+        let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
+        let eng = engine_with_store(rt.clone(), routes, store.clone());
+        (eng, rt, store)
+    }
+
+    /// Perform one deploy from a config JSON string — thin wrapper shared by
+    /// tests that only care about the deploy's side effects.
+    async fn deploy_config(
+        engine: &Engine<FakeRuntime>,
+        branch: &str,
+        json: &str,
+    ) -> anyhow::Result<DeployAccepted> {
+        engine.deploy(request(branch, json)).await
     }
 
     const TWO_SERVICE: &str = r#"{"project":"p","services":{
@@ -752,5 +779,44 @@ mod tests {
             t.lookup("backend-b2.dev.example.com").is_some(),
             "b2 route lost"
         );
+    }
+
+    #[tokio::test]
+    async fn credential_is_sent_only_to_the_matching_registry() {
+        // A project with a ghcr.io credential deploying two services: one
+        // private image from ghcr.io, one public image from Docker Hub.
+        let (engine, runtime, store) = engine_with_fake();
+        store
+            .set_registry("myproj", "ghcr.io", "bot", "ghp_secret")
+            .unwrap();
+
+        let config = r#"{"project":"myproj","services":{
+            "postgres":{"image":"postgres:16"},
+            "backend":{"image":"ghcr.io/org/backend:v1","expose":{"port":8080}}
+        }}"#;
+        deploy_config(&engine, "main", config).await.unwrap();
+
+        let sent = runtime.pull_cred_of("ghcr.io/org/backend:v1").unwrap();
+        assert_eq!(
+            sent.as_ref().map(|c| c.username.as_str()),
+            Some("bot"),
+            "credential should be sent to its own registry"
+        );
+
+        let public = runtime.pull_cred_of("postgres:16").unwrap();
+        assert!(
+            public.is_none(),
+            "ghcr.io credential must NOT be sent to Docker Hub"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_credential_stored_means_anonymous_pulls() {
+        let (engine, runtime, _store) = engine_with_fake();
+        let config = r#"{"project":"myproj","services":{
+            "backend":{"image":"ghcr.io/org/backend:v1","expose":{"port":8080}}
+        }}"#;
+        deploy_config(&engine, "main", config).await.unwrap();
+        assert_eq!(runtime.pull_cred_of("ghcr.io/org/backend:v1"), Some(None));
     }
 }
