@@ -41,6 +41,7 @@ the HTTP `Host` header, and keeps each branch on its own Docker network.
   - [HTTPS with a reverse proxy](#https-with-a-reverse-proxy)
   - [The dashboard](#the-dashboard)
   - [Project environment & secrets](#project-environment--secrets)
+  - [Private registry credentials](#private-registry-credentials)
 - [Verifying your setup](#verifying-your-setup)
 - [Deploying a project](#deploying-a-project)
 - [Releasing (maintainers)](#releasing-maintainers)
@@ -252,7 +253,8 @@ Redirect `:80` to `:443` in a separate server block if you want to force HTTPS.
 Setting `HOSTER_DASHBOARD_PASSWORD` enables a small server-rendered web
 dashboard, **grouped by project**. Each project card shows its deployments
 (branch, status, URLs, and an expandable **config** view of the `hoster.json`
-each branch was deployed from) and its [managed environment](#project-environment--secrets).
+each branch was deployed from), its [managed environment](#project-environment--secrets),
+and its [registry credential](#private-registry-credentials).
 It is served on the **control API listener** (`HOSTER_API_LISTEN`) at:
 
 - `GET /login`, `POST /login` — password login (sets a session cookie)
@@ -260,6 +262,8 @@ It is served on the **control API listener** (`HOSTER_API_LISTEN`) at:
 - `POST /ui/destroy/<branch>` — tear a branch down from the UI
 - `POST /ui/projects/<project>/vars` — add/replace a managed env var
 - `POST /ui/projects/<project>/vars/<key>/delete` — delete one
+- `POST /ui/projects/<project>/registry` — set/replace the registry credential
+- `POST /ui/projects/<project>/registry/delete` — remove it
 - `POST /logout`
 
 Because it lives on the private API listener, reach it the same way you reach
@@ -305,6 +309,47 @@ curl -fsS "$API/projects" -H "Authorization: Bearer $HOSTER_TOKEN"
 
 # delete
 curl -fsS -X DELETE "$API/projects/odinvestor/vars/GOOGLE_API_KEY" \
+  -H "Authorization: Bearer $HOSTER_TOKEN"
+```
+
+### Private registry credentials
+
+If a project's images live in a private registry, give the project a
+credential and hoster authenticates its pulls with it. Set it once in the
+dashboard's **Registry credential** panel (or via the API below): enter the
+registry host, a username, and a token or password. For GitHub Container
+Registry that's `ghcr.io`, your GitHub username, and a personal access token
+with `read:packages`.
+
+- **Host matching.** The credential is attached to a pull **only** when the
+  image's registry host equals the stored one. A project holding a `ghcr.io`
+  token still pulls `postgres:16` anonymously from Docker Hub, so the token
+  never leaves the registry it belongs to. Docker Hub images (`postgres:16`,
+  `library/postgres`, …) always normalize to the host `docker.io` — store the
+  credential as `docker.io`, not `index.docker.io`, or it will silently never
+  match.
+- **One credential per project.** Saving a new one replaces the old.
+- **Masking.** The password is write-only: the dashboard and API return the
+  host and username — listed alongside variables in the same `GET /projects`
+  response — but never the password.
+- **Not verified.** hoster does not check the credential against the
+  registry when you save it; a bad one shows up as a failed deploy with the
+  registry's own error.
+
+The password is stored in `HOSTER_PROJECTS_FILE` alongside project env vars
+(mode `0600`) and, like them, is not encrypted at rest — see
+[Project environment & secrets](#project-environment--secrets).
+
+JSON API (bearer token):
+
+```bash
+# set/replace the credential
+curl -fsS -X PUT "$API/projects/odinvestor/registry" \
+  -H "Authorization: Bearer $HOSTER_TOKEN" \
+  -d '{"registry":"ghcr.io","username":"my-user","password":"ghp_..."}'
+
+# remove it
+curl -fsS -X DELETE "$API/projects/odinvestor/registry" \
   -H "Authorization: Bearer $HOSTER_TOKEN"
 ```
 
