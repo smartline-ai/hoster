@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "tag=$tag crate=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - name: Install Rust + musl target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add "$TARGET"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package artifacts
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME}"
+          name="hoster-${ver}-x86_64-linux-musl"
+          bin="target/${TARGET}/release/hoster"
+          mkdir -p "dist/${name}"
+          cp "$bin" "dist/${name}/hoster"
+          cp scripts/install.sh "dist/${name}/install.sh"
+          cp README.md "dist/${name}/README.md"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          cp "$bin" "dist/hoster"
+          ( cd dist && sha256sum "${name}.tar.gz" hoster > SHA256SUMS )
+          ls -l dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/hoster-*-x86_64-linux-musl.tar.gz
+            dist/hoster
+            dist/SHA256SUMS
