@@ -628,13 +628,18 @@ impl NamecheapProvider {
 
     async fn get_hosts(&self, sld: &str, tld: &str) -> anyhow::Result<Vec<NcHost>> {
         let q = self.base_query("namecheap.domains.dns.getHosts", sld, tld);
+        // The api_key rides in the query string (Namecheap has no header auth),
+        // so strip the URL from any transport/status error — reqwest would
+        // otherwise attach `...ApiKey=<secret>...` to the error's Display.
         let resp = self
             .http
             .get(&self.base_url)
             .query(&q)
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(|e| e.without_url())?
+            .error_for_status()
+            .map_err(|e| e.without_url())?
             .text()
             .await?;
         Self::check_status(&resp)?;
@@ -658,8 +663,10 @@ impl NamecheapProvider {
             .get(&self.base_url)
             .query(&q)
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(|e| e.without_url())?
+            .error_for_status()
+            .map_err(|e| e.without_url())?
             .text()
             .await?;
         Self::check_status(&resp)?;
@@ -1180,5 +1187,17 @@ mod tests {
         let e = nc.upsert_a("*.dev.example.com", "5.6.7.8").await.unwrap_err();
         assert!(e.to_string().contains("Invalid request IP"), "got {e}");
         assert!(!e.to_string().contains("supersecret"), "must not leak api key: {e}");
+    }
+
+    #[tokio::test]
+    async fn namecheap_http_error_does_not_leak_api_key() {
+        // Namecheap carries the api_key as a query param, so a non-2xx (or any
+        // transport failure) must not surface the request URL — reqwest would
+        // otherwise attach `ApiKey=<secret>` to the error's Display.
+        let (addr, _seen) = mock_server(vec![(500, "<oops/>".into())]).await;
+        let nc = NamecheapProvider::with_base_url(
+            "u".into(), "supersecret".into(), "u".into(), "1.2.3.4".into(), format!("http://{addr}"));
+        let e = nc.upsert_a("*.dev.example.com", "5.6.7.8").await.unwrap_err();
+        assert!(!e.to_string().contains("supersecret"), "api_key leaked in error: {e}");
     }
 }
