@@ -6,14 +6,15 @@ use std::collections::HashMap;
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, NetworkingConfig, RemoveContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
+    NetworkingConfig, RemoveContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{EndpointSettings, HostConfig};
 use bollard::network::CreateNetworkOptions;
 use futures_util::TryStreamExt;
 
-use crate::runtime::{ContainerRuntime, ContainerSpec, RunningContainer};
+use crate::runtime::{ContainerRuntime, ContainerSpec, LogStream, RunningContainer};
 use crate::secrets::RegistryCred;
 
 pub struct DockerRuntime {
@@ -187,5 +188,53 @@ impl ContainerRuntime for DockerRuntime {
             }
         }
         Ok(out)
+    }
+
+    async fn logs(
+        &self,
+        container_id: &str,
+        follow: bool,
+        tail: usize,
+    ) -> anyhow::Result<LogStream> {
+        use futures_util::StreamExt;
+        let options = LogsOptions::<String> {
+            follow,
+            stdout: true,
+            stderr: true,
+            tail: tail.to_string(),
+            timestamps: false,
+            ..Default::default()
+        };
+        let raw = self.docker.logs(container_id, Some(options));
+        // A single Docker log frame can carry several `\n`-separated lines
+        // (e.g. a multi-line stack trace written in one syscall), but the
+        // `LogStream` contract is one decoded line per item. Split each
+        // frame into its lines and flatten with `stream::iter` so the
+        // output stream stays a uniform `anyhow::Result<String>` (no
+        // `Either`/`left_stream`/`right_stream` needed). A stream error
+        // still surfaces as exactly one `Err` item. Note: a line split
+        // across two frames (rare) may surface as two items — an accepted
+        // limitation for a live tail.
+        let mapped = raw.flat_map(|chunk: Result<LogOutput, bollard::errors::Error>| {
+            let items: Vec<anyhow::Result<String>> = match chunk {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(&out.into_bytes()).into_owned();
+                    let mut lines: Vec<String> = text
+                        .split('\n')
+                        .map(|l| l.trim_end_matches('\r').to_string())
+                        .collect();
+                    // split() on a trailing '\n' leaves a final empty
+                    // element — drop it so a terminal newline doesn't
+                    // produce a spurious empty item.
+                    if lines.last().is_some_and(|s| s.is_empty()) {
+                        lines.pop();
+                    }
+                    lines.into_iter().map(Ok).collect()
+                }
+                Err(e) => vec![Err(anyhow::Error::from(e))],
+            };
+            futures_util::stream::iter(items)
+        });
+        Ok(Box::pin(mapped))
     }
 }
