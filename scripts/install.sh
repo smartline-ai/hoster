@@ -170,7 +170,7 @@ EnvironmentFile=${ENV_FILE}
 ExecStart=${BIN_DIR}/hoster
 Restart=always
 RestartSec=2
-# Allow binding :80 as a non-root service.
+# Allow binding :80 and, with HOSTER_HTTPS_LISTEN, :443 as a non-root service.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true

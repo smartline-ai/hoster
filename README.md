@@ -43,6 +43,7 @@ the HTTP `Host` header, and keeps each branch on its own Docker network.
   - [Project environment & secrets](#project-environment--secrets)
   - [Private registry credentials](#private-registry-credentials)
   - [Per-project domains](#per-project-domains)
+  - [Built-in TLS](#built-in-tls)
 - [Verifying your setup](#verifying-your-setup)
 - [Deploying a project](#deploying-a-project)
 - [Releasing (maintainers)](#releasing-maintainers)
@@ -168,6 +169,10 @@ the only required one. The installer keeps them in `/etc/hoster/hoster.env`.
 | `HOSTER_REGISTRY` | `localhost:5000` | Registry base used for the `{{registry}}` template variable in image refs. |
 | `HOSTER_DASHBOARD_PASSWORD` | *(unset)* | Set a non-empty value to enable the web [dashboard](#the-dashboard). Unset disables it. |
 | `HOSTER_PROJECTS_FILE` | `/etc/hoster/projects.json` | Where [project environment variables](#project-environment--secrets) are stored (`0600`). |
+| `HOSTER_HTTPS_LISTEN` | *(unset)* | Address the **HTTPS listener** binds. Unset disables [built-in TLS](#built-in-tls) entirely — no listener, no renewal loop, no issuance. |
+| `HOSTER_CERT_DIR` | `/var/lib/hoster/certs` | Where issued certificates and keys are stored. |
+| `HOSTER_ACME_ACCOUNT_FILE` | `/var/lib/hoster/acme-account.json` | Where the Let's Encrypt account key is stored. |
+| `HOSTER_ACME_PRODUCTION` | *(unset — staging)* | Set to `1`, `true`, or `yes` to request certificates from Let's Encrypt **production** instead of staging. See [Built-in TLS](#built-in-tls). |
 | `DOCKER_HOST` | *(Docker default)* | Socket selection, honoured by the Docker client. Set it if your socket is non-standard. |
 | `RUST_LOG` | `hoster=info` | Log filter (`tracing`/`env_filter` syntax), e.g. `hoster=debug`. |
 
@@ -386,8 +391,110 @@ Changing a project's domain affects **subsequent** deploys only. Branches
 already running keep the hostnames they were deployed with, because each
 container records its own hostname; redeploy a branch to move it.
 
-Each domain still needs its own wildcard DNS record, and — until hoster
-terminates TLS itself — its own certificate and reverse-proxy server block.
+Each domain still needs its own wildcard DNS record, and its own certificate —
+either from your own reverse proxy (see
+[HTTPS with a reverse proxy](#https-with-a-reverse-proxy)) or from hoster's
+own ACME client (see [Built-in TLS](#built-in-tls)).
+
+### Built-in TLS
+
+hoster can terminate TLS itself, issuing and renewing its own Let's Encrypt
+certificates instead of sitting behind nginx or another reverse proxy.
+Certificates are issued via the ACME **DNS-01** challenge, so they can be
+wildcards — one certificate per domain covers every branch's hostname.
+**Only Cloudflare is supported as a DNS provider today.**
+
+**1. Create a Cloudflare API token.** In the Cloudflare dashboard, scope it to
+`Zone:DNS:Edit` on just the zone(s) hoster needs, not a global API key. hoster
+only ever creates and deletes `_acme-challenge` TXT records.
+
+**2. Enter the ACME email, control hostname, and token in the dashboard.**
+Open the dashboard's **TLS & DNS** panel (requires
+[`HOSTER_DASHBOARD_PASSWORD`](#the-dashboard)) and fill in:
+
+- **ACME account** — your email and, optionally, a control hostname (a plain,
+  non-wildcard hostname such as `hoster.example.com` that you want its own
+  certificate for, alongside the wildcards).
+- **DNS provider** — `cloudflare` and the API token from step 1.
+
+The same fields are available over the bearer-token API, for scripting:
+
+```bash
+curl -fsS -X PUT "$API/acme/config" -H "Authorization: Bearer $HOSTER_TOKEN" \
+  -d '{"email":"you@example.com","control_hostname":"hoster.example.com"}'
+
+curl -fsS -X PUT "$API/acme/dns" -H "Authorization: Bearer $HOSTER_TOKEN" \
+  -d '{"kind":"cloudflare","token":"the-cloudflare-token"}'
+```
+
+The token is stored in `HOSTER_PROJECTS_FILE` under mode `0600`, the same as
+project secrets, and **is never displayed again** once saved — the dashboard
+and `GET /acme/status` show only that a provider is configured, never the
+token itself.
+
+**3. Set `HOSTER_HTTPS_LISTEN`** and restart hoster:
+
+```bash
+sudoedit /etc/hoster/hoster.env      # HOSTER_HTTPS_LISTEN=0.0.0.0:8443
+sudo systemctl restart hoster
+```
+
+This starts the HTTPS listener and a background renewal loop that issues and
+renews a certificate for every domain hoster currently wants one for: the
+global `HOSTER_HOSTNAME_TEMPLATE`, every project's own domain override, and
+the control hostname, if set. Certificates persist in `HOSTER_CERT_DIR`
+(default `/var/lib/hoster/certs`) and outlive restarts — hoster does not
+reissue a certificate that is already valid on disk.
+
+**Staging by default.** Until you set `HOSTER_ACME_PRODUCTION`, hoster
+requests certificates from Let's Encrypt's **staging** environment, whose
+certificates are **not trusted by browsers** — you'll see a certificate
+warning until you switch to production. That's deliberate, not a wart: it
+proves DNS-01, your Cloudflare token, and the renewal loop all work end to
+end before you're spending production's much tighter rate limits (five
+failed authorizations per hour) on a configuration that might still be wrong.
+Once a staging certificate issues cleanly, switch over:
+
+```bash
+sudoedit /etc/hoster/hoster.env      # HOSTER_ACME_PRODUCTION=1
+sudo systemctl restart hoster
+```
+
+**4. Watch certificates appear in the dashboard's certificate table.** The
+**TLS & DNS** panel lists one row per domain hoster wants a certificate for,
+with a plain-language state: `pending`, `valid until <date>`, or `failed:
+<reason>` (`GET /acme/status` returns the same data as JSON). **A domain
+without a valid certificate keeps serving plain HTTP rather than going
+dark** — that is the deliberate failure mode, so a bad token or a typoed
+hostname degrades one domain instead of taking every branch down. The
+certificate table is where you'll see it, so check it after changing DNS
+credentials or adding a domain.
+
+#### Cutting over from nginx
+
+To move an existing nginx-terminated install to built-in TLS without a gap:
+
+1. Set `HOSTER_HTTPS_LISTEN=0.0.0.0:8443` (or any free port) so hoster runs
+   its HTTPS listener *alongside* nginx, which keeps `:443` for now.
+2. Configure the ACME account and Cloudflare token as above, staying on
+   staging.
+3. Watch the certificate table until every domain you care about reads
+   `valid`, then confirm a branch actually serves over it:
+   ```bash
+   openssl s_client -connect <host>:8443 -servername backend-main.dev.example.com </dev/null \
+     | openssl x509 -noout -text | grep -A1 "Subject Alternative Name"
+   ```
+4. Set `HOSTER_ACME_PRODUCTION=1`, restart, and confirm a browser-trusted
+   certificate is issued.
+5. Move hoster onto the public port and retire nginx:
+   ```bash
+   sudoedit /etc/hoster/hoster.env    # HOSTER_HTTPS_LISTEN=0.0.0.0:443
+   sudo systemctl restart hoster
+   sudo systemctl stop nginx && sudo systemctl disable nginx
+   ```
+   Binding `:443` as the non-root `hoster` service user works because the
+   installed unit already grants `CAP_NET_BIND_SERVICE` (see
+   [Ports and binding](#ports-and-binding)).
 
 ---
 
