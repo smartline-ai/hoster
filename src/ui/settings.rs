@@ -1,7 +1,7 @@
 //! The Settings page body.
 use std::fmt::Write;
 
-use crate::certs::CertRow;
+use crate::certs::{CertRow, CertSeverity};
 use crate::secrets::MaskedAcme;
 use crate::settings::Settings;
 use crate::ui::components::html_escape;
@@ -151,7 +151,7 @@ fn render_cert_table(body: &mut String, certs: &[CertRow]) {
     }
     body.push_str("<div class=\"env-list\">");
     for c in certs {
-        let (class, label, reason) = cert_state_parts(&c.state);
+        let (class, label, reason) = cert_state_parts(c);
         let _ = write!(
             body,
             "<div class=\"env-row\"><span class=\"k\">{}</span>\
@@ -167,18 +167,27 @@ fn render_cert_table(body: &mut String, certs: &[CertRow]) {
     body.push_str("</div>");
 }
 
-/// Split a free-form certificate state into a severity class, a short label,
-/// and — for a failure — the reason, which is surfaced beside the label rather
-/// than buried inside it.
-fn cert_state_parts(state: &str) -> (&'static str, &str, Option<&str>) {
-    if let Some(reason) = state.strip_prefix("failed:") {
-        let reason = reason.trim();
-        return ("bad", "failed", Some(reason).filter(|r| !r.is_empty()));
-    }
-    if state.starts_with("valid") {
-        ("ok", state, None)
-    } else {
-        ("warn", state, None)
+/// Map a row's typed [`CertSeverity`] to a CSS class, a short label, and —
+/// for a failure — the reason, which is surfaced beside the label rather
+/// than buried inside it. Severity drives the styling directly; `state`'s
+/// wording is only ever used to extract the human-readable reason text, so a
+/// reworded failure message can never lose its failure styling the way
+/// string-matching `state`'s prefix used to allow.
+fn cert_state_parts(row: &CertRow) -> (&'static str, &str, Option<&str>) {
+    match row.severity {
+        CertSeverity::Failed => {
+            // `state` is normally `"failed: <reason>"`; strip that prefix
+            // when present, but fall back to the whole string so a reworded
+            // message still surfaces as the reason rather than disappearing.
+            let reason = row
+                .state
+                .strip_prefix("failed:")
+                .map(str::trim)
+                .unwrap_or(row.state.as_str());
+            ("bad", "failed", Some(reason).filter(|r| !r.is_empty()))
+        }
+        CertSeverity::Valid => ("ok", &row.state, None),
+        CertSeverity::Pending => ("warn", &row.state, None),
     }
 }
 
@@ -208,10 +217,11 @@ mod tests {
         }
     }
 
-    fn row(domain: &str, state: &str) -> CertRow {
+    fn row(domain: &str, state: &str, severity: CertSeverity) -> CertRow {
         CertRow {
             domain: domain.into(),
             state: state.into(),
+            severity,
         }
     }
 
@@ -237,11 +247,18 @@ mod tests {
         assert!(html.contains("action=\"/ui/acme/config\""));
     }
 
-    /// The DNS token can rewrite DNS. Only a masked placeholder may render.
+    /// The DNS row names the provider and shows the token only as a masked
+    /// placeholder, with forms to replace or remove it. This does not (and
+    /// structurally cannot) guard against the token itself leaking: `acme()`
+    /// is a [`MaskedAcme`] fixture, and that type has no field capable of
+    /// holding the plaintext token in the first place — that guarantee comes
+    /// from `MaskedAcme`'s shape, plus the end-to-end
+    /// `dashboard_pages_never_render_the_dns_token` test in `crate::api`,
+    /// which stores a real token through `set_dns_token` and inspects the
+    /// actual rendered page.
     #[test]
-    fn never_renders_the_dns_token() {
+    fn renders_the_dns_provider_masked_and_with_manage_actions() {
         let html = settings_body(&settings(), Some(&acme()), &[]);
-        assert!(!html.contains("cf_topsecret"));
         // the provider is named and the token shown only as bullets
         assert!(html.contains("cloudflare"));
         assert!(html.contains('\u{2022}'));
@@ -265,9 +282,17 @@ mod tests {
     #[test]
     fn renders_certificate_state_rows_including_a_failure_reason() {
         let rows = [
-            row("a.example.com", "valid until 2026-10-01"),
-            row("b.example.com", "pending"),
-            row("c.example.com", "failed: no zone found"),
+            row(
+                "a.example.com",
+                "valid until 2026-10-01",
+                CertSeverity::Valid,
+            ),
+            row("b.example.com", "pending", CertSeverity::Pending),
+            row(
+                "c.example.com",
+                "failed: no zone found",
+                CertSeverity::Failed,
+            ),
         ];
         let html = settings_body(&settings(), Some(&acme()), &rows);
         assert!(html.contains("a.example.com"));
@@ -285,10 +310,35 @@ mod tests {
         let rows = [row(
             "<b>d</b>.example.com",
             "failed: <script>alert(1)</script>",
+            CertSeverity::Failed,
         )];
         let html = settings_body(&settings(), Some(&acme()), &rows);
         assert!(!html.contains("<script>alert(1)"));
         assert!(!html.contains("<b>d</b>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    /// Severity is set structurally by the caller, not re-derived from
+    /// `state`'s wording — so a reworded failure message that no longer
+    /// starts with "failed:" must still render with the failure (`bad`)
+    /// styling and its reason. Before the fix, `cert_state_parts` string-
+    /// matched `state`'s prefix, so this exact row rendered as a neutral
+    /// "warn" row instead of a red one.
+    #[test]
+    fn a_failed_row_keeps_failure_styling_even_when_its_wording_no_longer_says_failed() {
+        let rows = [row(
+            "e.example.com",
+            "DNS challenge could not be completed",
+            CertSeverity::Failed,
+        )];
+        let html = settings_body(&settings(), Some(&acme()), &rows);
+        assert!(
+            html.contains("tag bad"),
+            "a Failed row must render with the bad/red styling regardless of wording: {html}"
+        );
+        assert!(
+            html.contains("DNS challenge could not be completed"),
+            "the failure reason must still be visible: {html}"
+        );
     }
 }

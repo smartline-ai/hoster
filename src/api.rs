@@ -23,7 +23,7 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
-use crate::certs::{CertRow, CertStore};
+use crate::certs::{CertRow, CertSeverity, CertStore};
 use crate::config::{self, DeployConfig};
 use crate::engine::{DeployRequest, Engine};
 use crate::renewal;
@@ -585,14 +585,21 @@ fn cert_rows<R: ContainerRuntime>(engine: &Engine<R>, settings: &Settings) -> Ve
     wanted
         .into_iter()
         .map(|domain| {
-            let state = match have.iter().find(|c| c.domain == domain) {
-                Some(c) => format!("valid until {}", format_date(c.not_after)),
+            let (state, severity) = match have.iter().find(|c| c.domain == domain) {
+                Some(c) => (
+                    format!("valid until {}", format_date(c.not_after)),
+                    CertSeverity::Valid,
+                ),
                 None => match failures.get(&domain).and_then(|s| s.last_error.as_deref()) {
-                    Some(err) => format!("failed: {err}"),
-                    None => "pending".to_string(),
+                    Some(err) => (format!("failed: {err}"), CertSeverity::Failed),
+                    None => ("pending".to_string(), CertSeverity::Pending),
                 },
             };
-            CertRow { domain, state }
+            CertRow {
+                domain,
+                state,
+                severity,
+            }
         })
         .collect()
 }
@@ -998,7 +1005,7 @@ async fn ui_projects<R: ContainerRuntime>(
     // mis-route into `delete_project` instead of reverting the domain.
     if let Some(project) = sub.strip_suffix("/domain/delete") {
         let _ = engine.store().delete_hostname_template(project);
-        return redirect("/");
+        return redirect(&format!("/p/{project}"));
     }
 
     if let Some(project) = sub.strip_suffix("/domain") {
@@ -1009,7 +1016,7 @@ async fn ui_projects<R: ContainerRuntime>(
         };
         let template = form_field(&bytes, "hostname_template").unwrap_or_default();
         return match engine.store().set_hostname_template(&project, &template) {
-            Ok(()) => redirect("/"),
+            Ok(()) => redirect(&format!("/p/{project}")),
             Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
         };
     }
@@ -1082,7 +1089,7 @@ async fn ui_acme<R: ContainerRuntime>(
 
     if sub == "dns/delete" {
         let _ = engine.store().delete_dns_token();
-        return redirect("/");
+        return redirect("/settings");
     }
 
     // The dashboard's "Retry now" button — the same trigger as
@@ -1101,7 +1108,7 @@ async fn ui_acme<R: ContainerRuntime>(
                 format!("a renewal pass was requested too recently; try again in {wait_secs}s"),
             );
         }
-        return redirect("/");
+        return redirect("/settings");
     }
 
     if sub == "dns" {
@@ -1112,7 +1119,7 @@ async fn ui_acme<R: ContainerRuntime>(
         let kind = form_field(&bytes, "kind").unwrap_or_default();
         let token = form_field(&bytes, "token").unwrap_or_default();
         return match engine.store().set_dns_token(&kind, &token) {
-            Ok(()) => redirect("/"),
+            Ok(()) => redirect("/settings"),
             Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
         };
     }
@@ -1128,7 +1135,7 @@ async fn ui_acme<R: ContainerRuntime>(
             .store()
             .set_acme_config(&email, control_hostname.as_deref())
         {
-            Ok(()) => redirect("/"),
+            Ok(()) => redirect("/settings"),
             Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
         };
     }
@@ -1748,6 +1755,44 @@ mod tests {
         );
     }
 
+    /// The domain form lives on the project page (`render_domain` in
+    /// `crate::ui::project`), the same as `/vars` and `/registry` — so, like
+    /// them, submitting it should return the operator to `/p/<project>`
+    /// rather than bouncing them to Overview.
+    #[tokio::test]
+    async fn ui_projects_domain_routes_redirect_back_to_the_project_page() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        engine
+            .store()
+            .set_hostname_template("myproj", "{branch}.demo.example.com")
+            .unwrap();
+
+        for (path, body) in [
+            (
+                "/ui/projects/myproj/domain",
+                "hostname_template={branch}.demo.example.com",
+            ),
+            ("/ui/projects/myproj/domain/delete", ""),
+        ] {
+            let res = call_with_cookie(
+                &engine,
+                &settings,
+                &sessions,
+                Method::POST,
+                path,
+                body,
+                &cookie,
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::SEE_OTHER, "{path}");
+            assert_eq!(
+                res.headers().get("location").and_then(|v| v.to_str().ok()),
+                Some("/p/myproj"),
+                "{path} should return the operator to the project page"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn put_acme_config_then_dns_token_stores_both() {
         let (engine, settings, sessions) = api_harness();
@@ -1828,6 +1873,9 @@ mod tests {
         assert!(body.contains("certificates"), "body: {body}");
         assert!(body.contains("dev.example.com"), "body: {body}");
         assert!(body.contains("pending"), "body: {body}");
+        // The typed severity travels over the wire alongside the
+        // human-readable state, not instead of it.
+        assert!(body.contains("\"severity\":\"pending\""), "body: {body}");
     }
 
     #[tokio::test]
@@ -1977,6 +2025,43 @@ mod tests {
         assert!(!masked.token_set);
     }
 
+    /// Every `/ui/acme/*` form lives on `/settings`; submitting one must
+    /// return the operator there to see the result, not bounce them to
+    /// Overview the way a bare `redirect("/")` used to.
+    #[tokio::test]
+    async fn ui_acme_form_routes_redirect_back_to_settings() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        engine
+            .store()
+            .set_acme_config("me@example.com", None)
+            .unwrap();
+        engine.store().set_dns_token("cloudflare", "tok").unwrap();
+
+        for (path, body) in [
+            ("/ui/acme/config", "email=me%40example.com"),
+            ("/ui/acme/dns", "kind=cloudflare&token=tok2"),
+            ("/ui/acme/dns/delete", ""),
+            ("/ui/acme/renew", ""),
+        ] {
+            let res = call_with_cookie(
+                &engine,
+                &settings,
+                &sessions,
+                Method::POST,
+                path,
+                body,
+                &cookie,
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::SEE_OTHER, "{path}");
+            assert_eq!(
+                res.headers().get("location").and_then(|v| v.to_str().ok()),
+                Some("/settings"),
+                "{path} should return the operator to /settings"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn ui_acme_routes_require_the_dashboard_session() {
         let (engine, settings, sessions) = api_harness();
@@ -2001,6 +2086,14 @@ mod tests {
     /// the data flowing into the templates, not the markup around it, so it
     /// holds whether or not the TLS panel has been ported yet. Both pages that
     /// read project/ACME state are checked.
+    ///
+    /// This is the real leak-protection test — unlike a fixture-built
+    /// `MaskedAcme` (which structurally cannot carry the plaintext token, so
+    /// asserting its absence proves nothing), this stores an actual token
+    /// through `set_dns_token` and inspects the actual rendered response.
+    /// `/settings` additionally must show the masked placeholder, so a page
+    /// that rendered nothing at all — which would vacuously satisfy "does
+    /// not contain the token" — cannot pass either.
     #[tokio::test]
     async fn dashboard_pages_never_render_the_dns_token() {
         let (engine, settings, sessions, cookie) = dashboard_harness();
@@ -2029,6 +2122,12 @@ mod tests {
                 !body.contains("cf_topsecret"),
                 "token leaked on {path}: {body}"
             );
+            if path == "/settings" {
+                assert!(
+                    body.contains('\u{2022}'),
+                    "expected the masked token placeholder on {path}, got: {body}"
+                );
+            }
         }
     }
 

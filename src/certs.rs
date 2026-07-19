@@ -600,9 +600,24 @@ mod tests {
     }
 }
 
+/// Coarse severity of a certificate row, set by the caller that actually
+/// knows which case it built — never re-derived from `CertRow::state`'s
+/// prose. That prose is free text assembled from provider error strings and
+/// can be reworded at any time; a severity re-parsed from it would silently
+/// drift out of sync and could downgrade a real failure to a neutral status
+/// with no way to notice. `state` stays purely for display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertSeverity {
+    Pending,
+    Valid,
+    Failed,
+}
+
 /// One row of the certificate table: a domain hoster wants a certificate for,
-/// plus a free-form, human-readable summary of its current state — `"valid
-/// until 2026-10-01"`, `"failed: no zone found"`, `"pending"`.
+/// a typed [`CertSeverity`], and a free-form, human-readable summary of its
+/// current state — `"valid until 2026-10-01"`, `"failed: no zone found"`,
+/// `"pending"` — for display only; severity must never be re-derived from it.
 ///
 /// Built by the caller from a [`CertStore`] and the renewal loop's persisted
 /// state. Served by `GET /acme/status` and rendered by the dashboard's TLS
@@ -611,4 +626,5 @@ mod tests {
 pub struct CertRow {
     pub domain: String,
     pub state: String,
+    pub severity: CertSeverity,
 }
