@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 #[async_trait]
@@ -822,6 +823,28 @@ impl DnsProvider for ManualProvider {
     async fn delete_a(&self, _name: &str) -> anyhow::Result<()> { Ok(()) }
 }
 
+/// Build a live provider from stored credentials. `client_ip` is hoster's
+/// public IP (Namecheap's allowlisted ClientIp; ignored by the others).
+pub fn build_provider(
+    cfg: &crate::secrets::DnsProviderConfig,
+    client_ip: &str,
+) -> anyhow::Result<Arc<dyn DnsProvider>> {
+    cfg.validate().map_err(|e| anyhow::anyhow!(e))?;
+    let p: Arc<dyn DnsProvider> = match cfg.kind.as_str() {
+        "cloudflare" => Arc::new(CloudflareProvider::new(cfg.token.clone().unwrap())),
+        "hetzner" => Arc::new(HetznerProvider::new(cfg.token.clone().unwrap())),
+        "namecheap" => Arc::new(NamecheapProvider::new(
+            cfg.api_user.clone().unwrap(),
+            cfg.api_key.clone().unwrap(),
+            cfg.username.clone().unwrap(),
+            client_ip.to_string(),
+        )),
+        "manual" => Arc::new(ManualProvider::new()),
+        other => anyhow::bail!("unknown DNS provider {other:?}"),
+    };
+    Ok(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1228,5 +1251,16 @@ mod tests {
         m.delete_a("*.dev.example.com").await.unwrap();
         m.upsert_txt("_acme-challenge.dev.example.com", "v").await.unwrap();
         m.delete_txt("_acme-challenge.dev.example.com", "v").await.unwrap();
+    }
+
+    #[test]
+    fn build_provider_maps_each_kind() {
+        use crate::secrets::DnsProviderConfig;
+        let cf = DnsProviderConfig { kind: "cloudflare".into(), token: Some("t".into()), api_user: None, api_key: None, username: None };
+        assert!(build_provider(&cf, "1.2.3.4").is_ok());
+        let manual = DnsProviderConfig { kind: "manual".into(), token: None, api_user: None, api_key: None, username: None };
+        assert!(build_provider(&manual, "1.2.3.4").is_ok());
+        let bad = DnsProviderConfig { kind: "route53".into(), token: None, api_user: None, api_key: None, username: None };
+        assert!(build_provider(&bad, "1.2.3.4").is_err());
     }
 }
