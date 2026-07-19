@@ -112,6 +112,106 @@ proxy — deploys fail until the daemon returns, but existing routes keep workin
 
 ---
 
+## Reverse-proxy mode (standalone vs. nginx)
+
+By default hoster is its own edge proxy: it binds `:80`/`:443` directly and
+routes by `Host` header. That's **standalone mode**, and it's unchanged from
+the rest of this guide — nothing to configure.
+
+If you'd rather put nginx at the edge — for its TLS stack, existing configs,
+or because other sites already share the box — hoster can run in **nginx
+mode** instead. nginx terminates TLS and reverse-proxies every request to
+hoster's plain HTTP listener (`HOSTER_LISTEN`); hoster keeps issuing and
+renewing the wildcard certificates (via the same DNS-01 ACME flow described
+elsewhere in this doc) and generates the nginx config that serves them.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HOSTER_PROXY_MODE` | `standalone` | Set to `nginx` to put nginx at the edge instead of hoster. |
+| `HOSTER_NGINX_CONF` | `/etc/nginx/conf.d/hoster.conf` | The single config file hoster generates and keeps up to date. |
+| `HOSTER_NGINX_RELOAD_CMD` | `systemctl reload nginx` | Command hoster runs after a config it wrote passes `nginx -t`. |
+
+In nginx mode:
+
+- **`HOSTER_HTTPS_LISTEN` is ignored.** nginx owns `:443`; hoster does not
+  bind it, no matter what `HOSTER_HTTPS_LISTEN` is set to.
+- **`HOSTER_LISTEN` is nginx's upstream.** Point it at a local, plain-HTTP
+  address — e.g. `127.0.0.1:8080` — and have nginx proxy to it. Don't expose
+  this address publicly; nginx is the public edge now.
+- hoster still issues and renews the wildcard TLS certificates itself. It
+  just hands them to nginx instead of terminating TLS with them directly.
+
+```bash
+export HOSTER_PROXY_MODE='nginx'
+export HOSTER_LISTEN='127.0.0.1:8080'
+export HOSTER_NGINX_CONF='/etc/nginx/conf.d/hoster.conf'
+# Running hoster as root: reload directly (default). If hoster runs as a
+# non-root user, use 'sudo systemctl reload nginx' instead and add the sudoers
+# entry below — hoster then validates as 'sudo nginx -t' to match. See Permissions.
+export HOSTER_NGINX_RELOAD_CMD='systemctl reload nginx'
+```
+
+### Lifecycle: generated at startup and on renewal, never per deploy
+
+hoster (re)writes `HOSTER_NGINX_CONF` at **startup** and whenever a
+certificate is **issued or renewed** — not on every deploy. A new branch
+needs **no nginx change**: the wildcard cert plus hoster's `Host`-based
+routing already cover every `*.<base>` subdomain, so nginx keeps working
+unmodified as branches come and go.
+
+The generated file has one shared `:80` server block (a catch-all that proxies
+plain HTTP to hoster's upstream, same as the `:443` blocks) plus one `:443`
+server block per wildcard base domain that currently has a certificate on
+disk. A base without a cert yet is simply omitted until issuance catches up.
+
+### Permissions
+
+hoster needs to be able to (a) write `HOSTER_NGINX_CONF` and (b) run
+`nginx -t` and the reload command. There are two ways to grant this:
+
+**Run hoster as root (simplest).** The default `HOSTER_NGINX_RELOAD_CMD`
+(`systemctl reload nginx`) and the `nginx -t` validation both run directly, no
+sudo needed. Nothing extra to configure.
+
+**Run hoster as a non-root user with sudo.** Set the reload command to run
+through `sudo`:
+
+```bash
+export HOSTER_NGINX_RELOAD_CMD='sudo systemctl reload nginx'
+```
+
+hoster automatically runs validation as `sudo nginx -t` to match — it inherits
+the `sudo` (or `doas`/`pkexec`) prefix from your reload command, so validation
+and reload use the same privilege path. `nginx -t` is always run and can never
+be replaced or skipped; only a recognized privilege prefix is prepended. Grant
+a narrow NOPASSWD sudoers entry covering both commands:
+
+```
+hoster ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /bin/systemctl reload nginx
+```
+
+Adjust the binary paths to match your distro. If hoster can't write the file
+or run these commands, it fails loudly — in the logs and in the dashboard's
+Proxy section — rather than silently leaving nginx unconfigured.
+
+### nginx version
+
+The generated config uses `http2 on;` as its own directive, which requires
+**nginx ≥ 1.25**. Older nginx needs HTTP/2 enabled on the `listen` line
+instead (the deprecated `listen 443 ssl http2;` form) — not supported by the
+generator, so upgrade nginx first if you're on an older release.
+
+### Failure behavior
+
+A failed `nginx -t` **never** triggers a reload — hoster restores the
+last-good config file, and the edge keeps serving whatever it was already
+serving. Check the dashboard's **Settings** page for the read-only **Proxy**
+section: it shows the active proxy mode, the generated conf path, and the
+result of the last apply attempt, including any `nginx -t` output when it
+failed.
+
+---
+
 ## Describing your project: `hoster.json`
 
 Each branch ships a `hoster.json` in its repo describing its services. Your CI

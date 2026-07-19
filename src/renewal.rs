@@ -218,6 +218,7 @@ pub async fn run_once(
     wanted: &[String],
     mut state: BTreeMap<String, DomainState>,
     now: i64,
+    on_change: Option<&(dyn Fn() + Sync)>,
 ) -> BTreeMap<String, DomainState> {
     let mut changed = false;
     for domain in store.due(wanted, now) {
@@ -261,6 +262,9 @@ pub async fn run_once(
     }
     if changed {
         rebuild(store, shared, now);
+        if let Some(f) = on_change {
+            f();
+        }
     }
 
     // Domains that are no longer wanted (a project's template changed, say)
@@ -293,6 +297,7 @@ pub async fn run_loop(
     shared: SharedCerts,
     wanted: impl Fn() -> Vec<String> + Send + 'static,
     trigger: RenewalTrigger,
+    on_change: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     let mut state = load_state(&store);
     // The first pass at startup is scheduled, not operator-requested.
@@ -311,7 +316,16 @@ pub async fn run_loop(
             clear_backoff(&mut state, &domains, cutoff);
         }
         let now = now_secs();
-        state = run_once(issuer.as_ref(), &store, &shared, &domains, state, now).await;
+        state = run_once(
+            issuer.as_ref(),
+            &store,
+            &shared,
+            &domains,
+            state,
+            now,
+            on_change.as_deref().map(|f| f as &(dyn Fn() + Sync)),
+        )
+        .await;
         if let Err(e) = save_state(&store, &state) {
             tracing::error!(error = %e, "failed to persist renewal state");
         }
@@ -517,7 +531,16 @@ mod tests {
         let wanted = vec!["a.example.com".to_string()];
 
         // One failure puts the domain into a 15-minute backoff.
-        let state = run_once(&AlwaysFails, &store, &shared, &wanted, BTreeMap::new(), 0).await;
+        let state = run_once(
+            &AlwaysFails,
+            &store,
+            &shared,
+            &wanted,
+            BTreeMap::new(),
+            0,
+            None,
+        )
+        .await;
         assert_eq!(state["a.example.com"].failures, 1);
 
         // A pass one minute later does not even attempt it: the domain is
@@ -525,14 +548,14 @@ mod tests {
         // always succeeds. (`AlwaysSucceeds` writes placeholder PEM, so the
         // on-disk file, not `load_all`, is the evidence here.)
         let cert_file = store.dir_for("a.example.com").join("cert.pem");
-        let mut state = run_once(&AlwaysSucceeds, &store, &shared, &wanted, state, 60).await;
+        let mut state = run_once(&AlwaysSucceeds, &store, &shared, &wanted, state, 60, None).await;
         assert!(!cert_file.exists(), "issuance should have been skipped");
         assert_eq!(state["a.example.com"].failures, 1);
 
         // A manual trigger accepted at 60 clears the backoff (the failure at
         // 0 predates it), so the same instant succeeds.
         clear_backoff(&mut state, &wanted, 60);
-        let state = run_once(&AlwaysSucceeds, &store, &shared, &wanted, state, 60).await;
+        let state = run_once(&AlwaysSucceeds, &store, &shared, &wanted, state, 60, None).await;
         assert!(!state.contains_key("a.example.com"));
         assert!(cert_file.exists(), "the retry should have issued");
     }
@@ -607,12 +630,13 @@ mod tests {
             &wanted,
             Default::default(),
             1000,
+            None,
         )
         .await;
         assert_eq!(state["*.dev.example.com"].failures, 1);
 
         // One minute later: still inside the 15-minute backoff, so no attempt.
-        let state = run_once(&AlwaysFails, &store, &shared, &wanted, state, 1060).await;
+        let state = run_once(&AlwaysFails, &store, &shared, &wanted, state, 1060, None).await;
         assert_eq!(
             state["*.dev.example.com"].failures, 1,
             "must not retry during backoff"
@@ -626,6 +650,7 @@ mod tests {
             &wanted,
             state,
             1000 + 15 * 60 + 1,
+            None,
         )
         .await;
         assert_eq!(state["*.dev.example.com"].failures, 2);
@@ -644,6 +669,7 @@ mod tests {
             &["*.old.example.com".to_string()],
             Default::default(),
             1000,
+            None,
         )
         .await;
         assert!(state.contains_key("*.old.example.com"));
@@ -655,6 +681,7 @@ mod tests {
             &["*.new.example.com".to_string()],
             state,
             2000,
+            None,
         )
         .await;
         assert!(
@@ -690,6 +717,7 @@ mod tests {
             &wanted,
             failing_state,
             1000,
+            None,
         )
         .await;
         assert!(
@@ -755,6 +783,7 @@ mod tests {
             &wanted,
             Default::default(),
             1000,
+            None,
         )
         .await;
         assert_eq!(state["*.dev.example.com"].failures, 1);
@@ -779,6 +808,7 @@ mod tests {
             &wanted,
             restarted_state,
             1060,
+            None,
         )
         .await;
         assert_eq!(
@@ -797,6 +827,65 @@ mod tests {
         assert!(
             state.is_empty(),
             "a corrupt state file must load as empty state, not panic or propagate an error"
+        );
+    }
+
+    /// `on_change` is nginx mode's hook to re-apply its config on rotation:
+    /// it must fire exactly once when a pass actually issues a certificate,
+    /// and not at all when a pass issues nothing.
+    #[tokio::test]
+    async fn run_once_calls_on_change_when_a_cert_is_issued() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = CertStore::new(temp_dir("on-change"));
+        let shared = SharedCerts::new(CertResolver::from_certs(&[]).unwrap());
+        let wanted = vec!["*.dev.example.com".to_string()];
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let on_change = move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        };
+
+        let state = run_once(
+            &AlwaysSucceeds,
+            &store,
+            &shared,
+            &wanted,
+            BTreeMap::new(),
+            0,
+            Some(&on_change),
+        )
+        .await;
+        assert!(state.is_empty(), "successful issuance clears state");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "on_change fires once on issuance"
+        );
+
+        // A pass that issues nothing (an issuer that always fails) must not
+        // fire the hook.
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let c2 = calls2.clone();
+        let on_change2 = move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+        };
+        let wanted2 = vec!["*.dev2.example.com".to_string()];
+        let _ = run_once(
+            &AlwaysFails,
+            &store,
+            &shared,
+            &wanted2,
+            BTreeMap::new(),
+            0,
+            Some(&on_change2),
+        )
+        .await;
+        assert_eq!(
+            calls2.load(Ordering::SeqCst),
+            0,
+            "on_change must not fire when nothing is issued"
         );
     }
 }

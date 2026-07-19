@@ -5,7 +5,7 @@ use hoster::engine::{AlwaysReady, Engine};
 use hoster::routing::{RoutingTable, SharedRoutes};
 use hoster::runtime::FakeRuntime;
 use hoster::secrets::Store;
-use hoster::settings::Settings;
+use hoster::settings::{ProxyMode, Settings};
 use tokio::net::TcpListener;
 
 fn temp_store() -> Arc<Store> {
@@ -31,6 +31,9 @@ async fn spawn() -> (String, Arc<FakeRuntime>) {
         https_listen: None,
         cert_dir: "/tmp/hoster-test-certs".into(),
         public_ip: None,
+        proxy_mode: ProxyMode::Standalone,
+        nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+        nginx_reload_cmd: "systemctl reload nginx".into(),
     });
     let engine = Arc::new(Engine::with_readiness(
         rt.clone(),

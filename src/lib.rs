@@ -7,6 +7,7 @@ pub mod docker;
 pub mod engine;
 pub mod imageref;
 pub mod labels;
+pub mod nginx;
 pub mod proxy;
 pub mod readiness;
 pub mod renewal;

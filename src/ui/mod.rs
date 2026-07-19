@@ -73,8 +73,9 @@ pub fn settings_page(
     env: &[MaskedProject],
     acme: Option<&MaskedAcme>,
     certs: &[CertRow],
+    nginx_status: Option<&crate::nginx::ApplyRecord>,
 ) -> String {
     let projects = project_names(deployments, env);
-    let body = settings::settings_body(settings, env, acme, certs);
+    let body = settings::settings_body(settings, env, acme, certs, nginx_status);
     app_shell(Nav::Settings, &projects, &body)
 }

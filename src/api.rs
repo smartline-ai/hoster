@@ -980,9 +980,19 @@ async fn ui_settings<R: ContainerRuntime>(
     let env = engine.store().list_masked();
     let acme = engine.store().masked_acme();
     let certs = cert_rows(engine, settings);
+    let nginx_snapshot = engine
+        .nginx_status()
+        .and_then(|h| h.lock().unwrap().clone());
     html(
         StatusCode::OK,
-        ui::settings_page(settings, &deployments, &env, acme.as_ref(), &certs),
+        ui::settings_page(
+            settings,
+            &deployments,
+            &env,
+            acme.as_ref(),
+            &certs,
+            nginx_snapshot.as_ref(),
+        ),
     )
 }
 
@@ -1254,6 +1264,7 @@ mod tests {
     use crate::runtime::FakeRuntime;
     use crate::secrets::{DnsProviderConfig, Store};
     use crate::session::Sessions;
+    use crate::settings::ProxyMode;
 
     /// A minimal Cloudflare-shaped `DnsProviderConfig` for tests that only
     /// care about the token.
@@ -1310,6 +1321,9 @@ mod tests {
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
             public_ip: None,
+            proxy_mode: ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         });
         let engine = Engine::with_readiness(
             rt,
@@ -1420,6 +1434,9 @@ mod tests {
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
             public_ip: None,
+            proxy_mode: ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         });
         let engine = Arc::new(
             Engine::with_readiness(
