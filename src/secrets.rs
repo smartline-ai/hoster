@@ -283,7 +283,11 @@ impl Store {
         let mut data = self.data.lock().unwrap();
         if let Some(p) = data.projects.get_mut(project) {
             p.vars.remove(key);
-            if p.vars.is_empty() && p.registry.is_none() && p.hostname_template.is_none() {
+            if p.vars.is_empty()
+                && p.registry.is_none()
+                && p.hostname_template.is_none()
+                && p.dns_provider.is_none()
+            {
                 data.projects.remove(project);
             }
         }
@@ -339,7 +343,7 @@ impl Store {
         let mut data = self.data.lock().unwrap();
         if let Some(p) = data.projects.get_mut(project) {
             p.registry = None;
-            if p.vars.is_empty() && p.hostname_template.is_none() {
+            if p.vars.is_empty() && p.hostname_template.is_none() && p.dns_provider.is_none() {
                 data.projects.remove(project);
             }
         }
@@ -1319,5 +1323,53 @@ mod tests {
             .dns_provider_for("*.dev.example.com", default_tmpl)
             .unwrap();
         assert_eq!(d.kind, "cloudflare");
+    }
+
+    #[test]
+    fn delete_var_keeps_a_project_that_only_has_a_dns_provider() {
+        let s = Store::load(temp_file()).unwrap();
+        // A project carrying ONLY a per-project DNS provider override — no
+        // vars, no registry, no hostname template.
+        s.set_project_dns_provider(
+            "solo",
+            DnsProviderConfig {
+                kind: "hetzner".into(),
+                token: Some("hz".into()),
+                api_user: None,
+                api_key: None,
+                username: None,
+            },
+        )
+        .unwrap();
+        // An unrelated delete_var (the var doesn't even exist) must not prune
+        // the row and discard the DNS credential.
+        s.delete_var("solo", "NOPE").unwrap();
+        assert!(
+            s.project_dns_provider("solo").is_some(),
+            "the DNS provider was pruned along with an unrelated delete_var"
+        );
+    }
+
+    #[test]
+    fn delete_registry_keeps_a_project_that_only_has_a_dns_provider() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_project_dns_provider(
+            "solo",
+            DnsProviderConfig {
+                kind: "hetzner".into(),
+                token: Some("hz".into()),
+                api_user: None,
+                api_key: None,
+                username: None,
+            },
+        )
+        .unwrap();
+        // delete_registry on a project with no registry must not prune the
+        // row and discard the DNS credential.
+        s.delete_registry("solo").unwrap();
+        assert!(
+            s.project_dns_provider("solo").is_some(),
+            "the DNS provider was pruned along with an unrelated delete_registry"
+        );
     }
 }
