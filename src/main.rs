@@ -12,8 +12,10 @@ use hoster::readiness::NetworkReadiness;
 use hoster::renewal;
 use hoster::routing::{RoutingTable, SharedRoutes};
 use hoster::secrets::Store;
-use hoster::settings::{Settings, wildcard_base};
+use hoster::session::Sessions;
+use hoster::settings::Settings;
 use hoster::tls::{CertResolver, SharedCerts};
+use http_body_util::BodyExt;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
@@ -65,13 +67,24 @@ impl CertIssuer for StoreIssuer {
     }
 }
 
-/// Terminate TLS and hand each connection to the same proxy service the plain
-/// listener uses. The `ServerConfig` is re-read per connection, so a renewal
-/// pass that swaps in a new certificate is picked up without a restart.
+/// Terminate TLS and dispatch each request by `Host`: hoster's own control
+/// hostname goes to the API/dashboard handler, everything else to the same
+/// proxy service the plain listener uses.
+///
+/// Serving the control hostname here is what makes the certificate hoster
+/// issues for it worth issuing — it is in the renewal loop's `wanted` set, and
+/// a certificate nothing ever presents is pure waste. Auth is unchanged:
+/// requests go through the very same `handle_api`, so the API's bearer gate
+/// and the dashboard's cookie session behave exactly as they do on
+/// `api_listen`. The control hostname is read from the store per request, so
+/// configuring it through the dashboard takes effect without a restart.
 async fn serve_https(
     listener: TcpListener,
     certs: SharedCerts,
     routes: SharedRoutes,
+    engine: Arc<Engine<DockerRuntime>>,
+    settings: Arc<Settings>,
+    sessions: Arc<Sessions>,
 ) -> anyhow::Result<()> {
     let client = hoster::proxy::build_client();
     tracing::info!(addr = %listener.local_addr()?, "https listening");
@@ -93,6 +106,9 @@ async fn serve_https(
         let acceptor = tokio_rustls::TlsAcceptor::from(certs.server_config());
         let routes = routes.clone();
         let client = client.clone();
+        let engine = engine.clone();
+        let settings = settings.clone();
+        let sessions = sessions.clone();
         tokio::spawn(async move {
             let tls = match acceptor.accept(stream).await {
                 Ok(t) => t,
@@ -103,13 +119,31 @@ async fn serve_https(
                     return;
                 }
             };
-            let service = service_fn(move |req| {
-                hoster::proxy::handle(
-                    req,
-                    routes.clone(),
-                    client.clone(),
-                    hoster::proxy::Scheme::Https,
-                )
+            let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let routes = routes.clone();
+                let client = client.clone();
+                let engine = engine.clone();
+                let settings = settings.clone();
+                let sessions = sessions.clone();
+                async move {
+                    let control = engine
+                        .store()
+                        .masked_acme()
+                        .and_then(|a| a.control_hostname);
+                    let host = req
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    if hoster::api::is_control_host(host.as_deref(), control.as_deref()) {
+                        let res = hoster::api::handle_api(req, engine, settings, sessions).await?;
+                        // `ApiBody`'s error type is `Infallible`, so the
+                        // `map_err` closure is unreachable; it exists only to
+                        // line the body types up.
+                        return Ok(res.map(|b| b.map_err(|never| match never {}).boxed()));
+                    }
+                    hoster::proxy::handle(req, routes, client, hoster::proxy::Scheme::Https).await
+                }
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(tls), service)
@@ -161,13 +195,26 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let routes = SharedRoutes::new(RoutingTable::new());
-    let engine = Arc::new(Engine::new(
+    // The trigger is only attached when TLS is on: with no renewal loop
+    // running there is nothing to trigger, and the API reports that instead
+    // of accepting a request that would do nothing.
+    let renewal_trigger = renewal::RenewalTrigger::new();
+    let engine = Engine::new(
         runtime,
         routes.clone(),
         settings.clone(),
         Arc::new(NetworkReadiness::default()),
         store.clone(),
-    ));
+    );
+    let engine = Arc::new(if settings.https_listen.is_some() {
+        engine.with_renewal_trigger(renewal_trigger.clone())
+    } else {
+        engine
+    });
+
+    // One session table shared by both listeners, so a dashboard login on the
+    // control hostname is the same session as one on `api_listen`.
+    let sessions = Arc::new(Sessions::new());
 
     // Rebuild routing from any containers a previous run left behind.
     if let Err(e) = engine.reconcile().await {
@@ -200,6 +247,9 @@ async fn main() -> anyhow::Result<()> {
             https_listener,
             shared.clone(),
             routes.clone(),
+            engine.clone(),
+            settings.clone(),
+            sessions.clone(),
         )));
 
         let issuer: Arc<dyn CertIssuer> = Arc::new(StoreIssuer {
@@ -215,29 +265,28 @@ async fn main() -> anyhow::Result<()> {
         });
 
         // Recomputed on every pass, so a project configured after startup gets
-        // its certificate without a restart.
+        // its certificate without a restart. The dashboard's certificate table
+        // calls the same `wanted_domains`, so the two can never drift.
         let wanted_store = store.clone();
         let default_template = settings.hostname_template.clone();
-        let wanted = move || {
-            let mut out: Vec<String> = std::iter::once(default_template.clone())
-                .chain(wanted_store.project_hostname_templates())
-                .filter_map(|t| wildcard_base(&t))
-                .collect();
-            if let Some(h) = wanted_store.masked_acme().and_then(|a| a.control_hostname) {
-                out.push(h);
-            }
-            out.sort();
-            out.dedup();
-            out
-        };
+        let wanted = move || renewal::wanted_domains(&wanted_store, &default_template);
 
         renewal_task = Some(tokio::spawn(renewal::run_loop(
-            issuer, cert_store, shared, wanted,
+            issuer,
+            cert_store,
+            shared,
+            wanted,
+            renewal_trigger.clone(),
         )));
     }
 
     let proxy = tokio::spawn(serve(proxy_listener, routes));
-    let api = tokio::spawn(hoster::api::serve_api(api_listener, engine, settings));
+    let api = tokio::spawn(hoster::api::serve_api_with_sessions(
+        api_listener,
+        engine,
+        settings,
+        sessions,
+    ));
 
     // `https` and `renewal_task` are `Option`s; a never-resolving future keeps
     // the `select!` arms well-formed when TLS is off.

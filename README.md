@@ -417,8 +417,14 @@ Open the dashboard's **TLS & DNS** panel (requires
 [`HOSTER_DASHBOARD_PASSWORD`](#the-dashboard)) and fill in:
 
 - **ACME account** — your email and, optionally, a control hostname (a plain,
-  non-wildcard hostname such as `hoster.example.com` that you want its own
-  certificate for, alongside the wildcards).
+  non-wildcard hostname such as `hoster.example.com`). hoster issues a
+  certificate for that name **and serves the API and dashboard on it over the
+  HTTPS listener**, so the dashboard is reachable at
+  `https://hoster.example.com` rather than only on the plain
+  `HOSTER_API_LISTEN` port. Authentication is unchanged: API routes still
+  require the bearer token, dashboard routes still require the dashboard
+  password and its session cookie. Point the name's DNS at this host, or
+  leave it unset if you don't want hoster reachable that way.
 - **DNS provider** — `cloudflare` and the API token from step 1.
 
 The same fields are available over the bearer-token API, for scripting:
@@ -449,6 +455,24 @@ global `HOSTER_HOSTNAME_TEMPLATE`, every project's own domain override, and
 the control hostname, if set. Certificates persist in `HOSTER_CERT_DIR`
 (default `/var/lib/hoster/certs`) and outlive restarts — hoster does not
 reissue a certificate that is already valid on disk.
+
+Branch URLs reported by the API, injected into containers as `{{url.*}}`, and
+linked from the dashboard switch to `https://` as soon as
+`HOSTER_HTTPS_LISTEN` is set, so a frontend never calls its backend over plain
+HTTP from an HTTPS page.
+
+**Retrying after a configuration change.** A pass runs every six hours, which
+is far too slow to tell you whether the token you just pasted works. The
+certificate table has a **Retry now** button that runs a pass immediately and
+clears the backoff accumulated by failures the old configuration caused. The
+same trigger is available for scripting:
+
+```bash
+curl -fsS -X POST "$API/acme/renew" -H "Authorization: Bearer $HOSTER_TOKEN"
+```
+
+Failures *after* a manual retry back off exactly as before — Let's Encrypt's
+rate limits apply no matter who asked for the attempt.
 
 **Staging by default.** Until you set `HOSTER_ACME_PRODUCTION`, hoster
 requests certificates from Let's Encrypt's **staging** environment, whose

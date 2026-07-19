@@ -27,7 +27,7 @@ use crate::engine::{DeployRequest, Engine};
 use crate::renewal;
 use crate::runtime::ContainerRuntime;
 use crate::session::{Sessions, constant_time_eq, cookie_value};
-use crate::settings::{Settings, sanitize_branch, wildcard_base};
+use crate::settings::{Settings, sanitize_branch};
 
 /// Response body type. Every response this API produces is small enough to
 /// buffer whole, so there is no need for the boxed streaming body the proxy
@@ -93,8 +93,20 @@ pub async fn serve_api<R: ContainerRuntime + 'static>(
     engine: Arc<Engine<R>>,
     settings: Arc<Settings>,
 ) -> anyhow::Result<()> {
+    serve_api_with_sessions(listener, engine, settings, Arc::new(Sessions::new())).await
+}
+
+/// [`serve_api`] with a caller-provided session table, so the HTTPS listener
+/// can serve the dashboard on the control hostname against the same sessions
+/// as `api_listen` — a login on one is a login on the other, rather than two
+/// independent tables whose cookies mysteriously don't work across them.
+pub async fn serve_api_with_sessions<R: ContainerRuntime + 'static>(
+    listener: TcpListener,
+    engine: Arc<Engine<R>>,
+    settings: Arc<Settings>,
+    sessions: Arc<Sessions>,
+) -> anyhow::Result<()> {
     tracing::info!(addr = %listener.local_addr()?, "api listening");
-    let sessions = Arc::new(Sessions::new());
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -203,6 +215,7 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
         (Method::PUT, "/acme/dns") => handle_set_dns_token(req, &engine).await,
         (Method::DELETE, "/acme/dns") => Ok(handle_delete_dns_token(&engine)),
         (Method::GET, "/acme/status") => Ok(handle_acme_status(&engine, &settings)),
+        (Method::POST, "/acme/renew") => Ok(handle_acme_renew(&engine)),
         _ => Ok(text(StatusCode::NOT_FOUND, "not found")),
     }
 }
@@ -474,26 +487,59 @@ fn handle_acme_status<R: ContainerRuntime>(
     json_bytes(StatusCode::OK, bytes)
 }
 
+/// `POST /acme/renew`: ask the renewal loop to run a pass now.
+///
+/// Without this an operator who has just configured credentials waits up to
+/// six hours — longer, because the domain has accumulated backoff from the
+/// failures the missing configuration caused — while the dashboard shows
+/// `failed: ACME is not configured` with no way to retry. The triggered pass
+/// clears that accumulated backoff (see [`renewal::clear_backoff`]); failures
+/// *after* the trigger back off as usual, so this cannot be used to hammer
+/// Let's Encrypt.
+fn handle_acme_renew<R: ContainerRuntime>(engine: &Engine<R>) -> Response<ApiBody> {
+    match engine.renewal_trigger() {
+        Some(trigger) => {
+            trigger.request();
+            text(StatusCode::ACCEPTED, "renewal pass requested")
+        }
+        // No renewal loop is running, so there is nothing to trigger; saying
+        // "accepted" would be a lie.
+        None => text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TLS is not enabled (HOSTER_HTTPS_LISTEN is unset)",
+        ),
+    }
+}
+
+/// Does this request's `Host` name hoster's own control hostname?
+///
+/// The HTTPS listener serves branch environments and — when an operator has
+/// configured a control hostname — hoster's own API and dashboard, so it has
+/// to tell the two apart. Comparison goes through
+/// [`crate::routing::normalize_host`], the same normalization the branch
+/// routing table uses, so a port suffix or odd casing in the header can't
+/// route the control hostname to the proxy (where it would 404).
+pub fn is_control_host(host: Option<&str>, control: Option<&str>) -> bool {
+    match (host, control) {
+        (Some(h), Some(c)) => {
+            crate::routing::normalize_host(h) == crate::routing::normalize_host(c)
+        }
+        _ => false,
+    }
+}
+
 /// Build the certificate status table: one row per domain hoster currently
-/// wants a certificate for — the default hostname template, every project's
-/// own template, and the ACME control hostname if set, each reduced to its
-/// wildcard base the same way `main.rs`'s renewal loop computes `wanted`.
+/// wants a certificate for, from the same [`renewal::wanted_domains`] the
+/// renewal loop drives issuance from — the two must never disagree, or the
+/// dashboard silently misreports which domains are managed.
+///
 /// A domain with a valid certificate on disk reads as `"valid until
 /// <date>"`; one that failed its last attempt (from the renewal loop's
 /// persisted state) reads as `"failed: <reason>"`; anything else is
 /// `"pending"` — the certificate table exists so a failure that leaves a
 /// domain on plain HTTP is visible rather than silent.
 fn cert_rows<R: ContainerRuntime>(engine: &Engine<R>, settings: &Settings) -> Vec<CertRow> {
-    let store = engine.store();
-    let mut wanted: Vec<String> = std::iter::once(settings.hostname_template.clone())
-        .chain(store.project_hostname_templates())
-        .filter_map(|t| wildcard_base(&t))
-        .collect();
-    if let Some(h) = store.masked_acme().and_then(|a| a.control_hostname) {
-        wanted.push(h);
-    }
-    wanted.sort();
-    wanted.dedup();
+    let wanted = renewal::wanted_domains(engine.store(), &settings.hostname_template);
 
     let cert_store = CertStore::new(std::path::PathBuf::from(&settings.cert_dir));
     let now = renewal::now_secs();
@@ -863,6 +909,7 @@ async fn ui_projects<R: ContainerRuntime>(
 ///   `acme/config`     — set/replace the ACME account email + control hostname (form body)
 ///   `acme/dns`        — set/replace the DNS provider token (form body)
 ///   `acme/dns/delete` — remove the DNS provider token, keeping the rest of the ACME config
+///   `acme/renew`      — run a renewal pass now, clearing accumulated backoff
 ///
 /// `dns/delete` is checked before `dns` for the same reason `ui_projects`
 /// orders `/registry/delete` before `/registry`: an equality match on `sub`
@@ -885,6 +932,16 @@ async fn ui_acme<R: ContainerRuntime>(
 
     if sub == "dns/delete" {
         let _ = engine.store().delete_dns_token();
+        return redirect("/");
+    }
+
+    // The dashboard's "Retry now" button — the same trigger as
+    // `POST /acme/renew`, so an operator who has just pasted a token in this
+    // very form doesn't have to wait for the next scheduled pass.
+    if sub == "renew" {
+        if let Some(trigger) = engine.renewal_trigger() {
+            trigger.request();
+        }
         return redirect("/");
     }
 
@@ -1004,6 +1061,25 @@ mod tests {
 
     /// A fresh engine, settings, and session table for one test.
     fn api_harness() -> (Arc<Engine<FakeRuntime>>, Arc<Settings>, Arc<Sessions>) {
+        api_harness_inner(None)
+    }
+
+    /// The same harness with a renewal trigger attached, as `main` does when
+    /// TLS is enabled and a renewal loop is actually running.
+    fn api_harness_with_trigger() -> (
+        Arc<Engine<FakeRuntime>>,
+        Arc<Settings>,
+        Arc<Sessions>,
+        renewal::RenewalTrigger,
+    ) {
+        let trigger = renewal::RenewalTrigger::new();
+        let (engine, settings, sessions) = api_harness_inner(Some(trigger.clone()));
+        (engine, settings, sessions, trigger)
+    }
+
+    fn api_harness_inner(
+        trigger: Option<renewal::RenewalTrigger>,
+    ) -> (Arc<Engine<FakeRuntime>>, Arc<Settings>, Arc<Sessions>) {
         let rt = Arc::new(FakeRuntime::new());
         let settings = Arc::new(Settings {
             listen: "127.0.0.1:0".into(),
@@ -1015,13 +1091,17 @@ mod tests {
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
         });
-        let engine = Arc::new(Engine::with_readiness(
+        let engine = Engine::with_readiness(
             rt,
             SharedRoutes::new(RoutingTable::new()),
             settings.clone(),
             Arc::new(AlwaysReady),
             temp_store(),
-        ));
+        );
+        let engine = Arc::new(match trigger {
+            Some(t) => engine.with_renewal_trigger(t),
+            None => engine,
+        });
         let sessions = Arc::new(Sessions::new());
         (engine, settings, sessions)
     }
@@ -1120,13 +1200,16 @@ mod tests {
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
         });
-        let engine = Arc::new(Engine::with_readiness(
-            rt,
-            SharedRoutes::new(RoutingTable::new()),
-            settings.clone(),
-            Arc::new(AlwaysReady),
-            temp_store(),
-        ));
+        let engine = Arc::new(
+            Engine::with_readiness(
+                rt,
+                SharedRoutes::new(RoutingTable::new()),
+                settings.clone(),
+                Arc::new(AlwaysReady),
+                temp_store(),
+            )
+            .with_renewal_trigger(renewal::RenewalTrigger::new()),
+        );
         let sessions = Arc::new(Sessions::new());
         let cookie = format!("{SESSION_COOKIE}={}", sessions.create());
         (engine, settings, sessions, cookie)
@@ -1771,6 +1854,147 @@ mod tests {
         assert!(!body.contains("cf_topsecret"), "token leaked: {body}");
         assert!(body.contains("me@example.com"));
         assert!(body.to_lowercase().contains("tls"));
+    }
+
+    /// The retry affordance an operator who has just configured credentials
+    /// needs; without it the only way to retry is to wait up to six hours.
+    #[tokio::test]
+    async fn post_acme_renew_triggers_a_pass() {
+        let (engine, settings, sessions, trigger) = api_harness_with_trigger();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/acme/renew",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        // The request really reached the loop's trigger: the permit is
+        // waiting, so a wait resolves immediately.
+        tokio::time::timeout(std::time::Duration::from_secs(1), trigger.wait())
+            .await
+            .expect("the endpoint must have requested a pass");
+    }
+
+    /// With TLS off there is no renewal loop, so accepting the request would
+    /// promise a pass that never runs.
+    #[tokio::test]
+    async fn post_acme_renew_reports_that_tls_is_off_when_no_loop_is_running() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/acme/renew",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn post_acme_renew_requires_the_bearer_token() {
+        let (engine, settings, sessions, _trigger) = api_harness_with_trigger();
+        let res = call_without_token(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/acme/renew",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ui_acme_renew_triggers_a_pass_and_returns_to_the_dashboard() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        let trigger = engine.renewal_trigger().cloned().unwrap();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/acme/renew",
+            "",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        tokio::time::timeout(std::time::Duration::from_secs(1), trigger.wait())
+            .await
+            .expect("the dashboard button must have requested a pass");
+    }
+
+    #[tokio::test]
+    async fn ui_acme_renew_requires_a_session() {
+        let (engine, settings, sessions, _cookie) = dashboard_harness();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/acme/renew",
+            "",
+            "hoster_session=not-a-real-session",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            res.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("/login")
+        );
+    }
+
+    /// The HTTPS listener dispatches by `Host`; the control hostname must win
+    /// regardless of port suffix or casing, or it would fall through to the
+    /// branch proxy and 404.
+    #[test]
+    fn control_host_matching_normalizes_port_and_case() {
+        assert!(is_control_host(
+            Some("Hoster.Example.com:443"),
+            Some("hoster.example.com")
+        ));
+        assert!(is_control_host(
+            Some("hoster.example.com"),
+            Some("hoster.example.com")
+        ));
+        assert!(!is_control_host(
+            Some("backend-b1.dev.example.com"),
+            Some("hoster.example.com")
+        ));
+        // No control hostname configured ⇒ nothing is the control host, so
+        // every request keeps going to the branch proxy.
+        assert!(!is_control_host(Some("hoster.example.com"), None));
+        assert!(!is_control_host(None, Some("hoster.example.com")));
+    }
+
+    /// The certificate table and the renewal loop derive their domain set
+    /// from one function, so the dashboard cannot misreport what is managed.
+    #[tokio::test]
+    async fn cert_rows_cover_exactly_the_domains_the_renewal_loop_wants() {
+        let (engine, settings, _sessions) = api_harness();
+        engine
+            .store()
+            .set_hostname_template("proj", "{service}-{branch}.team.example.com")
+            .unwrap();
+        engine
+            .store()
+            .set_acme_config("me@example.com", Some("hoster.example.com"))
+            .unwrap();
+        let rows: Vec<String> = cert_rows(&engine, &settings)
+            .into_iter()
+            .map(|r| r.domain)
+            .collect();
+        assert_eq!(
+            rows,
+            renewal::wanted_domains(engine.store(), &settings.hostname_template)
+        );
+        assert!(rows.contains(&"hoster.example.com".to_string()));
     }
 
     /// The DNS token must never be printable through `Debug`, the same

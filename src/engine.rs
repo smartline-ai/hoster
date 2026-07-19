@@ -87,6 +87,12 @@ pub struct Engine<R: ContainerRuntime> {
     /// routes (lost-update race). Held across the `.await` of the list call,
     /// so it must be an async mutex, not a std one.
     swap_lock: tokio::sync::Mutex<()>,
+    /// Handle for asking the certificate renewal loop to run a pass now.
+    /// `None` when TLS is off — no loop is running, so there is nothing to
+    /// trigger and the API says so rather than accepting a no-op. It lives
+    /// here because the engine is the shared state the control API already
+    /// holds, and the control API is what exposes the trigger.
+    renewal_trigger: Option<crate::renewal::RenewalTrigger>,
 }
 
 impl<R: ContainerRuntime> Engine<R> {
@@ -116,7 +122,20 @@ impl<R: ContainerRuntime> Engine<R> {
             status: Mutex::new(BTreeMap::new()),
             urls: Mutex::new(BTreeMap::new()),
             swap_lock: tokio::sync::Mutex::new(()),
+            renewal_trigger: None,
         }
+    }
+
+    /// Attach the renewal loop's trigger. Called only when TLS is enabled and
+    /// a loop actually exists to be triggered.
+    pub fn with_renewal_trigger(mut self, trigger: crate::renewal::RenewalTrigger) -> Self {
+        self.renewal_trigger = Some(trigger);
+        self
+    }
+
+    /// The renewal trigger, if a renewal loop is running.
+    pub fn renewal_trigger(&self) -> Option<&crate::renewal::RenewalTrigger> {
+        self.renewal_trigger.as_ref()
     }
 
     /// The project environment store, for the control API's project routes.

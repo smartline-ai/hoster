@@ -596,9 +596,19 @@ onsubmit=\"return confirm('Remove the DNS provider token?')\">\
 
     // Certificates: one row per domain hoster wants a certificate for, so a
     // failure keeps serving plain HTTP visibly rather than going dark.
+    // The retry affordance: without it an operator who has just entered
+    // credentials watches `failed: ACME is not configured` for up to six
+    // hours with no way to ask hoster to try again. Only offered once an
+    // account exists, since there is nothing to retry before that.
+    let retry = if acme.is_some() {
+        "<form method=\"post\" action=\"/ui/acme/renew\" style=\"display:inline\">\
+<button class=\"btn\" type=\"submit\">Retry now</button></form>"
+    } else {
+        ""
+    };
     let _ = write!(
         body,
-        "<div class=\"col certs\"><div class=\"col-label\">Certificates <span class=\"count\">{}</span></div>",
+        "<div class=\"col certs\"><div class=\"col-label\">Certificates <span class=\"count\">{}</span> {retry}</div>",
         certs.len(),
     );
     if certs.is_empty() {
@@ -855,6 +865,29 @@ mod tests {
         assert!(html.contains("me@example.com"));
         assert!(html.contains("cloudflare"));
         assert!(html.contains("\u{2022}\u{2022}\u{2022}\u{2022}"));
+    }
+
+    /// A failed domain must come with a way to retry: an operator who has
+    /// just entered credentials should not have to wait for the next
+    /// scheduled pass to find out whether they worked.
+    #[test]
+    fn certificate_table_offers_a_retry_button_once_acme_is_configured() {
+        let masked = MaskedAcme {
+            email: "me@example.com".into(),
+            control_hostname: None,
+            provider_kind: Some("cloudflare".into()),
+            token_set: true,
+        };
+        let rows = vec![CertRow {
+            domain: "*.dev.example.com".into(),
+            state: "failed: ACME is not configured".into(),
+        }];
+        let html = dashboard_page(&[], &[], DEFAULT_TEMPLATE, Some(&masked), &rows);
+        assert!(html.contains("/ui/acme/renew"), "no retry affordance");
+
+        // Nothing to retry before an account exists.
+        let html = dashboard_page(&[], &[], DEFAULT_TEMPLATE, None, &rows);
+        assert!(!html.contains("/ui/acme/renew"));
     }
 
     #[test]

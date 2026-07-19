@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::acme::CertIssuer;
 use crate::certs::{CertStore, StoredCert};
+use crate::secrets::Store;
+use crate::settings::wildcard_base;
 use crate::tls::{CertResolver, SharedCerts};
 
 const BASE_BACKOFF_SECS: i64 = 15 * 60;
@@ -34,6 +36,73 @@ pub fn next_attempt(failures: u32, last_attempt: i64) -> i64 {
         .saturating_mul(1i64.checked_shl(shift).unwrap_or(i64::MAX))
         .min(MAX_BACKOFF_SECS);
     last_attempt + delay
+}
+
+/// Every domain hoster wants a certificate for: the wildcard base of the
+/// default hostname template, of every project's own template, and the ACME
+/// control hostname if one is configured (hoster serves that name on the
+/// HTTPS listener, so it needs a certificate like any other).
+///
+/// The renewal loop and the dashboard's certificate table must agree on this
+/// set exactly — when they drift the dashboard silently misreports which
+/// domains are managed — so both call this one function rather than keeping
+/// their own copy of the derivation.
+pub fn wanted_domains(store: &Store, default_template: &str) -> Vec<String> {
+    let mut out: Vec<String> = std::iter::once(default_template.to_string())
+        .chain(store.project_hostname_templates())
+        .filter_map(|t| wildcard_base(&t))
+        .collect();
+    if let Some(h) = store.masked_acme().and_then(|a| a.control_hostname) {
+        out.push(h);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A handle an operator-facing endpoint uses to ask the renewal loop to run a
+/// pass now, instead of waiting up to six hours for the next scheduled one.
+///
+/// This exists because the alternative is unusable: an operator who pastes a
+/// Cloudflare token into the dashboard would otherwise watch
+/// `failed: ACME is not configured` sit there for hours — longer, since the
+/// domain has accumulated backoff from the failures the *missing*
+/// configuration caused.
+///
+/// `notify_one` stores a permit when nobody is waiting, so a trigger fired
+/// while a pass is already running is remembered and honoured by the next
+/// wait rather than lost.
+#[derive(Clone, Default)]
+pub struct RenewalTrigger {
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl RenewalTrigger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask for a pass. Never blocks, and is safe to call when no loop is
+    /// running (the permit is simply never consumed).
+    pub fn request(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Resolve when a pass has been requested.
+    pub async fn wait(&self) {
+        self.notify.notified().await;
+    }
+}
+
+/// Forget the accumulated backoff for `domains`.
+///
+/// Used only on a manually triggered pass: those failures were caused by the
+/// configuration the operator has just changed, so continuing to honour their
+/// backoff would make the retry they asked for do nothing. Failures that
+/// happen *after* the trigger accumulate backoff as usual — Let's Encrypt's
+/// rate limits do not care why we retried.
+pub fn clear_backoff(state: &mut BTreeMap<String, DomainState>, domains: &[String]) {
+    state.retain(|domain, _| !domains.iter().any(|d| d == domain));
 }
 
 /// Per-domain failure state, for backoff and for display.
@@ -177,15 +246,30 @@ pub async fn run_loop(
     store: Arc<CertStore>,
     shared: SharedCerts,
     wanted: impl Fn() -> Vec<String> + Send + 'static,
+    trigger: RenewalTrigger,
 ) {
     let mut state = load_state(&store);
+    // The first pass at startup is scheduled, not operator-requested.
+    let mut manual = false;
     loop {
+        let domains = wanted();
+        if manual {
+            // The operator asked for this pass, having just changed the
+            // configuration the previous failures were caused by.
+            clear_backoff(&mut state, &domains);
+        }
         let now = now_secs();
-        state = run_once(issuer.as_ref(), &store, &shared, &wanted(), state, now).await;
+        state = run_once(issuer.as_ref(), &store, &shared, &domains, state, now).await;
         if let Err(e) = save_state(&store, &state) {
             tracing::error!(error = %e, "failed to persist renewal state");
         }
-        tokio::time::sleep(PASS_INTERVAL).await;
+        manual = tokio::select! {
+            _ = tokio::time::sleep(PASS_INTERVAL) => false,
+            _ = trigger.wait() => {
+                tracing::info!("renewal pass requested by operator");
+                true
+            }
+        };
     }
 }
 
@@ -220,6 +304,136 @@ mod tests {
         // u32::MAX failures must still produce a sane, capped delay rather
         // than wrapping negative and retrying instantly.
         assert_eq!(next_attempt(u32::MAX, 0), 24 * 3600);
+    }
+
+    /// A store on a unique, non-existent path, so tests never share state.
+    fn temp_store() -> Store {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let n = C.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "hoster-renewal-unit-{}-{n}/projects.json",
+            std::process::id()
+        ));
+        Store::load(path).unwrap()
+    }
+
+    #[test]
+    fn wanted_domains_covers_the_default_template_projects_and_the_control_host() {
+        let store = temp_store();
+        store
+            .set_hostname_template("proj", "{service}-{branch}.team.example.com")
+            .unwrap();
+        store
+            .set_acme_config("me@example.com", Some("hoster.example.com"))
+            .unwrap();
+        assert_eq!(
+            wanted_domains(&store, "{service}-{branch}.dev.example.com"),
+            vec![
+                "*.dev.example.com".to_string(),
+                "*.team.example.com".to_string(),
+                "hoster.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wanted_domains_dedupes_a_project_template_equal_to_the_default() {
+        let store = temp_store();
+        store
+            .set_hostname_template("proj", "{service}-{branch}.dev.example.com")
+            .unwrap();
+        assert_eq!(
+            wanted_domains(&store, "{service}-{branch}.dev.example.com"),
+            vec!["*.dev.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn wanted_domains_omits_the_control_host_when_unset() {
+        let store = temp_store();
+        store.set_acme_config("me@example.com", None).unwrap();
+        assert_eq!(
+            wanted_domains(&store, "{service}-{branch}.dev.example.com"),
+            vec!["*.dev.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn clearing_backoff_only_touches_the_domains_being_retried() {
+        let mut state = BTreeMap::new();
+        state.insert(
+            "*.dev.example.com".to_string(),
+            DomainState {
+                failures: 4,
+                last_attempt: 1000,
+                last_error: Some("ACME is not configured".into()),
+            },
+        );
+        state.insert(
+            "other.example.com".to_string(),
+            DomainState {
+                failures: 2,
+                last_attempt: 1000,
+                last_error: Some("nope".into()),
+            },
+        );
+        clear_backoff(&mut state, &["*.dev.example.com".to_string()]);
+        assert!(!state.contains_key("*.dev.example.com"));
+        assert_eq!(state["other.example.com"].failures, 2);
+    }
+
+    /// Clearing backoff is what actually makes a manual retry do something:
+    /// with the failure state still in place the pass skips the domain.
+    #[tokio::test]
+    async fn a_domain_in_backoff_is_skipped_until_the_backoff_is_cleared() {
+        let store = CertStore::new(temp_dir("manual-retry"));
+        let shared = SharedCerts::new(CertResolver::from_certs(&[]).unwrap());
+        let wanted = vec!["a.example.com".to_string()];
+
+        // One failure puts the domain into a 15-minute backoff.
+        let state = run_once(&AlwaysFails, &store, &shared, &wanted, BTreeMap::new(), 0).await;
+        assert_eq!(state["a.example.com"].failures, 1);
+
+        // A pass one minute later does not even attempt it: the domain is
+        // still in backoff, so nothing is written even by an issuer that
+        // always succeeds. (`AlwaysSucceeds` writes placeholder PEM, so the
+        // on-disk file, not `load_all`, is the evidence here.)
+        let cert_file = store.dir_for("a.example.com").join("cert.pem");
+        let mut state = run_once(&AlwaysSucceeds, &store, &shared, &wanted, state, 60).await;
+        assert!(!cert_file.exists(), "issuance should have been skipped");
+        assert_eq!(state["a.example.com"].failures, 1);
+
+        // A manual trigger clears the backoff, so the same instant succeeds.
+        clear_backoff(&mut state, &wanted);
+        let state = run_once(&AlwaysSucceeds, &store, &shared, &wanted, state, 60).await;
+        assert!(!state.contains_key("a.example.com"));
+        assert!(cert_file.exists(), "the retry should have issued");
+    }
+
+    /// A trigger fired while a pass is running must not be lost: `request`
+    /// before `wait` still resolves.
+    #[tokio::test]
+    async fn a_trigger_fired_before_the_wait_is_not_lost() {
+        let trigger = RenewalTrigger::new();
+        trigger.request();
+        tokio::time::timeout(Duration::from_secs(1), trigger.wait())
+            .await
+            .expect("a requested pass must be observed by the next wait");
+    }
+
+    /// A trigger requested after the loop is already waiting wakes it.
+    #[tokio::test]
+    async fn a_trigger_wakes_a_waiting_loop() {
+        let trigger = RenewalTrigger::new();
+        let waiter = trigger.clone();
+        let handle = tokio::spawn(async move { waiter.wait().await });
+        tokio::task::yield_now().await;
+        trigger.request();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("wait should have been woken")
+            .unwrap();
     }
 
     struct AlwaysFails;
