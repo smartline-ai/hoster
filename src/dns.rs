@@ -542,6 +542,259 @@ impl DnsProvider for HetznerProvider {
     }
 }
 
+const NAMECHEAP_API: &str = "https://api.namecheap.com/xml.response";
+
+/// Namecheap DNS over its XML API. There is no per-record endpoint: `getHosts`
+/// returns the entire host-record set for a domain and `setHosts` replaces it
+/// wholesale. Every write here is therefore read-merge-write — fetch the full
+/// set, change or add exactly one record, and send the full set back.
+/// Dropping any other record in that round trip is silent data loss for
+/// whatever else is published on the domain, so every mutating call preserves
+/// every record it doesn't touch.
+pub struct NamecheapProvider {
+    api_user: String,
+    api_key: String,
+    username: String,
+    client_ip: String,
+    base_url: String,
+    http: reqwest::Client,
+}
+
+// Deliberately no `#[derive(Debug)]` here (matching `HetznerProvider` and
+// `CloudflareProvider` above): api_key must never be printable via `{:?}`,
+// and the simplest way to guarantee that is to not implement Debug at all.
+#[derive(Clone)]
+struct NcHost {
+    name: String,
+    kind: String,
+    address: String,
+    mx_pref: Option<String>,
+    ttl: String,
+}
+
+impl NamecheapProvider {
+    pub fn new(api_user: String, api_key: String, username: String, client_ip: String) -> Self {
+        Self::with_base_url(api_user, api_key, username, client_ip, NAMECHEAP_API.to_string())
+    }
+
+    /// Construct against an arbitrary base URL, so tests can point at a local
+    /// mock server instead of Namecheap.
+    pub fn with_base_url(
+        api_user: String,
+        api_key: String,
+        username: String,
+        client_ip: String,
+        base_url: String,
+    ) -> Self {
+        NamecheapProvider {
+            api_user,
+            api_key,
+            username,
+            client_ip,
+            base_url,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Split a fully-qualified name into (host, sld, tld). Assumes a two-label
+    /// registrable domain (`example.com`); does not handle multi-label public
+    /// suffixes like `co.uk` — a documented limitation.
+    fn split(name: &str) -> anyhow::Result<(String, String, String)> {
+        let labels: Vec<&str> = name.split('.').collect();
+        if labels.len() < 2 {
+            anyhow::bail!("name {name} is not under a registrable domain");
+        }
+        let tld = labels[labels.len() - 1].to_string();
+        let sld = labels[labels.len() - 2].to_string();
+        let host = if labels.len() == 2 {
+            "@".to_string()
+        } else {
+            labels[..labels.len() - 2].join(".")
+        };
+        Ok((host, sld, tld))
+    }
+
+    fn base_query(&self, command: &str, sld: &str, tld: &str) -> Vec<(String, String)> {
+        vec![
+            ("ApiUser".into(), self.api_user.clone()),
+            ("ApiKey".into(), self.api_key.clone()),
+            ("UserName".into(), self.username.clone()),
+            ("ClientIp".into(), self.client_ip.clone()),
+            ("Command".into(), command.into()),
+            ("SLD".into(), sld.into()),
+            ("TLD".into(), tld.into()),
+        ]
+    }
+
+    async fn get_hosts(&self, sld: &str, tld: &str) -> anyhow::Result<Vec<NcHost>> {
+        let q = self.base_query("namecheap.domains.dns.getHosts", sld, tld);
+        let resp = self
+            .http
+            .get(&self.base_url)
+            .query(&q)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Self::check_status(&resp)?;
+        Ok(Self::parse_hosts(&resp))
+    }
+
+    async fn set_hosts(&self, sld: &str, tld: &str, hosts: &[NcHost]) -> anyhow::Result<()> {
+        let mut q = self.base_query("namecheap.domains.dns.setHosts", sld, tld);
+        for (i, h) in hosts.iter().enumerate() {
+            let n = i + 1;
+            q.push((format!("HostName{n}"), h.name.clone()));
+            q.push((format!("RecordType{n}"), h.kind.clone()));
+            q.push((format!("Address{n}"), h.address.clone()));
+            q.push((format!("TTL{n}"), h.ttl.clone()));
+            if let Some(p) = &h.mx_pref {
+                q.push((format!("MXPref{n}"), p.clone()));
+            }
+        }
+        let resp = self
+            .http
+            .get(&self.base_url)
+            .query(&q)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Self::check_status(&resp)?;
+        Ok(())
+    }
+
+    fn check_status(xml: &str) -> anyhow::Result<()> {
+        // Namecheap answers HTTP 200 with Status="ERROR" and an <Errors> block.
+        if xml.contains("Status=\"ERROR\"") || xml.contains("Status=\"error\"") {
+            let msg = Self::first_error(xml).unwrap_or_else(|| "Namecheap API error".into());
+            anyhow::bail!("Namecheap API call failed: {msg}");
+        }
+        Ok(())
+    }
+
+    /// Parse the text of the first `<Error>` element, without ever touching
+    /// (or being able to leak) the api_key — this only ever sees Namecheap's
+    /// response body.
+    fn first_error(xml: &str) -> Option<String> {
+        use quick_xml::Reader;
+        use quick_xml::events::Event;
+        let mut r = Reader::from_str(xml);
+        let mut in_error = false;
+        loop {
+            match r.read_event() {
+                Ok(Event::Start(e)) if e.name().as_ref() == b"Error" => in_error = true,
+                Ok(Event::Text(t)) if in_error => return t.unescape().ok().map(|s| s.into_owned()),
+                Ok(Event::Eof) | Err(_) => return None,
+                _ => {}
+            }
+        }
+    }
+
+    fn parse_hosts(xml: &str) -> Vec<NcHost> {
+        use quick_xml::Reader;
+        use quick_xml::events::Event;
+        let mut r = Reader::from_str(xml);
+        let mut out = Vec::new();
+        loop {
+            match r.read_event() {
+                Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.name().as_ref() == b"host" => {
+                    let mut name = String::new();
+                    let mut kind = String::new();
+                    let mut address = String::new();
+                    let mut ttl = "1800".to_string();
+                    let mut mx_pref = None;
+                    for a in e.attributes().flatten() {
+                        let v = a.unescape_value().unwrap_or_default().into_owned();
+                        match a.key.as_ref() {
+                            b"Name" => name = v,
+                            b"Type" => kind = v,
+                            b"Address" => address = v,
+                            b"TTL" => ttl = v,
+                            b"MXPref" => mx_pref = Some(v),
+                            _ => {}
+                        }
+                    }
+                    out.push(NcHost { name, kind, address, mx_pref, ttl });
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Merge one record into the full host set: replace a same-(name,type)
+    /// record's address, else append. Never drops other records.
+    fn merge(mut hosts: Vec<NcHost>, host: &str, kind: &str, address: &str) -> Vec<NcHost> {
+        if let Some(h) = hosts.iter_mut().find(|h| h.name == host && h.kind == kind) {
+            h.address = address.to_string();
+        } else {
+            hosts.push(NcHost {
+                name: host.into(),
+                kind: kind.into(),
+                address: address.into(),
+                mx_pref: None,
+                ttl: "60".into(),
+            });
+        }
+        hosts
+    }
+}
+
+#[async_trait]
+impl DnsProvider for NamecheapProvider {
+    async fn upsert_a(&self, name: &str, ip: &str) -> anyhow::Result<()> {
+        let (host, sld, tld) = Self::split(name)?;
+        let hosts = self.get_hosts(&sld, &tld).await?;
+        let merged = Self::merge(hosts, &host, "A", ip);
+        self.set_hosts(&sld, &tld, &merged).await
+    }
+
+    async fn delete_a(&self, name: &str) -> anyhow::Result<()> {
+        let (host, sld, tld) = Self::split(name)?;
+        let mut hosts = self.get_hosts(&sld, &tld).await?;
+        let before = hosts.len();
+        hosts.retain(|h| !(h.name == host && h.kind == "A"));
+        if hosts.len() == before {
+            return Ok(());
+        }
+        self.set_hosts(&sld, &tld, &hosts).await
+    }
+
+    async fn upsert_txt(&self, name: &str, value: &str) -> anyhow::Result<()> {
+        let (host, sld, tld) = Self::split(name)?;
+        let mut hosts = self.get_hosts(&sld, &tld).await?;
+        if hosts
+            .iter()
+            .any(|h| h.name == host && h.kind == "TXT" && h.address == value)
+        {
+            return Ok(());
+        }
+        hosts.push(NcHost {
+            name: host,
+            kind: "TXT".into(),
+            address: value.into(),
+            mx_pref: None,
+            ttl: "60".into(),
+        });
+        self.set_hosts(&sld, &tld, &hosts).await
+    }
+
+    async fn delete_txt(&self, name: &str, value: &str) -> anyhow::Result<()> {
+        let (host, sld, tld) = Self::split(name)?;
+        let mut hosts = self.get_hosts(&sld, &tld).await?;
+        let before = hosts.len();
+        hosts.retain(|h| !(h.name == host && h.kind == "TXT" && h.address == value));
+        if hosts.len() == before {
+            return Ok(());
+        }
+        self.set_hosts(&sld, &tld, &hosts).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,5 +1132,53 @@ mod tests {
             HetznerProvider::relative("*.dev.example.com", "dev.example.com"),
             "*"
         );
+    }
+
+    #[tokio::test]
+    async fn namecheap_sethosts_preserves_sibling_records() {
+        // getHosts returns two unrelated hosts; our upsert must send all THREE back.
+        let get = r#"<?xml version="1.0"?><ApiResponse Status="OK"><CommandResponse>
+          <DomainDNSGetHostsResult>
+            <host Name="@" Type="A" Address="9.9.9.9" TTL="1800"/>
+            <host Name="mail" Type="MX" Address="mx.example.com" MXPref="10" TTL="1800"/>
+          </DomainDNSGetHostsResult></CommandResponse></ApiResponse>"#;
+        let set = r#"<?xml version="1.0"?><ApiResponse Status="OK"><CommandResponse>
+          <DomainDNSSetHostsResult IsSuccess="true"/></CommandResponse></ApiResponse>"#;
+        let (addr, seen) = mock_server(vec![(200, get.into()), (200, set.into())]).await;
+        let nc = NamecheapProvider::with_base_url(
+            "u".into(), "k".into(), "u".into(), "1.2.3.4".into(), format!("http://{addr}"));
+        nc.upsert_a("*.dev.example.com", "5.6.7.8").await.unwrap();
+
+        let reqs = seen.lock().unwrap().clone();
+        let set_req = reqs.last().unwrap();
+        // full record set round-trips: the two siblings AND our new record.
+        assert!(set_req.1.contains("HostName1=%40") || set_req.1.contains("HostName1=@"), "apex kept: {}", set_req.1);
+        assert!(set_req.1.contains("mail"), "MX sibling kept: {}", set_req.1);
+        assert!(set_req.1.contains("5.6.7.8"), "new A value present: {}", set_req.1);
+        assert!(set_req.1.contains(&"Address".to_string()));
+    }
+
+    #[test]
+    fn namecheap_split_puts_subdomain_in_host() {
+        assert_eq!(
+            NamecheapProvider::split("*.dev.example.com").unwrap(),
+            ("*.dev".into(), "example".into(), "com".into())
+        );
+        assert_eq!(
+            NamecheapProvider::split("example.com").unwrap(),
+            ("@".into(), "example".into(), "com".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn namecheap_surfaces_api_error_without_leaking_key() {
+        let err = r#"<?xml version="1.0"?><ApiResponse Status="ERROR">
+          <Errors><Error Number="1011150">Invalid request IP</Error></Errors></ApiResponse>"#;
+        let (addr, _seen) = mock_server(vec![(200, err.into())]).await;
+        let nc = NamecheapProvider::with_base_url(
+            "u".into(), "supersecret".into(), "u".into(), "1.2.3.4".into(), format!("http://{addr}"));
+        let e = nc.upsert_a("*.dev.example.com", "5.6.7.8").await.unwrap_err();
+        assert!(e.to_string().contains("Invalid request IP"), "got {e}");
+        assert!(!e.to_string().contains("supersecret"), "must not leak api key: {e}");
     }
 }
