@@ -43,8 +43,9 @@ struct StoreIssuer {
 #[async_trait::async_trait]
 impl CertIssuer for StoreIssuer {
     async fn issue(&self, domain: &str) -> anyhow::Result<IssuedCert> {
-        // The token is read here and nowhere else on this path; it is handed
-        // straight to the provider and never logged or returned.
+        // Credentials are read from the store and handed straight to the
+        // provider (built in `build_provider` below); they are never logged or
+        // returned on this path.
         let cfg = self
             .store
             .acme_config()

@@ -2013,10 +2013,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body = body_string(res).await;
         assert!(body.contains("hetzner"), "body: {body}");
-        assert!(
-            !body.contains("hetzner_topsecret"),
-            "token leaked: {body}"
-        );
+        assert!(!body.contains("hetzner_topsecret"), "token leaked: {body}");
 
         // 3. A namecheap provider missing `api_key` is rejected with a 4xx
         // that names the missing field.

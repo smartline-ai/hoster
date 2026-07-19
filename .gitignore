@@ -1,1 +1,4 @@
 /target
+
+# Scratch directories created by the test suite (unique per run).
+/hoster-*/

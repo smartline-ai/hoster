@@ -575,7 +575,13 @@ struct NcHost {
 
 impl NamecheapProvider {
     pub fn new(api_user: String, api_key: String, username: String, client_ip: String) -> Self {
-        Self::with_base_url(api_user, api_key, username, client_ip, NAMECHEAP_API.to_string())
+        Self::with_base_url(
+            api_user,
+            api_key,
+            username,
+            client_ip,
+            NAMECHEAP_API.to_string(),
+        )
     }
 
     /// Construct against an arbitrary base URL, so tests can point at a local
@@ -725,7 +731,13 @@ impl NamecheapProvider {
                             _ => {}
                         }
                     }
-                    out.push(NcHost { name, kind, address, mx_pref, ttl });
+                    out.push(NcHost {
+                        name,
+                        kind,
+                        address,
+                        mx_pref,
+                        ttl,
+                    });
                 }
                 Ok(Event::Eof) | Err(_) => break,
                 _ => {}
@@ -807,7 +819,11 @@ impl DnsProvider for NamecheapProvider {
 /// operator must create themselves and returns Ok.
 #[derive(Default)]
 pub struct ManualProvider;
-impl ManualProvider { pub fn new() -> Self { Self } }
+impl ManualProvider {
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 #[async_trait]
 impl DnsProvider for ManualProvider {
@@ -815,12 +831,16 @@ impl DnsProvider for ManualProvider {
         tracing::info!(record.name = %name, record.value = %value, "manual DNS: create TXT yourself");
         Ok(())
     }
-    async fn delete_txt(&self, _name: &str, _value: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn delete_txt(&self, _name: &str, _value: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn upsert_a(&self, name: &str, ip: &str) -> anyhow::Result<()> {
         tracing::info!(record.name = %name, record.ip = %ip, "manual DNS: create A record yourself");
         Ok(())
     }
-    async fn delete_a(&self, _name: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn delete_a(&self, _name: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Build a live provider from stored credentials. `client_ip` is hoster's
@@ -1138,9 +1158,16 @@ mod tests {
         cf.upsert_a("*.dev.example.com", "1.1.1.1").await.unwrap();
         cf.upsert_a("*.dev.example.com", "2.2.2.2").await.unwrap();
         let reqs = seen.lock().unwrap().clone();
-        assert_eq!(reqs.len(), 5, "expected zone lookup + 2x(A-lookup+write): {reqs:?}");
+        assert_eq!(
+            reqs.len(),
+            5,
+            "expected zone lookup + 2x(A-lookup+write): {reqs:?}"
+        );
         assert_eq!(reqs[2].0, "POST", "first upsert with no record must POST");
-        assert_eq!(reqs[4].0, "PUT", "second upsert must PUT the existing record");
+        assert_eq!(
+            reqs[4].0, "PUT",
+            "second upsert must PUT the existing record"
+        );
         assert!(reqs[4].2.contains("2.2.2.2"));
     }
 
@@ -1196,15 +1223,28 @@ mod tests {
           <DomainDNSSetHostsResult IsSuccess="true"/></CommandResponse></ApiResponse>"#;
         let (addr, seen) = mock_server(vec![(200, get.into()), (200, set.into())]).await;
         let nc = NamecheapProvider::with_base_url(
-            "u".into(), "k".into(), "u".into(), "1.2.3.4".into(), format!("http://{addr}"));
+            "u".into(),
+            "k".into(),
+            "u".into(),
+            "1.2.3.4".into(),
+            format!("http://{addr}"),
+        );
         nc.upsert_a("*.dev.example.com", "5.6.7.8").await.unwrap();
 
         let reqs = seen.lock().unwrap().clone();
         let set_req = reqs.last().unwrap();
         // full record set round-trips: the two siblings AND our new record.
-        assert!(set_req.1.contains("HostName1=%40") || set_req.1.contains("HostName1=@"), "apex kept: {}", set_req.1);
+        assert!(
+            set_req.1.contains("HostName1=%40") || set_req.1.contains("HostName1=@"),
+            "apex kept: {}",
+            set_req.1
+        );
         assert!(set_req.1.contains("mail"), "MX sibling kept: {}", set_req.1);
-        assert!(set_req.1.contains("5.6.7.8"), "new A value present: {}", set_req.1);
+        assert!(
+            set_req.1.contains("5.6.7.8"),
+            "new A value present: {}",
+            set_req.1
+        );
         assert!(set_req.1.contains(&"Address".to_string()));
     }
 
@@ -1226,10 +1266,21 @@ mod tests {
           <Errors><Error Number="1011150">Invalid request IP</Error></Errors></ApiResponse>"#;
         let (addr, _seen) = mock_server(vec![(200, err.into())]).await;
         let nc = NamecheapProvider::with_base_url(
-            "u".into(), "supersecret".into(), "u".into(), "1.2.3.4".into(), format!("http://{addr}"));
-        let e = nc.upsert_a("*.dev.example.com", "5.6.7.8").await.unwrap_err();
+            "u".into(),
+            "supersecret".into(),
+            "u".into(),
+            "1.2.3.4".into(),
+            format!("http://{addr}"),
+        );
+        let e = nc
+            .upsert_a("*.dev.example.com", "5.6.7.8")
+            .await
+            .unwrap_err();
         assert!(e.to_string().contains("Invalid request IP"), "got {e}");
-        assert!(!e.to_string().contains("supersecret"), "must not leak api key: {e}");
+        assert!(
+            !e.to_string().contains("supersecret"),
+            "must not leak api key: {e}"
+        );
     }
 
     #[tokio::test]
@@ -1239,9 +1290,20 @@ mod tests {
         // otherwise attach `ApiKey=<secret>` to the error's Display.
         let (addr, _seen) = mock_server(vec![(500, "<oops/>".into())]).await;
         let nc = NamecheapProvider::with_base_url(
-            "u".into(), "supersecret".into(), "u".into(), "1.2.3.4".into(), format!("http://{addr}"));
-        let e = nc.upsert_a("*.dev.example.com", "5.6.7.8").await.unwrap_err();
-        assert!(!e.to_string().contains("supersecret"), "api_key leaked in error: {e}");
+            "u".into(),
+            "supersecret".into(),
+            "u".into(),
+            "1.2.3.4".into(),
+            format!("http://{addr}"),
+        );
+        let e = nc
+            .upsert_a("*.dev.example.com", "5.6.7.8")
+            .await
+            .unwrap_err();
+        assert!(
+            !e.to_string().contains("supersecret"),
+            "api_key leaked in error: {e}"
+        );
     }
 
     #[tokio::test]
@@ -1249,18 +1311,40 @@ mod tests {
         let m = ManualProvider::new();
         m.upsert_a("*.dev.example.com", "1.2.3.4").await.unwrap();
         m.delete_a("*.dev.example.com").await.unwrap();
-        m.upsert_txt("_acme-challenge.dev.example.com", "v").await.unwrap();
-        m.delete_txt("_acme-challenge.dev.example.com", "v").await.unwrap();
+        m.upsert_txt("_acme-challenge.dev.example.com", "v")
+            .await
+            .unwrap();
+        m.delete_txt("_acme-challenge.dev.example.com", "v")
+            .await
+            .unwrap();
     }
 
     #[test]
     fn build_provider_maps_each_kind() {
         use crate::secrets::DnsProviderConfig;
-        let cf = DnsProviderConfig { kind: "cloudflare".into(), token: Some("t".into()), api_user: None, api_key: None, username: None };
+        let cf = DnsProviderConfig {
+            kind: "cloudflare".into(),
+            token: Some("t".into()),
+            api_user: None,
+            api_key: None,
+            username: None,
+        };
         assert!(build_provider(&cf, "1.2.3.4").is_ok());
-        let manual = DnsProviderConfig { kind: "manual".into(), token: None, api_user: None, api_key: None, username: None };
+        let manual = DnsProviderConfig {
+            kind: "manual".into(),
+            token: None,
+            api_user: None,
+            api_key: None,
+            username: None,
+        };
         assert!(build_provider(&manual, "1.2.3.4").is_ok());
-        let bad = DnsProviderConfig { kind: "route53".into(), token: None, api_user: None, api_key: None, username: None };
+        let bad = DnsProviderConfig {
+            kind: "route53".into(),
+            token: None,
+            api_user: None,
+            api_key: None,
+            username: None,
+        };
         assert!(build_provider(&bad, "1.2.3.4").is_err());
     }
 }
