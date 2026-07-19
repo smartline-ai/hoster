@@ -1145,14 +1145,19 @@ async fn ui_acme<R: ContainerRuntime>(
             Ok(c) => c.to_bytes(),
             Err(_) => return text(StatusCode::BAD_REQUEST, "could not read request body"),
         };
+        // The guided picker (Task 12) submits one form for every provider
+        // kind, so every kind's field is present here; only the ones the
+        // selected `kind` needs are kept — `DnsProviderConfig::validate`
+        // enforces which those are — and a field the operator left blank is
+        // stored as absent rather than as an empty string.
+        let non_empty = |v: Option<String>| v.filter(|s| !s.is_empty());
         let kind = form_field(&bytes, "kind").unwrap_or_default();
-        let token = form_field(&bytes, "token").unwrap_or_default();
         let cfg = crate::secrets::DnsProviderConfig {
             kind,
-            token: Some(token),
-            api_user: None,
-            api_key: None,
-            username: None,
+            token: non_empty(form_field(&bytes, "token")),
+            api_user: non_empty(form_field(&bytes, "api_user")),
+            api_key: non_empty(form_field(&bytes, "api_key")),
+            username: non_empty(form_field(&bytes, "username")),
         };
         return match engine.store().set_dns_provider(cfg) {
             Ok(()) => redirect("/settings"),
