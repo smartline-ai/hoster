@@ -531,7 +531,16 @@ mod tests {
         let wanted = vec!["a.example.com".to_string()];
 
         // One failure puts the domain into a 15-minute backoff.
-        let state = run_once(&AlwaysFails, &store, &shared, &wanted, BTreeMap::new(), 0, None).await;
+        let state = run_once(
+            &AlwaysFails,
+            &store,
+            &shared,
+            &wanted,
+            BTreeMap::new(),
+            0,
+            None,
+        )
+        .await;
         assert_eq!(state["a.example.com"].failures, 1);
 
         // A pass one minute later does not even attempt it: the domain is

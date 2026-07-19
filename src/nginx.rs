@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 
-use crate::certs::{write_atomic, CertStore};
+use crate::certs::{CertStore, write_atomic};
 
 /// One wildcard base (or plain control hostname) served by nginx, with the
 /// on-disk cert it presents. `cert_path` and `key_path` may be the same
@@ -105,7 +105,26 @@ pub struct ApplyOutcome {
 pub struct NginxBackend {
     conf_path: PathBuf,
     reload_cmd: Vec<String>,
+    /// The validate command, always `nginx -t`, optionally prefixed with the
+    /// same privilege escalator the reload command uses (`sudo`/`doas`/
+    /// `pkexec`). Computed from `reload_cmd`, never operator-supplied directly,
+    /// so `nginx -t` can never be replaced or skipped — only elevated.
+    validate_cmd: Vec<String>,
     runner: CommandRunner,
+}
+
+/// Derive the validate command from the reload command. `nginx -t` is
+/// mandatory and non-replaceable; the only adjustment permitted is inheriting
+/// a recognized privilege prefix (`sudo`, `doas`, `pkexec`) from the reload
+/// command, so an operator who reloads via `sudo systemctl reload nginx` also
+/// validates via `sudo nginx -t` (matching the sudoers NOPASSWD entry).
+fn validate_cmd_from_reload(reload_cmd: &[String]) -> Vec<String> {
+    match reload_cmd.first().map(String::as_str) {
+        Some(prefix @ ("sudo" | "doas" | "pkexec")) => {
+            vec![prefix.to_string(), "nginx".to_string(), "-t".to_string()]
+        }
+        _ => vec!["nginx".to_string(), "-t".to_string()],
+    }
 }
 
 fn real_runner(args: &[&str]) -> anyhow::Result<CmdOutput> {
@@ -122,9 +141,11 @@ fn real_runner(args: &[&str]) -> anyhow::Result<CmdOutput> {
 
 impl NginxBackend {
     pub fn new(conf_path: PathBuf, reload_cmd: Vec<String>) -> NginxBackend {
+        let validate_cmd = validate_cmd_from_reload(&reload_cmd);
         NginxBackend {
             conf_path,
             reload_cmd,
+            validate_cmd,
             runner: Box::new(real_runner),
         }
     }
@@ -135,9 +156,11 @@ impl NginxBackend {
         reload_cmd: Vec<String>,
         runner: CommandRunner,
     ) -> NginxBackend {
+        let validate_cmd = validate_cmd_from_reload(&reload_cmd);
         NginxBackend {
             conf_path,
             reload_cmd,
+            validate_cmd,
             runner,
         }
     }
@@ -150,7 +173,8 @@ impl NginxBackend {
         write_atomic(&self.conf_path, config.as_bytes(), 0o644)
             .with_context(|| format!("write {}", self.conf_path.display()))?;
 
-        let validate = match (self.runner)(&["nginx", "-t"]) {
+        let validate_refs: Vec<&str> = self.validate_cmd.iter().map(String::as_str).collect();
+        let validate = match (self.runner)(&validate_refs) {
             Ok(v) => v,
             Err(e) => {
                 self.restore_or_clear(&backup);
@@ -386,7 +410,10 @@ mod manager_tests {
         store.save("*.dev.example.com", "CHAIN", "KEY").unwrap();
 
         let bases = bases_for(
-            &["*.dev.example.com".to_string(), "*.team.example.com".to_string()],
+            &[
+                "*.dev.example.com".to_string(),
+                "*.team.example.com".to_string(),
+            ],
             &store,
         );
         assert_eq!(bases.len(), 1);
@@ -424,7 +451,10 @@ mod manager_tests {
         mgr.apply_now();
 
         let written = std::fs::read_to_string(&conf).expect("config written");
-        assert!(written.contains("server_name .dev.example.com;"), "{written}");
+        assert!(
+            written.contains("server_name .dev.example.com;"),
+            "{written}"
+        );
 
         let rec = status.lock().unwrap().clone().expect("status recorded");
         assert!(rec.validated && rec.reloaded);
@@ -474,6 +504,29 @@ mod apply_tests {
         let c = calls.lock().unwrap();
         assert_eq!(c[0], "nginx -t");
         assert_eq!(c[1], "systemctl reload nginx");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sudo_reload_cmd_inherits_the_prefix_for_validation() {
+        let path = temp_conf();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let be = NginxBackend::with_runner(
+            path.clone(),
+            vec![
+                "sudo".into(),
+                "systemctl".into(),
+                "reload".into(),
+                "nginx".into(),
+            ],
+            runner(true, true, calls.clone()),
+        );
+        let out = be.apply("CONFIG-SUDO").unwrap();
+        assert!(out.validated && out.reloaded);
+        let c = calls.lock().unwrap();
+        // `nginx -t` still runs first, now elevated to match the reload prefix.
+        assert_eq!(c[0], "sudo nginx -t");
+        assert_eq!(c[1], "sudo systemctl reload nginx");
         let _ = std::fs::remove_file(&path);
     }
 

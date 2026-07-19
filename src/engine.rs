@@ -155,8 +155,9 @@ impl<R: ContainerRuntime> Engine<R> {
         }
     }
 
-    /// Attach the renewal loop's trigger. Called only when TLS is enabled and
-    /// a loop actually exists to be triggered.
+    /// Attach the renewal loop's trigger. Called whenever hoster issues and
+    /// renews certs — standalone-TLS mode or nginx mode — i.e. whenever a
+    /// renewal loop actually exists to be triggered.
     pub fn with_renewal_trigger(mut self, trigger: crate::renewal::RenewalTrigger) -> Self {
         self.renewal_trigger = Some(trigger);
         self

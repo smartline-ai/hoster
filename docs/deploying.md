@@ -145,6 +145,9 @@ In nginx mode:
 export HOSTER_PROXY_MODE='nginx'
 export HOSTER_LISTEN='127.0.0.1:8080'
 export HOSTER_NGINX_CONF='/etc/nginx/conf.d/hoster.conf'
+# Running hoster as root: reload directly (default). If hoster runs as a
+# non-root user, use 'sudo systemctl reload nginx' instead and add the sudoers
+# entry below — hoster then validates as 'sudo nginx -t' to match. See Permissions.
 export HOSTER_NGINX_RELOAD_CMD='systemctl reload nginx'
 ```
 
@@ -164,8 +167,24 @@ disk. A base without a cert yet is simply omitted until issuance catches up.
 ### Permissions
 
 hoster needs to be able to (a) write `HOSTER_NGINX_CONF` and (b) run
-`nginx -t` and the reload command. Either run hoster as root, or grant it a
-narrow sudoers entry:
+`nginx -t` and the reload command. There are two ways to grant this:
+
+**Run hoster as root (simplest).** The default `HOSTER_NGINX_RELOAD_CMD`
+(`systemctl reload nginx`) and the `nginx -t` validation both run directly, no
+sudo needed. Nothing extra to configure.
+
+**Run hoster as a non-root user with sudo.** Set the reload command to run
+through `sudo`:
+
+```bash
+export HOSTER_NGINX_RELOAD_CMD='sudo systemctl reload nginx'
+```
+
+hoster automatically runs validation as `sudo nginx -t` to match — it inherits
+the `sudo` (or `doas`/`pkexec`) prefix from your reload command, so validation
+and reload use the same privilege path. `nginx -t` is always run and can never
+be replaced or skipped; only a recognized privilege prefix is prepended. Grant
+a narrow NOPASSWD sudoers entry covering both commands:
 
 ```
 hoster ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /bin/systemctl reload nginx

@@ -54,12 +54,15 @@ impl Settings {
     /// Every public URL hoster reports — the `{{url.*}}` values injected into
     /// containers, the API's deploy/deployments responses, and the dashboard's
     /// links — must use the scheme a browser will actually reach the
-    /// environment on. `https_listen` being set is the signal that hoster
-    /// terminates TLS, so it is the single source of that answer; hardcoding
-    /// `http://` makes a frontend on the HTTPS listener call its backend over
-    /// plain HTTP and get blocked as mixed content.
+    /// environment on. TLS is terminated in one of two ways, and either one
+    /// means the public scheme is `https`: hoster terminates it itself when
+    /// `https_listen` is set, OR nginx terminates it on `:443` when
+    /// `proxy_mode` is `Nginx` (in which case `https_listen` is unset/ignored,
+    /// but the edge is still HTTPS). Hardcoding `http://` in nginx mode makes a
+    /// frontend on the HTTPS edge call its backend over plain HTTP and get
+    /// blocked as mixed content.
     pub fn public_scheme(&self) -> &'static str {
-        if self.https_listen.is_some() {
+        if self.https_listen.is_some() || self.proxy_mode == ProxyMode::Nginx {
             "https"
         } else {
             "http"
@@ -395,8 +398,21 @@ mod tests {
 
     #[test]
     fn public_scheme_is_https_only_when_hoster_terminates_tls() {
+        // Standalone, no https listener: hoster is a plain-HTTP edge.
         assert_eq!(settings(None).public_scheme(), "http");
+        // Standalone with an https listener: hoster terminates TLS.
         assert_eq!(settings(Some("0.0.0.0:8443")).public_scheme(), "https");
+
+        // nginx mode terminates TLS on :443 even though https_listen is unset,
+        // so the public scheme must still be https.
+        let mut nginx = settings(None);
+        nginx.proxy_mode = ProxyMode::Nginx;
+        assert_eq!(nginx.public_scheme(), "https");
+
+        // Explicit standalone with no https listener stays http.
+        let mut standalone = settings(None);
+        standalone.proxy_mode = ProxyMode::Standalone;
+        assert_eq!(standalone.public_scheme(), "http");
     }
 
     #[test]

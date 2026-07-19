@@ -208,9 +208,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let routes = SharedRoutes::new(RoutingTable::new());
-    // The trigger is only attached when TLS is on: with no renewal loop
-    // running there is nothing to trigger, and the API reports that instead
-    // of accepting a request that would do nothing.
+    // The trigger is attached whenever hoster issues/renews certs — that is
+    // standalone-TLS mode OR nginx mode (see `issue_certs` below). Without a
+    // renewal loop running there is nothing to trigger, and the API reports
+    // that instead of accepting a request that would do nothing.
     let renewal_trigger = renewal::RenewalTrigger::new();
     let engine = Engine::new(
         runtime,

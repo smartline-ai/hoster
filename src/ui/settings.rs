@@ -102,7 +102,7 @@ fn render_proxy(
             ),
             Some(r) => {
                 let (class, label) = if r.validated && r.reloaded {
-                    ("tag", "reloaded")
+                    ("tag ok", "reloaded")
                 } else if r.validated {
                     ("tag bad", "validated, reload failed")
                 } else {
