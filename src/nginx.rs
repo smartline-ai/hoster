@@ -1,10 +1,11 @@
 //! nginx-mode config generation. See docs/superpowers/specs/2026-07-19-reverse-proxy-backend-design.md.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 
-use crate::certs::write_atomic;
+use crate::certs::{write_atomic, CertStore};
 
 /// One wildcard base (or plain control hostname) served by nginx, with the
 /// on-disk cert it presents. `cert_path` and `key_path` may be the same
@@ -192,6 +193,111 @@ impl NginxBackend {
     }
 }
 
+/// Snapshot of the outcome of the most recent [`NginxManager::apply_now`]
+/// call, kept for the dashboard/status endpoint.
+#[derive(Clone)]
+pub struct ApplyRecord {
+    pub validated: bool,
+    pub reloaded: bool,
+    pub message: Option<String>,
+    pub at: i64,
+}
+
+impl ApplyRecord {
+    fn from_outcome(o: &ApplyOutcome, at: i64) -> ApplyRecord {
+        ApplyRecord {
+            validated: o.validated,
+            reloaded: o.reloaded,
+            message: o.message.clone(),
+            at,
+        }
+    }
+
+    fn error(msg: String, at: i64) -> ApplyRecord {
+        ApplyRecord {
+            validated: false,
+            reloaded: false,
+            message: Some(msg),
+            at,
+        }
+    }
+}
+
+/// Shared, mutable snapshot of the last `apply` result, read by the dashboard.
+pub type NginxStatusHandle = Arc<Mutex<Option<ApplyRecord>>>;
+
+/// One [`NginxBase`] per wanted domain that already has a cert on disk. A
+/// domain without a cert is omitted, so `nginx -t` still passes mid-issuance.
+pub fn bases_for(wanted: &[String], store: &CertStore) -> Vec<NginxBase> {
+    wanted
+        .iter()
+        .filter_map(|domain| {
+            let cert = store.dir_for(domain).join("cert.pem");
+            if cert.exists() {
+                Some(NginxBase {
+                    server_name: server_name_for(domain),
+                    cert_path: cert.clone(),
+                    key_path: cert,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+type WantedFn = Box<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Ties the pieces together: recompute bases from the current wanted-domain set
+/// and on-disk certs, render, apply, and record the outcome. Called at startup
+/// and from the renewal loop's change hook — never per deploy.
+pub struct NginxManager {
+    backend: NginxBackend,
+    cert_store: Arc<CertStore>,
+    wanted: WantedFn,
+    upstream: String,
+    status: NginxStatusHandle,
+}
+
+impl NginxManager {
+    pub fn new(
+        backend: NginxBackend,
+        cert_store: Arc<CertStore>,
+        wanted: WantedFn,
+        upstream: String,
+        status: NginxStatusHandle,
+    ) -> NginxManager {
+        NginxManager {
+            backend,
+            cert_store,
+            wanted,
+            upstream,
+            status,
+        }
+    }
+
+    pub fn apply_now(&self) {
+        let bases = bases_for(&(self.wanted)(), &self.cert_store);
+        let config = render(&bases, &self.upstream);
+        let at = crate::renewal::now_secs();
+        let record = match self.backend.apply(&config) {
+            Ok(o) => {
+                if o.validated && o.reloaded {
+                    tracing::info!(bases = bases.len(), "nginx config applied");
+                } else {
+                    tracing::error!(message = ?o.message, "nginx apply did not fully succeed");
+                }
+                ApplyRecord::from_outcome(&o, at)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "nginx apply errored");
+                ApplyRecord::error(e.to_string(), at)
+            }
+        };
+        *self.status.lock().unwrap() = Some(record);
+    }
+}
+
 #[cfg(test)]
 mod render_tests {
     use super::*;
@@ -253,6 +359,78 @@ mod render_tests {
         assert!(!out.contains("evil.com"), "{out}");
         assert!(out.contains("server_name .dev.example.com;"), "{out}");
         assert!(out.contains("listen 443 ssl;"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+    use crate::certs::CertStore;
+    use std::sync::{Arc, Mutex};
+
+    fn unique_dir() -> PathBuf {
+        let n = Box::into_raw(Box::new(0u8)) as usize;
+        std::env::temp_dir().join(format!("hoster-nginx-store-{n}"))
+    }
+
+    fn temp_conf() -> PathBuf {
+        let n = Box::into_raw(Box::new(0u8)) as usize;
+        std::env::temp_dir().join(format!("hoster-mgr-{n}.conf"))
+    }
+
+    #[test]
+    fn bases_for_includes_only_domains_with_a_cert_on_disk() {
+        let dir = unique_dir();
+        let store = CertStore::new(dir.clone());
+        // Give "*.dev.example.com" a cert; leave "*.team.example.com" without one.
+        store.save("*.dev.example.com", "CHAIN", "KEY").unwrap();
+
+        let bases = bases_for(
+            &["*.dev.example.com".to_string(), "*.team.example.com".to_string()],
+            &store,
+        );
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0].server_name, ".dev.example.com");
+        assert!(bases[0].cert_path.ends_with("cert.pem"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_now_renders_and_records_status() {
+        let dir = unique_dir();
+        let store = Arc::new(CertStore::new(dir.clone()));
+        store.save("*.dev.example.com", "CHAIN", "KEY").unwrap();
+
+        let conf = temp_conf();
+        let backend = NginxBackend::with_runner(
+            conf.clone(),
+            vec!["true".into()],
+            Box::new(|_args: &[&str]| {
+                Ok(CmdOutput {
+                    success: true,
+                    stderr: String::new(),
+                })
+            }),
+        );
+        let status: NginxStatusHandle = Arc::new(Mutex::new(None));
+        let mgr = NginxManager::new(
+            backend,
+            store.clone(),
+            Box::new(|| vec!["*.dev.example.com".to_string()]),
+            "127.0.0.1:8080".to_string(),
+            status.clone(),
+        );
+
+        mgr.apply_now();
+
+        let written = std::fs::read_to_string(&conf).expect("config written");
+        assert!(written.contains("server_name .dev.example.com;"), "{written}");
+
+        let rec = status.lock().unwrap().clone().expect("status recorded");
+        assert!(rec.validated && rec.reloaded);
+
+        std::fs::remove_dir_all(&dir).ok();
+        let _ = std::fs::remove_file(&conf);
     }
 }
 
