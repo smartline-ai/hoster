@@ -90,20 +90,34 @@ fn config_from(resolver: CertResolver) -> ServerConfig {
 /// A wildcard covers exactly one label: `*.dev.example.com` matches
 /// `backend.dev.example.com` but neither `a.b.dev.example.com` nor the bare
 /// `dev.example.com`, which needs its own identifier on the certificate.
+///
+/// A single trailing dot (an absolute FQDN, e.g. `backend.dev.example.com.`)
+/// is normalised away on both sides before comparing: rustls accepts a
+/// trailing dot in a `ClientHello`'s server name and passes it through
+/// untrimmed, so a client sending an absolute name must still be matched
+/// against a certificate issued for the relative form.
 pub fn matches(cert_domain: &str, sni: &str) -> bool {
-    let cert = cert_domain.to_ascii_lowercase();
-    let sni = sni.to_ascii_lowercase();
+    let cert = normalize(cert_domain);
+    let sni = normalize(sni);
     match cert.strip_prefix("*.") {
         None => cert == sni,
         Some(parent) => match sni.strip_suffix(parent) {
             // The remaining prefix must be exactly one non-empty label plus its dot.
-            Some(prefix) => {
-                prefix.ends_with('.')
-                    && !prefix.is_empty()
-                    && !prefix[..prefix.len() - 1].contains('.')
-            }
+            Some(prefix) => match prefix.strip_suffix('.') {
+                Some(label) => !label.is_empty() && !label.contains('.'),
+                None => false,
+            },
             None => false,
         },
+    }
+}
+
+/// Lowercase a name and strip a single trailing dot, if present.
+fn normalize(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    match lower.strip_suffix('.') {
+        Some(trimmed) => trimmed.to_string(),
+        None => lower,
     }
 }
 
@@ -162,6 +176,28 @@ mod tests {
     }
 
     #[test]
+    fn trailing_dot_on_sni_is_normalised() {
+        assert!(matches("*.dev.example.com", "backend.dev.example.com."));
+        assert!(matches("hoster.example.com", "hoster.example.com."));
+    }
+
+    #[test]
+    fn trailing_dot_on_cert_domain_is_normalised() {
+        assert!(matches("*.dev.example.com.", "backend.dev.example.com"));
+        assert!(matches("hoster.example.com.", "hoster.example.com"));
+    }
+
+    #[test]
+    fn trailing_dot_on_both_sides_is_normalised() {
+        assert!(matches("*.dev.example.com.", "backend.dev.example.com."));
+    }
+
+    #[test]
+    fn wildcard_rejects_an_empty_label() {
+        assert!(!matches("*.dev.example.com", ".dev.example.com"));
+    }
+
+    #[test]
     fn resolver_skips_an_unusable_certificate_without_failing() {
         let bad = StoredCert {
             domain: "*.dev.example.com".into(),
@@ -183,6 +219,28 @@ mod tests {
         let params = rcgen::CertificateParams::new(vec![domain.to_string()]).unwrap();
         let cert = params.self_signed(&key).unwrap();
         (cert.pem(), key.serialize_pem())
+    }
+
+    #[test]
+    fn resolver_skips_a_certificate_whose_key_does_not_match() {
+        // Two independently generated, individually valid certificate/key
+        // pairs. Pairing one certificate with the *other* pair's private
+        // key must be caught by `CertifiedKey::from_der`'s key/cert match
+        // check, not silently accepted and only fail at handshake time.
+        let (chain_pem, _matching_key_pem) = self_signed("dev.example.com");
+        let (_other_chain_pem, mismatched_key_pem) = self_signed("other.example.com");
+        let stored = StoredCert {
+            domain: "dev.example.com".into(),
+            chain_pem,
+            key_pem: mismatched_key_pem,
+            not_after: i64::MAX,
+        };
+        let r = CertResolver::from_certs(&[stored]).unwrap();
+        assert!(
+            r.entries.is_empty(),
+            "a certificate paired with a non-matching private key must be \
+             skipped, not served"
+        );
     }
 
     #[test]
@@ -225,5 +283,161 @@ mod tests {
             "swap must publish a new config rather than mutate the one \
              in-flight connections already hold"
         );
+    }
+
+    // `ClientHello` has no public constructor outside rustls, so `resolve()`
+    // cannot be reached with a hand-built value — a mutation to
+    // `self.entries.first()` would still typecheck and every test above
+    // would keep passing. These tests drive a real handshake instead: a
+    // `TlsAcceptor` built from `SharedCerts::server_config()` against a
+    // `TlsConnector`, over an in-memory `tokio::io::duplex` pair (no
+    // sockets, no network), with the client trusting the exact self-signed
+    // roots involved. That's the only way to observe which certificate
+    // `resolve()` actually chose.
+    mod handshake {
+        use std::sync::Arc;
+
+        use rustls::RootCertStore;
+        use rustls::pki_types::{CertificateDer, ServerName};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        use super::*;
+
+        /// A self-signed certificate for `domain`, generated in-process via
+        /// `rcgen`. The certificate's own SAN is `domain`, so a `StoredCert`
+        /// built from it and looked up under the same `domain` behaves like
+        /// a real cert/entry pair — including under rustls's own wildcard
+        /// hostname verification on the client side.
+        fn stored_cert(domain: &str) -> (StoredCert, CertificateDer<'static>) {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(vec![domain.to_string()]).unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            let der = cert.der().clone();
+            let stored = StoredCert {
+                domain: domain.into(),
+                chain_pem: cert.pem(),
+                key_pem: key.serialize_pem(),
+                not_after: i64::MAX,
+            };
+            (stored, der)
+        }
+
+        /// Drive a real TLS handshake over an in-memory duplex pair, server
+        /// side backed by `server_certs` through the real `CertResolver` /
+        /// `SharedCerts` path, client side trusting exactly `trusted` as
+        /// roots. Returns the DER of the certificate the client actually
+        /// received (proof of what `resolve()` picked), or the handshake
+        /// error if either side failed.
+        async fn handshake(
+            server_certs: &[StoredCert],
+            trusted: &[CertificateDer<'static>],
+            sni: &str,
+        ) -> anyhow::Result<CertificateDer<'static>> {
+            let resolver = CertResolver::from_certs(server_certs)?;
+            let shared = SharedCerts::new(resolver);
+            let acceptor = TlsAcceptor::from(shared.server_config());
+
+            let mut roots = RootCertStore::empty();
+            for der in trusted {
+                roots.add(der.clone())?;
+            }
+            let client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(client_config));
+
+            let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+            let server_name = ServerName::try_from(sni.to_string())?;
+
+            let server = tokio::spawn(async move { acceptor.accept(server_io).await });
+            let client =
+                tokio::spawn(async move { connector.connect(server_name, client_io).await });
+
+            let server_result = server.await.expect("server task panicked");
+            let client_result = client.await.expect("client task panicked");
+
+            server_result.map_err(|e| anyhow::anyhow!("server-side handshake failed: {e}"))?;
+            let client_stream =
+                client_result.map_err(|e| anyhow::anyhow!("client-side handshake failed: {e}"))?;
+
+            let (_, conn) = client_stream.get_ref();
+            conn.peer_certificates()
+                .and_then(|certs| certs.first())
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("client completed handshake with no peer certificate")
+                })
+        }
+
+        /// With certificates for `*.dev.example.com` and `other.example.com`
+        /// loaded, a client using SNI `backend-main.dev.example.com` must
+        /// receive the `*.dev.example.com` certificate.
+        ///
+        /// A resolver mutated to `self.entries.first()` must fail this: the
+        /// unrelated certificate is deliberately placed first in the vec, so
+        /// "first" and "correct" are never the same entry here.
+        #[tokio::test]
+        async fn resolve_selects_the_wildcard_certificate_for_a_covered_subdomain() {
+            let (wildcard_cert, wildcard_der) = stored_cert("*.dev.example.com");
+            let (other_cert, _other_der) = stored_cert("other.example.com");
+            let (decoy_cert, _decoy_der) = stored_cert("unrelated.example.net");
+
+            // Deliberately not first: `entries.first()` would be `decoy_cert`.
+            let certs = vec![decoy_cert, other_cert, wildcard_cert];
+            let trusted = vec![wildcard_der.clone()];
+
+            let received = handshake(&certs, &trusted, "backend-main.dev.example.com")
+                .await
+                .expect("handshake with a covered SNI must succeed");
+
+            assert_eq!(
+                received, wildcard_der,
+                "client must receive the *.dev.example.com certificate for \
+                 a subdomain it covers"
+            );
+        }
+
+        /// The exact-match sibling of the above: SNI `other.example.com`
+        /// must receive the `other.example.com` certificate, not the
+        /// wildcard one — and not whatever `entries.first()` happens to be.
+        #[tokio::test]
+        async fn resolve_selects_the_exact_certificate_for_an_exact_sni() {
+            let (wildcard_cert, _wildcard_der) = stored_cert("*.dev.example.com");
+            let (other_cert, other_der) = stored_cert("other.example.com");
+            let (decoy_cert, _decoy_der) = stored_cert("unrelated.example.net");
+
+            // Deliberately not first: `entries.first()` would be `decoy_cert`.
+            let certs = vec![decoy_cert, wildcard_cert, other_cert];
+            let trusted = vec![other_der.clone()];
+
+            let received = handshake(&certs, &trusted, "other.example.com")
+                .await
+                .expect("handshake with an exact-match SNI must succeed");
+
+            assert_eq!(
+                received, other_der,
+                "client must receive the other.example.com certificate for \
+                 an exact-match SNI"
+            );
+        }
+
+        /// An SNI that no loaded certificate covers must fail the handshake
+        /// rather than being served an arbitrary certificate — `resolve()`
+        /// returns `None`, and rustls sends a fatal alert instead of a cert.
+        #[tokio::test]
+        async fn resolve_fails_the_handshake_for_an_uncovered_sni() {
+            let (wildcard_cert, wildcard_der) = stored_cert("*.dev.example.com");
+            let (other_cert, other_der) = stored_cert("other.example.com");
+            let certs = vec![wildcard_cert, other_cert];
+            let trusted = vec![wildcard_der, other_der];
+
+            let result = handshake(&certs, &trusted, "totally-unrelated.example.org").await;
+
+            assert!(
+                result.is_err(),
+                "a client offering an SNI no certificate covers must not \
+                 complete the handshake"
+            );
+        }
     }
 }
