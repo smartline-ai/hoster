@@ -168,6 +168,12 @@ Substituted at deploy time in `image` and `env` values:
 | `{{sha}}` | the commit sha from the deploy request |
 | `{{url.<service>}}` | the full public URL of an exposed service, e.g. `http://backend-mybranch.dev.example.com` |
 
+The scheme in `{{url.<service>}}` — and in every URL hoster reports, including
+the deploy response and the dashboard's links — follows whether hoster is
+terminating TLS: `https://` when `HOSTER_HTTPS_LISTEN` is set, `http://`
+otherwise. A frontend given `{{url.backend}}` therefore never calls its
+backend over plain HTTP from an HTTPS page.
+
 `{{url.<service>}}` only works for services that have an `expose` block —
 referencing an internal service is a validation error.
 
@@ -331,9 +337,10 @@ If step 3 returns nginx's welcome page, routing works end to end.
 
 Known and deliberate for this build — plan around them:
 
-- **Plain HTTP, no TLS.** Branch URLs are `http://`. Run hoster behind a
-  TLS-terminating proxy if you need HTTPS today; native TLS is a planned
-  milestone.
+- **TLS is opt-in.** With `HOSTER_HTTPS_LISTEN` unset there is no HTTPS
+  listener and branch URLs are `http://` — run hoster behind a
+  TLS-terminating proxy in that case. Set it (see the README's *Built-in
+  TLS*) and hoster terminates TLS itself and reports `https://` URLs.
 - **One shared token.** Every CI caller uses the same `HOSTER_TOKEN`. Keep the
   control API off the public internet. Per-project tokens are planned.
 - **HTTP services only.** Public routing works by the HTTP `Host` header. Raw

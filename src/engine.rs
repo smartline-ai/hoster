@@ -366,7 +366,10 @@ impl<R: ContainerRuntime> Engine<R> {
             if let Some(exp) = &svc.expose {
                 let sub = exp.subdomain.clone().unwrap_or_else(|| name.clone());
                 let host = hostname_for(&template, &sub, branch);
-                urls.insert(name.clone(), format!("http://{host}"));
+                urls.insert(
+                    name.clone(),
+                    format!("{}://{host}", self.settings.public_scheme()),
+                );
             }
         }
         urls
@@ -411,9 +414,12 @@ impl<R: ContainerRuntime> Engine<R> {
             let config = cfg_json
                 .as_deref()
                 .and_then(|j| serde_json::from_str::<DeployConfig>(j).ok());
-            // service -> http://hostname, straight off the labels written at
-            // deploy time. A container without a HOSTNAME label isn't
-            // exposed and contributes no URL.
+            // service -> <scheme>://hostname, straight off the labels written
+            // at deploy time. A container without a HOSTNAME label isn't
+            // exposed and contributes no URL. The scheme comes from the same
+            // `public_scheme()` `urls_for` uses, so a reconstructed URL and
+            // the one originally reported for the same deploy never disagree.
+            let scheme = self.settings.public_scheme();
             let mut urls = BTreeMap::new();
             for c in &branch_containers {
                 let (Some(service), Some(hostname)) = (
@@ -422,7 +428,7 @@ impl<R: ContainerRuntime> Engine<R> {
                 ) else {
                     continue;
                 };
-                urls.insert(service.clone(), format!("http://{hostname}"));
+                urls.insert(service.clone(), format!("{scheme}://{hostname}"));
             }
             let status = match self.status_of(&branch) {
                 Some(DeployStatus::Provisioning) => "provisioning".to_string(),
@@ -481,6 +487,14 @@ mod tests {
             dashboard_password: None,
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
+        })
+    }
+
+    /// The same settings with hoster terminating TLS itself.
+    fn tls_settings() -> Arc<crate::settings::Settings> {
+        Arc::new(crate::settings::Settings {
+            https_listen: Some("0.0.0.0:8443".into()),
+            ..(*settings()).clone()
         })
     }
 
@@ -628,6 +642,81 @@ mod tests {
             !cfg.contains("SECRET_KEY"),
             "secret key leaked into config label: {cfg}"
         );
+    }
+
+    /// With TLS on, every URL hoster reports — the deploy response and the
+    /// `{{url.*}}` value injected into a container — must be `https://`.
+    /// Reporting `http://` here is what makes a browser on the HTTPS frontend
+    /// block the backend call as mixed content.
+    #[tokio::test]
+    async fn reported_urls_use_https_when_tls_is_configured() {
+        let rt = Arc::new(FakeRuntime::new());
+        let eng = Engine::with_readiness(
+            rt.clone(),
+            SharedRoutes::new(crate::routing::RoutingTable::new()),
+            tls_settings(),
+            Arc::new(AlwaysReady),
+            empty_store(),
+        );
+        let accepted = eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+        assert_eq!(
+            accepted.urls["backend"],
+            "https://backend-b1.dev.example.com"
+        );
+        // The same scheme reaches the container through `{{url.backend}}`.
+        let backend = rt.env_of("b1-backend").unwrap();
+        assert!(
+            backend
+                .iter()
+                .any(|e| e == "PUBLIC_URL=https://backend-b1.dev.example.com"),
+            "got {backend:?}"
+        );
+    }
+
+    /// The plain listener's URLs stay `http://` — TLS is opt-in and nothing
+    /// about an existing install may change until `https_listen` is set.
+    #[tokio::test]
+    async fn reported_urls_use_http_when_tls_is_off() {
+        let rt = Arc::new(FakeRuntime::new());
+        let eng = engine(
+            rt.clone(),
+            SharedRoutes::new(crate::routing::RoutingTable::new()),
+        );
+        let accepted = eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+        assert_eq!(
+            accepted.urls["backend"],
+            "http://backend-b1.dev.example.com"
+        );
+    }
+
+    /// The label-reconstructed path (`deployment_views`, what the dashboard
+    /// renders after a restart) must agree with the freshly-deployed path.
+    #[tokio::test]
+    async fn label_reconstructed_urls_use_the_same_scheme_as_the_reported_ones() {
+        for (https, expected) in [
+            (None, "http://backend-b1.dev.example.com"),
+            (
+                Some("0.0.0.0:8443".to_string()),
+                "https://backend-b1.dev.example.com",
+            ),
+        ] {
+            let rt = Arc::new(FakeRuntime::new());
+            let cfg = Arc::new(crate::settings::Settings {
+                https_listen: https,
+                ..(*settings()).clone()
+            });
+            let eng = Engine::with_readiness(
+                rt.clone(),
+                SharedRoutes::new(crate::routing::RoutingTable::new()),
+                cfg,
+                Arc::new(AlwaysReady),
+                empty_store(),
+            );
+            let accepted = eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+            let views = eng.deployment_views().await.unwrap();
+            assert_eq!(views[0].urls["backend"], expected);
+            assert_eq!(accepted.urls["backend"], expected);
+        }
     }
 
     #[tokio::test]

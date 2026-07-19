@@ -14,6 +14,25 @@ pub struct Settings {
     pub cert_dir: String,
 }
 
+impl Settings {
+    /// The URL scheme hoster advertises for the environments it publishes.
+    ///
+    /// Every public URL hoster reports — the `{{url.*}}` values injected into
+    /// containers, the API's deploy/deployments responses, and the dashboard's
+    /// links — must use the scheme a browser will actually reach the
+    /// environment on. `https_listen` being set is the signal that hoster
+    /// terminates TLS, so it is the single source of that answer; hardcoding
+    /// `http://` makes a frontend on the HTTPS listener call its backend over
+    /// plain HTTP and get blocked as mixed content.
+    pub fn public_scheme(&self) -> &'static str {
+        if self.https_listen.is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    }
+}
+
 /// A hand-written `Debug` that redacts `token` (the bearer credential that
 /// authenticates the whole control API) and `dashboard_password` — the same
 /// reasoning as [`crate::secrets::DnsProviderConfig`]'s impl: a derived
@@ -318,6 +337,25 @@ pub fn cert_identifiers(name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn settings(https_listen: Option<&str>) -> Settings {
+        Settings {
+            listen: "127.0.0.1:0".into(),
+            api_listen: "127.0.0.1:0".into(),
+            hostname_template: "{service}-{branch}.dev.example.com".into(),
+            registry: "reg.example.com".into(),
+            token: "t".into(),
+            dashboard_password: None,
+            https_listen: https_listen.map(str::to_string),
+            cert_dir: "/tmp/hoster-test-certs".into(),
+        }
+    }
+
+    #[test]
+    fn public_scheme_is_https_only_when_hoster_terminates_tls() {
+        assert_eq!(settings(None).public_scheme(), "http");
+        assert_eq!(settings(Some("0.0.0.0:8443")).public_scheme(), "https");
+    }
 
     #[test]
     fn sanitizes_slashes_and_case() {
