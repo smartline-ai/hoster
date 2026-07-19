@@ -15,7 +15,6 @@ use hoster::secrets::Store;
 use hoster::session::Sessions;
 use hoster::settings::Settings;
 use hoster::tls::{CertResolver, SharedCerts};
-use http_body_util::BodyExt;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
@@ -136,11 +135,10 @@ async fn serve_https(
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
                     if hoster::api::is_control_host(host.as_deref(), control.as_deref()) {
-                        let res = hoster::api::handle_api(req, engine, settings, sessions).await?;
-                        // `ApiBody`'s error type is `Infallible`, so the
-                        // `map_err` closure is unreachable; it exists only to
-                        // line the body types up.
-                        return Ok(res.map(|b| b.map_err(|never| match never {}).boxed()));
+                        // `api::ApiBody` and `proxy::ProxyBody` are both
+                        // `BoxBody<Bytes, BoxError>`, so the control-host
+                        // response needs no body adaptation.
+                        return hoster::api::handle_api(req, engine, settings, sessions).await;
                     }
                     hoster::proxy::handle(req, routes, client, hoster::proxy::Scheme::Https).await
                 }

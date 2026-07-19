@@ -599,3 +599,16 @@ mod tests {
         );
     }
 }
+
+/// One row of the certificate table: a domain hoster wants a certificate for,
+/// plus a free-form, human-readable summary of its current state — `"valid
+/// until 2026-10-01"`, `"failed: no zone found"`, `"pending"`.
+///
+/// Built by the caller from a [`CertStore`] and the renewal loop's persisted
+/// state. Served by `GET /acme/status` and rendered by the dashboard's TLS
+/// panel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CertRow {
+    pub domain: String,
+    pub state: String,
+}

@@ -7,7 +7,7 @@ use crate::config::{self, DeployConfig};
 use crate::imageref::registry_host;
 use crate::labels;
 use crate::routing::SharedRoutes;
-use crate::runtime::{ContainerRuntime, ContainerSpec, RunningContainer};
+use crate::runtime::{ContainerRuntime, ContainerSpec, LogStream, RunningContainer};
 use crate::secrets::Store;
 use crate::settings::{Settings, hostname_for, sanitize_branch};
 use crate::template::{TemplateVars, substitute};
@@ -466,6 +466,32 @@ impl<R: ContainerRuntime> Engine<R> {
             });
         }
         Ok(out)
+    }
+
+    /// Stream one service's container logs. Resolves the container by its
+    /// project/branch/service labels (branch sanitized the same way deploys
+    /// are), erroring if no such running container exists.
+    pub async fn service_logs(
+        &self,
+        project: &str,
+        branch: &str,
+        service: &str,
+        follow: bool,
+        tail: usize,
+    ) -> anyhow::Result<LogStream> {
+        let branch = sanitize_branch(branch);
+        let containers = self.runtime.list_by_label(labels::PROJECT).await?;
+        let target = containers
+            .into_iter()
+            .find(|c| {
+                c.labels.get(labels::PROJECT).map(String::as_str) == Some(project)
+                    && c.labels.get(labels::BRANCH).map(String::as_str) == Some(branch.as_str())
+                    && c.labels.get(labels::SERVICE).map(String::as_str) == Some(service)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("no running container for {project}/{branch}/{service}")
+            })?;
+        self.runtime.logs(&target.id, follow, tail).await
     }
 
     pub async fn reconcile(&self) -> anyhow::Result<()> {
@@ -1151,5 +1177,29 @@ mod tests {
             v.urls
         );
         assert_eq!(v.urls.len(), 2, "got {:?}", v.urls);
+    }
+    #[tokio::test]
+    async fn service_logs_streams_for_a_deployed_service() {
+        use futures_util::StreamExt;
+        let (eng, _rt, _store) = engine_with_fake();
+        eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+
+        let mut stream = eng
+            .service_logs("p", "b1", "backend", false, 100)
+            .await
+            .unwrap();
+        let first = stream.next().await.expect("at least one line").unwrap();
+        assert!(!first.is_empty());
+    }
+
+    #[tokio::test]
+    async fn service_logs_errors_for_an_unknown_service() {
+        let (eng, _rt, _store) = engine_with_fake();
+        eng.deploy(request("b1", TWO_SERVICE)).await.unwrap();
+        assert!(
+            eng.service_logs("p", "b1", "nope", false, 100)
+                .await
+                .is_err()
+        );
     }
 }
