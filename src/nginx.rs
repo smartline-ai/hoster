@@ -123,4 +123,17 @@ mod render_tests {
         assert!(!is_safe_server_name("has space"));
         assert!(!is_safe_server_name(""));
     }
+
+    #[test]
+    fn render_skips_base_with_unsafe_server_name_but_keeps_others() {
+        let unsafe_base = NginxBase {
+            server_name: "evil.com;\n}".to_string(),
+            cert_path: PathBuf::from("/certs/evil.com/cert.pem"),
+            key_path: PathBuf::from("/certs/evil.com/cert.pem"),
+        };
+        let out = render(&[unsafe_base, base("*.dev.example.com")], "127.0.0.1:8080");
+        assert!(!out.contains("evil.com"), "{out}");
+        assert!(out.contains("server_name .dev.example.com;"), "{out}");
+        assert!(out.contains("listen 443 ssl;"), "{out}");
+    }
 }
