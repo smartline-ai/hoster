@@ -121,32 +121,48 @@ fn real_runner(args: &[&str]) -> anyhow::Result<CmdOutput> {
 
 impl NginxBackend {
     pub fn new(conf_path: PathBuf, reload_cmd: Vec<String>) -> NginxBackend {
-        NginxBackend { conf_path, reload_cmd, runner: Box::new(real_runner) }
+        NginxBackend {
+            conf_path,
+            reload_cmd,
+            runner: Box::new(real_runner),
+        }
     }
 
     #[cfg(test)]
-    pub fn with_runner(conf_path: PathBuf, reload_cmd: Vec<String>, runner: CommandRunner) -> NginxBackend {
-        NginxBackend { conf_path, reload_cmd, runner }
+    pub fn with_runner(
+        conf_path: PathBuf,
+        reload_cmd: Vec<String>,
+        runner: CommandRunner,
+    ) -> NginxBackend {
+        NginxBackend {
+            conf_path,
+            reload_cmd,
+            runner,
+        }
     }
 
     /// Write `config`, validate with `nginx -t`, and reload on success.
-    /// A failed validate restores the previous file and never reloads.
+    /// A failed validate — or a failure to even run `nginx -t` — restores the
+    /// previous file and never reloads.
     pub fn apply(&self, config: &str) -> anyhow::Result<ApplyOutcome> {
         let backup = std::fs::read(&self.conf_path).ok();
         write_atomic(&self.conf_path, config.as_bytes(), 0o644)
             .with_context(|| format!("write {}", self.conf_path.display()))?;
 
-        let validate = (self.runner)(&["nginx", "-t"])?;
-        if !validate.success {
-            match &backup {
-                Some(bytes) => {
-                    let _ = write_atomic(&self.conf_path, bytes, 0o644);
-                }
-                None => {
-                    let _ = std::fs::remove_file(&self.conf_path);
-                }
+        let validate = match (self.runner)(&["nginx", "-t"]) {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_or_clear(&backup);
+                return Err(e).context("run nginx -t");
             }
-            return Ok(ApplyOutcome { validated: false, reloaded: false, message: Some(validate.stderr) });
+        };
+        if !validate.success {
+            self.restore_or_clear(&backup);
+            return Ok(ApplyOutcome {
+                validated: false,
+                reloaded: false,
+                message: Some(validate.stderr),
+            });
         }
 
         let reload_refs: Vec<&str> = self.reload_cmd.iter().map(String::as_str).collect();
@@ -154,8 +170,25 @@ impl NginxBackend {
         Ok(ApplyOutcome {
             validated: true,
             reloaded: reload.success,
-            message: if reload.success { None } else { Some(reload.stderr) },
+            message: if reload.success {
+                None
+            } else {
+                Some(reload.stderr)
+            },
         })
+    }
+
+    /// Put the config file back the way it was before `apply` wrote it:
+    /// restore the previous contents, or remove the file if there was none.
+    fn restore_or_clear(&self, backup: &Option<Vec<u8>>) {
+        match backup {
+            Some(bytes) => {
+                let _ = write_atomic(&self.conf_path, bytes, 0o644);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.conf_path);
+            }
+        }
     }
 }
 
@@ -191,8 +224,14 @@ mod render_tests {
         assert!(out.contains("listen 443 ssl;"), "{out}");
         assert!(out.contains("http2 on;"), "{out}");
         assert!(out.contains("server_name .dev.example.com;"), "{out}");
-        assert!(out.contains("ssl_certificate /certs/*.dev.example.com/cert.pem;"), "{out}");
-        assert!(out.contains("ssl_certificate_key /certs/*.dev.example.com/cert.pem;"), "{out}");
+        assert!(
+            out.contains("ssl_certificate /certs/*.dev.example.com/cert.pem;"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ssl_certificate_key /certs/*.dev.example.com/cert.pem;"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -292,6 +331,48 @@ mod apply_tests {
         assert!(out.validated && !out.reloaded);
         assert_eq!(out.message.as_deref(), Some("boom"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "CONFIG-B");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_spawn_error_restores_backup() {
+        let path = temp_conf();
+        crate::certs::write_atomic(&path, b"GOOD", 0o644).unwrap();
+        let be = NginxBackend::with_runner(
+            path.clone(),
+            vec!["systemctl".into(), "reload".into(), "nginx".into()],
+            Box::new(move |args: &[&str]| {
+                if args == ["nginx", "-t"] {
+                    anyhow::bail!("spawn fail")
+                } else {
+                    Ok(CmdOutput {
+                        success: true,
+                        stderr: String::new(),
+                    })
+                }
+            }),
+        );
+        let result = be.apply("BAD");
+        assert!(result.is_err());
+        // Last-good config is restored, not left as the new unvalidated content.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "GOOD");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_failure_with_no_existing_file_removes_written_file() {
+        let path = temp_conf();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let be = NginxBackend::with_runner(
+            path.clone(),
+            vec!["systemctl".into(), "reload".into(), "nginx".into()],
+            runner(false, true, calls.clone()),
+        );
+        let out = be.apply("BAD").unwrap();
+        assert!(!out.validated && !out.reloaded);
+        // No backup existed, so the unvalidated file is removed rather than restored.
+        assert!(!path.exists());
+        assert_eq!(*calls.lock().unwrap(), vec!["nginx -t".to_string()]);
         let _ = std::fs::remove_file(&path);
     }
 }
