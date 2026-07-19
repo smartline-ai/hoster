@@ -2,6 +2,10 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
+
+use crate::certs::write_atomic;
+
 /// One wildcard base (or plain control hostname) served by nginx, with the
 /// on-disk cert it presents. `cert_path` and `key_path` may be the same
 /// combined PEM (hoster stores chain+key together in one `cert.pem`).
@@ -80,6 +84,81 @@ fn https_block(b: &NginxBase, upstream: &str) -> String {
     )
 }
 
+pub struct CmdOutput {
+    pub success: bool,
+    pub stderr: String,
+}
+
+/// Runs one external command (argv slice) and reports success + captured
+/// stderr. The seam that lets tests drive `apply` without a real nginx —
+/// mirrors `Engine::with_dns_provider_builder`.
+pub type CommandRunner = Box<dyn Fn(&[&str]) -> anyhow::Result<CmdOutput> + Send + Sync>;
+
+pub struct ApplyOutcome {
+    pub validated: bool,
+    pub reloaded: bool,
+    /// Captured stderr from `nginx -t` or the reload command, when either failed.
+    pub message: Option<String>,
+}
+
+pub struct NginxBackend {
+    conf_path: PathBuf,
+    reload_cmd: Vec<String>,
+    runner: CommandRunner,
+}
+
+fn real_runner(args: &[&str]) -> anyhow::Result<CmdOutput> {
+    let (cmd, rest) = args.split_first().context("empty command")?;
+    let out = std::process::Command::new(cmd)
+        .args(rest)
+        .output()
+        .with_context(|| format!("spawn {cmd}"))?;
+    Ok(CmdOutput {
+        success: out.status.success(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+impl NginxBackend {
+    pub fn new(conf_path: PathBuf, reload_cmd: Vec<String>) -> NginxBackend {
+        NginxBackend { conf_path, reload_cmd, runner: Box::new(real_runner) }
+    }
+
+    #[cfg(test)]
+    pub fn with_runner(conf_path: PathBuf, reload_cmd: Vec<String>, runner: CommandRunner) -> NginxBackend {
+        NginxBackend { conf_path, reload_cmd, runner }
+    }
+
+    /// Write `config`, validate with `nginx -t`, and reload on success.
+    /// A failed validate restores the previous file and never reloads.
+    pub fn apply(&self, config: &str) -> anyhow::Result<ApplyOutcome> {
+        let backup = std::fs::read(&self.conf_path).ok();
+        write_atomic(&self.conf_path, config.as_bytes(), 0o644)
+            .with_context(|| format!("write {}", self.conf_path.display()))?;
+
+        let validate = (self.runner)(&["nginx", "-t"])?;
+        if !validate.success {
+            match &backup {
+                Some(bytes) => {
+                    let _ = write_atomic(&self.conf_path, bytes, 0o644);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.conf_path);
+                }
+            }
+            return Ok(ApplyOutcome { validated: false, reloaded: false, message: Some(validate.stderr) });
+        }
+
+        let reload_refs: Vec<&str> = self.reload_cmd.iter().map(String::as_str).collect();
+        let reload = (self.runner)(&reload_refs)?;
+        Ok(ApplyOutcome {
+            validated: true,
+            reloaded: reload.success,
+            message: if reload.success { None } else { Some(reload.stderr) },
+        })
+    }
+}
+
 #[cfg(test)]
 mod render_tests {
     use super::*;
@@ -135,5 +214,84 @@ mod render_tests {
         assert!(!out.contains("evil.com"), "{out}");
         assert!(out.contains("server_name .dev.example.com;"), "{out}");
         assert!(out.contains("listen 443 ssl;"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn temp_conf() -> PathBuf {
+        // A unique, non-existent path per test (no Date/rand available: use ptr).
+        let n = Box::into_raw(Box::new(0u8)) as usize;
+        std::env::temp_dir().join(format!("hoster-nginx-{n}.conf"))
+    }
+
+    /// A runner that records invoked argv and returns canned results keyed by
+    /// the first arg ("nginx" for validate, anything else for reload).
+    fn runner(validate_ok: bool, reload_ok: bool, calls: Arc<Mutex<Vec<String>>>) -> CommandRunner {
+        Box::new(move |args: &[&str]| {
+            calls.lock().unwrap().push(args.join(" "));
+            let is_validate = args == ["nginx", "-t"];
+            let ok = if is_validate { validate_ok } else { reload_ok };
+            Ok(CmdOutput {
+                success: ok,
+                stderr: if ok { String::new() } else { "boom".into() },
+            })
+        })
+    }
+
+    #[test]
+    fn happy_path_writes_validates_then_reloads() {
+        let path = temp_conf();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let be = NginxBackend::with_runner(
+            path.clone(),
+            vec!["systemctl".into(), "reload".into(), "nginx".into()],
+            runner(true, true, calls.clone()),
+        );
+        let out = be.apply("CONFIG-A").unwrap();
+        assert!(out.validated && out.reloaded);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "CONFIG-A");
+        let c = calls.lock().unwrap();
+        assert_eq!(c[0], "nginx -t");
+        assert_eq!(c[1], "systemctl reload nginx");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_failure_restores_backup_and_does_not_reload() {
+        let path = temp_conf();
+        crate::certs::write_atomic(&path, b"GOOD", 0o644).unwrap();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let be = NginxBackend::with_runner(
+            path.clone(),
+            vec!["systemctl".into(), "reload".into(), "nginx".into()],
+            runner(false, true, calls.clone()),
+        );
+        let out = be.apply("BAD").unwrap();
+        assert!(!out.validated && !out.reloaded);
+        assert_eq!(out.message.as_deref(), Some("boom"));
+        // Last-good config is restored; no reload was attempted.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "GOOD");
+        assert_eq!(*calls.lock().unwrap(), vec!["nginx -t".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reload_failure_is_surfaced_but_config_stays() {
+        let path = temp_conf();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let be = NginxBackend::with_runner(
+            path.clone(),
+            vec!["systemctl".into(), "reload".into(), "nginx".into()],
+            runner(true, false, calls.clone()),
+        );
+        let out = be.apply("CONFIG-B").unwrap();
+        assert!(out.validated && !out.reloaded);
+        assert_eq!(out.message.as_deref(), Some("boom"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "CONFIG-B");
+        let _ = std::fs::remove_file(&path);
     }
 }
