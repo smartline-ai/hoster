@@ -493,15 +493,21 @@ fn handle_acme_status<R: ContainerRuntime>(
 /// six hours — longer, because the domain has accumulated backoff from the
 /// failures the missing configuration caused — while the dashboard shows
 /// `failed: ACME is not configured` with no way to retry. The triggered pass
-/// clears that accumulated backoff (see [`renewal::clear_backoff`]); failures
-/// *after* the trigger back off as usual, so this cannot be used to hammer
-/// Let's Encrypt.
+/// clears backoff accumulated *before* the trigger (see
+/// [`renewal::clear_backoff`]); a failure recorded at or after the trigger
+/// keeps its backoff. What actually stops this from being used to hammer
+/// Let's Encrypt is the combination of that cutoff with a floor on how often
+/// a trigger is even accepted — a request that lands too soon after the last
+/// one is rejected with how long to wait, below.
 fn handle_acme_renew<R: ContainerRuntime>(engine: &Engine<R>) -> Response<ApiBody> {
     match engine.renewal_trigger() {
-        Some(trigger) => {
-            trigger.request();
-            text(StatusCode::ACCEPTED, "renewal pass requested")
-        }
+        Some(trigger) => match trigger.request(renewal::now_secs()) {
+            Ok(()) => text(StatusCode::ACCEPTED, "renewal pass requested"),
+            Err(wait_secs) => text_owned(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("a renewal pass was requested too recently; try again in {wait_secs}s"),
+            ),
+        },
         // No renewal loop is running, so there is nothing to trigger; saying
         // "accepted" would be a lie.
         None => text(
@@ -937,10 +943,19 @@ async fn ui_acme<R: ContainerRuntime>(
 
     // The dashboard's "Retry now" button — the same trigger as
     // `POST /acme/renew`, so an operator who has just pasted a token in this
-    // very form doesn't have to wait for the next scheduled pass.
+    // very form doesn't have to wait for the next scheduled pass. A request
+    // that lands too soon after the last one is rejected (see
+    // [`renewal::RenewalTrigger::request`]); that rejection is shown rather
+    // than silently swallowed, so clicking twice doesn't look like nothing
+    // happened.
     if sub == "renew" {
-        if let Some(trigger) = engine.renewal_trigger() {
-            trigger.request();
+        if let Some(trigger) = engine.renewal_trigger()
+            && let Err(wait_secs) = trigger.request(renewal::now_secs())
+        {
+            return text_owned(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("a renewal pass was requested too recently; try again in {wait_secs}s"),
+            );
         }
         return redirect("/");
     }

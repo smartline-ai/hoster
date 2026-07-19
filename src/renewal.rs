@@ -21,6 +21,19 @@ const MAX_BACKOFF_SECS: i64 = 24 * 3600;
 /// cadence for a newly configured domain reasonable.
 const PASS_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 
+/// The minimum time between manual passes.
+///
+/// Let's Encrypt permits five failed validations per identifier per hour.
+/// `clear_backoff`'s cutoff already stops a trigger from erasing a failure
+/// recorded after it, but nothing about that stops an operator from simply
+/// clicking "Retry now" in a tight loop — each click still gets to attempt
+/// issuance again as soon as it lands. This floor bounds how often a
+/// trigger is even accepted, independent of `clear_backoff`: one trigger
+/// every 20 minutes allows at most four manual passes in any rolling hour,
+/// comfortably under the five-per-hour cap even before counting whatever
+/// the automatic six-hourly pass does in the same window.
+const MIN_MANUAL_INTERVAL_SECS: i64 = 20 * 60;
+
 /// When a domain may next be attempted, given how many times it has failed.
 ///
 /// Backoff is a correctness requirement, not politeness: Let's Encrypt permits
@@ -75,6 +88,12 @@ pub fn wanted_domains(store: &Store, default_template: &str) -> Vec<String> {
 #[derive(Clone, Default)]
 pub struct RenewalTrigger {
     notify: Arc<tokio::sync::Notify>,
+    /// When the most recently *accepted* trigger arrived (Unix seconds).
+    /// Read for two purposes: gating [`MIN_MANUAL_INTERVAL_SECS`] against the
+    /// next request, and — by `run_loop` — as the cutoff [`clear_backoff`]
+    /// uses to tell a failure that predates the trigger from one that
+    /// doesn't.
+    last_accepted: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
 impl RenewalTrigger {
@@ -82,10 +101,30 @@ impl RenewalTrigger {
         Self::default()
     }
 
-    /// Ask for a pass. Never blocks, and is safe to call when no loop is
-    /// running (the permit is simply never consumed).
-    pub fn request(&self) {
+    /// Ask for a pass at time `now`. Never blocks, and is safe to call when
+    /// no loop is running (the permit is simply never consumed).
+    ///
+    /// Rejects the request with `Err(seconds remaining)` if a trigger already
+    /// landed within [`MIN_MANUAL_INTERVAL_SECS`] of `now` — see that
+    /// constant for why the floor exists. `Ok(())` means the pass was queued.
+    pub fn request(&self, now: i64) -> Result<(), i64> {
+        let mut last = self.last_accepted.lock().unwrap();
+        if let Some(prev) = *last {
+            let elapsed = now - prev;
+            if elapsed < MIN_MANUAL_INTERVAL_SECS {
+                return Err(MIN_MANUAL_INTERVAL_SECS - elapsed);
+            }
+        }
+        *last = Some(now);
+        drop(last);
         self.notify.notify_one();
+        Ok(())
+    }
+
+    /// When the most recently accepted trigger arrived, for `run_loop` to use
+    /// as [`clear_backoff`]'s cutoff on the pass that trigger causes.
+    fn last_accepted_at(&self) -> Option<i64> {
+        *self.last_accepted.lock().unwrap()
     }
 
     /// Resolve when a pass has been requested.
@@ -94,15 +133,22 @@ impl RenewalTrigger {
     }
 }
 
-/// Forget the accumulated backoff for `domains`.
+/// Forget backoff for `domains` accumulated *before* `cutoff`.
 ///
-/// Used only on a manually triggered pass: those failures were caused by the
-/// configuration the operator has just changed, so continuing to honour their
-/// backoff would make the retry they asked for do nothing. Failures that
-/// happen *after* the trigger accumulate backoff as usual — Let's Encrypt's
-/// rate limits do not care why we retried.
-pub fn clear_backoff(state: &mut BTreeMap<String, DomainState>, domains: &[String]) {
-    state.retain(|domain, _| !domains.iter().any(|d| d == domain));
+/// Used only on a manually triggered pass, with `cutoff` set to when that
+/// trigger was accepted: failures recorded before then were caused by the
+/// configuration the operator has just changed, so continuing to honour
+/// their backoff would make the retry they asked for do nothing.
+///
+/// A failure whose `last_attempt` is at or after `cutoff` is left alone —
+/// whether it came from the pass this very trigger causes, from a pass
+/// already in flight when the trigger arrived, or from a later trigger's
+/// pass. A trigger forgives the past; it cannot pre-forgive whatever happens
+/// from its own moment onward, so repeated triggering cannot use this
+/// function to erase backoff faster than [`MIN_MANUAL_INTERVAL_SECS`]
+/// already limits it.
+pub fn clear_backoff(state: &mut BTreeMap<String, DomainState>, domains: &[String], cutoff: i64) {
+    state.retain(|domain, st| !domains.iter().any(|d| d == domain) || st.last_attempt >= cutoff);
 }
 
 /// Per-domain failure state, for backoff and for display.
@@ -255,8 +301,14 @@ pub async fn run_loop(
         let domains = wanted();
         if manual {
             // The operator asked for this pass, having just changed the
-            // configuration the previous failures were caused by.
-            clear_backoff(&mut state, &domains);
+            // configuration the previous failures were caused by. Only
+            // failures that predate the trigger are forgiven — see
+            // `clear_backoff` for why a failure at or after it is kept.
+            // `last_accepted_at` should always be `Some` here (`manual` is
+            // only ever set by a successful `request`), but `now_secs`
+            // (clearing nothing new) is a safe fallback if it's ever not.
+            let cutoff = trigger.last_accepted_at().unwrap_or_else(now_secs);
+            clear_backoff(&mut state, &domains, cutoff);
         }
         let now = now_secs();
         state = run_once(issuer.as_ref(), &store, &shared, &domains, state, now).await;
@@ -378,9 +430,82 @@ mod tests {
                 last_error: Some("nope".into()),
             },
         );
-        clear_backoff(&mut state, &["*.dev.example.com".to_string()]);
+        clear_backoff(&mut state, &["*.dev.example.com".to_string()], 2000);
         assert!(!state.contains_key("*.dev.example.com"));
         assert_eq!(state["other.example.com"].failures, 2);
+    }
+
+    /// The straightforward case: a trigger accepted well after a failure
+    /// forgives it.
+    #[test]
+    fn a_manual_trigger_clears_backoff_from_a_failure_that_predates_it() {
+        let mut state = BTreeMap::new();
+        state.insert(
+            "*.dev.example.com".to_string(),
+            DomainState {
+                failures: 3,
+                last_attempt: 1000,
+                last_error: Some("ACME is not configured".into()),
+            },
+        );
+        // The trigger was accepted at 2000, well after the 1000 failure.
+        clear_backoff(&mut state, &["*.dev.example.com".to_string()], 2000);
+        assert!(!state.contains_key("*.dev.example.com"));
+    }
+
+    /// The bug this fix is for: `run_loop` used to call `clear_backoff`
+    /// unconditionally at the top of every manual pass, so a failure
+    /// recorded by one triggered pass was wiped by the next trigger's clear
+    /// regardless of timing. A cutoff fixes that — a failure at or after the
+    /// trigger's own moment must survive. Against the pre-fix
+    /// `clear_backoff(state, domains)`, which had no cutoff and always
+    /// removed matching domains, this case did not exist as a distinguishable
+    /// state at all: there was no way to tell "before" from "after", so the
+    /// entry was always erased. Run against today's fixed signature, this is
+    /// the assertion that would have failed before the cutoff existed.
+    #[test]
+    fn a_manual_trigger_does_not_clear_backoff_from_a_failure_recorded_after_it() {
+        let mut state = BTreeMap::new();
+        state.insert(
+            "*.dev.example.com".to_string(),
+            DomainState {
+                failures: 1,
+                last_attempt: 1500,
+                last_error: Some("still wrong token".into()),
+            },
+        );
+        // The trigger was accepted at 1000; the failure at 1500 happened
+        // after it (e.g. from a pass already in flight when the trigger
+        // arrived), so it must not be erased.
+        clear_backoff(&mut state, &["*.dev.example.com".to_string()], 1000);
+        assert!(
+            state.contains_key("*.dev.example.com"),
+            "a failure recorded after the trigger must keep its backoff"
+        );
+        assert_eq!(state["*.dev.example.com"].failures, 1);
+    }
+
+    #[test]
+    fn repeated_manual_triggers_within_the_minimum_interval_are_rejected() {
+        let trigger = RenewalTrigger::new();
+        trigger
+            .request(1000)
+            .expect("the first trigger is always accepted");
+        let wait = trigger
+            .request(1000 + MIN_MANUAL_INTERVAL_SECS - 1)
+            .expect_err("a trigger inside the minimum interval must be rejected");
+        assert_eq!(wait, 1, "the rejection must name exactly how long remains");
+    }
+
+    #[test]
+    fn a_manual_trigger_after_the_interval_elapses_is_accepted() {
+        let trigger = RenewalTrigger::new();
+        trigger
+            .request(1000)
+            .expect("the first trigger is always accepted");
+        trigger
+            .request(1000 + MIN_MANUAL_INTERVAL_SECS)
+            .expect("a trigger at exactly the minimum interval must be accepted");
     }
 
     /// Clearing backoff is what actually makes a manual retry do something:
@@ -404,8 +529,9 @@ mod tests {
         assert!(!cert_file.exists(), "issuance should have been skipped");
         assert_eq!(state["a.example.com"].failures, 1);
 
-        // A manual trigger clears the backoff, so the same instant succeeds.
-        clear_backoff(&mut state, &wanted);
+        // A manual trigger accepted at 60 clears the backoff (the failure at
+        // 0 predates it), so the same instant succeeds.
+        clear_backoff(&mut state, &wanted, 60);
         let state = run_once(&AlwaysSucceeds, &store, &shared, &wanted, state, 60).await;
         assert!(!state.contains_key("a.example.com"));
         assert!(cert_file.exists(), "the retry should have issued");
@@ -416,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn a_trigger_fired_before_the_wait_is_not_lost() {
         let trigger = RenewalTrigger::new();
-        trigger.request();
+        trigger.request(0).unwrap();
         tokio::time::timeout(Duration::from_secs(1), trigger.wait())
             .await
             .expect("a requested pass must be observed by the next wait");
@@ -429,7 +555,7 @@ mod tests {
         let waiter = trigger.clone();
         let handle = tokio::spawn(async move { waiter.wait().await });
         tokio::task::yield_now().await;
-        trigger.request();
+        trigger.request(0).unwrap();
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
             .expect("wait should have been woken")
