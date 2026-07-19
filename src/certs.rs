@@ -146,6 +146,15 @@ fn validate_domain(domain: &str) -> anyhow::Result<()> {
     if std::path::Path::new(domain).is_absolute() {
         anyhow::bail!("domain {domain:?} is not safe to store on disk");
     }
+
+    // Structural check: reject domains that resolve to the store root itself.
+    // This guards against edge cases like "." or ".." that pass the above checks
+    // but would map to the root or its parent.
+    let escaped = domain.replace('_', "__").replace('*', "_wildcard_");
+    if escaped == "." || escaped == ".." {
+        anyhow::bail!("domain {domain:?} is not safe to store on disk");
+    }
+
     Ok(())
 }
 
@@ -489,5 +498,65 @@ mod tests {
         // directory some other process left behind.
         std::fs::remove_file(store.dir_for("*.dev.example.com").join("domain")).unwrap();
         assert!(store.load_all(now_ts()).is_empty());
+    }
+
+    #[test]
+    fn save_rejects_a_single_dot_domain() {
+        let root = temp_dir();
+        let store = CertStore::new(root.clone());
+        let (chain, key, _) = self_signed("dev.example.com", 3600);
+
+        let result = store.save(".", &chain, &key);
+        assert!(result.is_err(), "domain '.' should be rejected");
+
+        // Verify nothing was written to the store root.
+        assert!(
+            !root.join("cert.pem").exists(),
+            "cert.pem should not exist in store root"
+        );
+        assert!(
+            !root.join("domain").exists(),
+            "domain file should not exist in store root"
+        );
+    }
+
+    #[test]
+    fn save_rejects_a_double_dot_domain() {
+        let root = temp_dir();
+        let store = CertStore::new(root.clone());
+        let (chain, key, _) = self_signed("dev.example.com", 3600);
+
+        let result = store.save("..", &chain, &key);
+        assert!(result.is_err(), "domain '..' should be rejected");
+
+        // Verify nothing was written to the store root.
+        assert!(
+            !root.join("cert.pem").exists(),
+            "cert.pem should not exist in store root"
+        );
+        assert!(
+            !root.join("domain").exists(),
+            "domain file should not exist in store root"
+        );
+    }
+
+    #[test]
+    fn save_rejects_a_slash_dot_slash_dot_domain() {
+        let root = temp_dir();
+        let store = CertStore::new(root.clone());
+        let (chain, key, _) = self_signed("dev.example.com", 3600);
+
+        let result = store.save("./.", &chain, &key);
+        assert!(result.is_err(), "domain './.' should be rejected");
+
+        // Verify nothing was written to the store root.
+        assert!(
+            !root.join("cert.pem").exists(),
+            "cert.pem should not exist in store root"
+        );
+        assert!(
+            !root.join("domain").exists(),
+            "domain file should not exist in store root"
+        );
     }
 }
