@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use hoster::acme::{CertIssuer, IssuedCert, Issuer};
 use hoster::certs::CertStore;
-use hoster::dns::{CloudflareProvider, DnsProvider};
 use hoster::docker::DockerRuntime;
 use hoster::engine::Engine;
 use hoster::proxy::serve;
@@ -36,6 +35,7 @@ fn env_flag(key: &str) -> bool {
 /// with an error, which the loop's backoff absorbs — until it is configured.
 struct StoreIssuer {
     store: Arc<Store>,
+    settings: Arc<Settings>,
     account_path: PathBuf,
     production: bool,
 }
@@ -49,17 +49,21 @@ impl CertIssuer for StoreIssuer {
             .store
             .acme_config()
             .ok_or_else(|| anyhow::anyhow!("ACME is not configured (no account email)"))?;
-        let provider = cfg
-            .provider
-            .ok_or_else(|| anyhow::anyhow!("ACME has no DNS provider credentials configured"))?;
-        if provider.kind != "cloudflare" {
-            anyhow::bail!("unsupported DNS provider {:?}", provider.kind);
+        // Resolved per domain rather than once globally: a project with its
+        // own DNS provider override wins for the base it owns, and only
+        // falls back to the global default (or errors) otherwise — see
+        // `Store::dns_provider_for`.
+        let provider_cfg = self
+            .store
+            .dns_provider_for(domain, &self.settings.hostname_template)
+            .ok_or_else(|| anyhow::anyhow!("no DNS provider configured for {domain}"))?;
+        if provider_cfg.kind == "manual" {
+            anyhow::bail!(
+                "{domain} uses the manual DNS provider; hoster cannot answer its DNS-01 challenge"
+            );
         }
-        let token = provider
-            .token
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("cloudflare provider missing token"))?;
-        let dns: Arc<dyn DnsProvider> = Arc::new(CloudflareProvider::new(token));
+        let client_ip = self.settings.public_ip.clone().unwrap_or_default();
+        let dns = hoster::dns::build_provider(&provider_cfg, &client_ip)?;
         let issuer = Issuer::new(self.account_path.clone(), cfg.email, dns);
         let issuer = if self.production {
             issuer.use_production()
@@ -259,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
 
         let issuer: Arc<dyn CertIssuer> = Arc::new(StoreIssuer {
             store: store.clone(),
+            settings: settings.clone(),
             account_path: PathBuf::from(env_or(
                 "HOSTER_ACME_ACCOUNT_FILE",
                 "/var/lib/hoster/acme-account.json",
@@ -313,5 +318,139 @@ async fn main() -> anyhow::Result<()> {
         r = api => r.context("api task panicked")?,
         r = https => r,
         r = renewal_task => r,
+    }
+}
+
+#[cfg(test)]
+mod store_issuer_tests {
+    use super::*;
+    use hoster::secrets::DnsProviderConfig;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A unique, non-existent store path per test, so parallel test runs
+    /// never share (or race on) a projects.json file.
+    fn temp_store_path() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "hoster-main-store-issuer-test-{}-{n}.json",
+            std::process::id()
+        ))
+    }
+
+    fn test_settings() -> Arc<Settings> {
+        Arc::new(Settings {
+            listen: "127.0.0.1:0".into(),
+            api_listen: "127.0.0.1:0".into(),
+            hostname_template: "{service}-{branch}.dev.example.com".into(),
+            registry: String::new(),
+            token: "t".into(),
+            dashboard_password: None,
+            https_listen: None,
+            cert_dir: "/tmp".into(),
+            public_ip: None,
+        })
+    }
+
+    fn store_issuer(store: Store) -> StoreIssuer {
+        StoreIssuer {
+            store: Arc::new(store),
+            settings: test_settings(),
+            account_path: PathBuf::from("/tmp/hoster-main-test-account.json"),
+            production: false,
+        }
+    }
+
+    /// `Result::unwrap_err` requires `T: Debug`, which `IssuedCert`
+    /// deliberately does not implement (it carries a private key). Extract
+    /// the error by hand instead of deriving `Debug` onto certificate
+    /// material just to satisfy a test helper.
+    fn expect_err(result: anyhow::Result<IssuedCert>) -> anyhow::Error {
+        match result {
+            Ok(_) => panic!("expected an error, got a successfully issued certificate"),
+            Err(e) => e,
+        }
+    }
+
+    // Both cases below resolve (or fail to resolve) a DNS provider before
+    // `Issuer::issue_cert` is ever reached, so neither one touches the
+    // network — the manual-bail and no-provider-configured paths return
+    // straight out of `StoreIssuer::issue` per-domain resolution.
+
+    #[tokio::test]
+    async fn issue_bails_clearly_for_a_manually_managed_domain() {
+        let store = Store::load(temp_store_path()).unwrap();
+        store.set_acme_config("ops@example.com", None).unwrap();
+        store
+            .set_dns_provider(DnsProviderConfig {
+                kind: "manual".into(),
+                token: None,
+                api_user: None,
+                api_key: None,
+                username: None,
+            })
+            .unwrap();
+        let issuer = store_issuer(store);
+
+        let err = expect_err(issuer.issue("*.dev.example.com").await);
+        assert!(
+            err.to_string().contains("manual"),
+            "error should name the manual DNS provider: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_errors_clearly_when_no_dns_provider_is_configured() {
+        let store = Store::load(temp_store_path()).unwrap();
+        store.set_acme_config("ops@example.com", None).unwrap();
+        let issuer = store_issuer(store);
+
+        let err = expect_err(issuer.issue("*.dev.example.com").await);
+        assert!(
+            err.to_string().contains("no DNS provider"),
+            "error should say no provider is configured: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_resolves_the_projects_own_provider_over_the_global_default() {
+        // Exercises the per-domain resolution end to end up to (but not
+        // including) the network call: the project "alpha" has its own
+        // manual override, so its base must bail with the manual error even
+        // though the global default below is a non-manual kind.
+        let store = Store::load(temp_store_path()).unwrap();
+        store.set_acme_config("ops@example.com", None).unwrap();
+        store
+            .set_dns_provider(DnsProviderConfig {
+                kind: "hetzner".into(),
+                token: Some("global-token".into()),
+                api_user: None,
+                api_key: None,
+                username: None,
+            })
+            .unwrap();
+        store
+            .set_hostname_template("alpha", "{service}-{branch}.alpha.example.com")
+            .unwrap();
+        store
+            .set_project_dns_provider(
+                "alpha",
+                DnsProviderConfig {
+                    kind: "manual".into(),
+                    token: None,
+                    api_user: None,
+                    api_key: None,
+                    username: None,
+                },
+            )
+            .unwrap();
+        let issuer = store_issuer(store);
+
+        let err = expect_err(issuer.issue("*.alpha.example.com").await);
+        assert!(
+            err.to_string().contains("manual"),
+            "alpha's own manual override should win over the global hetzner default: {err}"
+        );
     }
 }
