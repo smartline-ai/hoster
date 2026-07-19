@@ -219,11 +219,29 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(NetworkReadiness::default()),
         store.clone(),
     );
-    let engine = Arc::new(if settings.https_listen.is_some() {
-        engine.with_renewal_trigger(renewal_trigger.clone())
-    } else {
-        engine
-    });
+
+    let nginx_mode = matches!(settings.proxy_mode, ProxyMode::Nginx);
+    // hoster serves TLS itself only in standalone mode; nginx mode ignores
+    // HOSTER_HTTPS_LISTEN and lets nginx own :443.
+    let tls_serve = settings.https_listen.is_some() && !nginx_mode;
+    // Certs are still issued in nginx mode — nginx serves them.
+    let issue_certs = tls_serve || nginx_mode;
+    if nginx_mode && settings.https_listen.is_some() {
+        tracing::info!("nginx mode: ignoring HOSTER_HTTPS_LISTEN (nginx terminates TLS)");
+    }
+    let nginx_status: hoster::nginx::NginxStatusHandle =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    let engine = {
+        let mut e = engine;
+        if issue_certs {
+            e = e.with_renewal_trigger(renewal_trigger.clone());
+        }
+        if nginx_mode {
+            e = e.with_nginx_status(nginx_status.clone());
+        }
+        Arc::new(e)
+    };
 
     // One session table shared by both listeners, so a dashboard login on the
     // control hostname is the same session as one on `api_listen`.
@@ -243,27 +261,36 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(proxy = %settings.listen, api = %settings.api_listen, "hoster up");
 
-    // TLS is entirely opt-in. With `HOSTER_HTTPS_LISTEN` unset there is no
-    // listener, no renewal loop, and no issuance, so upgrading an existing
-    // install changes nothing.
+    // TLS/cert issuance is entirely opt-in. In standalone mode with
+    // `HOSTER_HTTPS_LISTEN` unset there is no listener, no renewal loop, and
+    // no issuance, so upgrading an existing install changes nothing. In nginx
+    // mode hoster never binds `:443` itself — nginx terminates TLS — but it
+    // still issues certificates and drives nginx's config.
     let mut https: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
     let mut renewal_task: Option<tokio::task::JoinHandle<()>> = None;
-    if let Some(addr) = settings.https_listen.clone() {
+    if issue_certs {
         let cert_store = Arc::new(CertStore::new(PathBuf::from(&settings.cert_dir)));
         let now = renewal::now_secs();
         let shared = SharedCerts::new(CertResolver::from_certs(&cert_store.load_all(now))?);
 
-        let https_listener = TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("bind https {addr}"))?;
-        https = Some(tokio::spawn(serve_https(
-            https_listener,
-            shared.clone(),
-            routes.clone(),
-            engine.clone(),
-            settings.clone(),
-            sessions.clone(),
-        )));
+        // hoster terminates TLS itself only in standalone mode.
+        if tls_serve {
+            let addr = settings
+                .https_listen
+                .clone()
+                .expect("tls_serve implies https_listen");
+            let https_listener = TcpListener::bind(&addr)
+                .await
+                .with_context(|| format!("bind https {addr}"))?;
+            https = Some(tokio::spawn(serve_https(
+                https_listener,
+                shared.clone(),
+                routes.clone(),
+                engine.clone(),
+                settings.clone(),
+                sessions.clone(),
+            )));
+        }
 
         let issuer: Arc<dyn CertIssuer> = Arc::new(StoreIssuer {
             store: store.clone(),
@@ -285,12 +312,45 @@ async fn main() -> anyhow::Result<()> {
         let default_template = settings.hostname_template.clone();
         let wanted = move || renewal::wanted_domains(&wanted_store, &default_template);
 
+        // nginx mode: build the manager, apply once now, and re-apply on
+        // rotation via the renewal loop's `on_change` hook. Standalone passes
+        // `None`, so the loop behaves exactly as it did before.
+        let on_change: Option<Arc<dyn Fn() + Send + Sync>> = if nginx_mode {
+            let backend = hoster::nginx::NginxBackend::new(
+                PathBuf::from(&settings.nginx_conf_path),
+                settings
+                    .nginx_reload_cmd
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+            );
+            let wanted_for_mgr = {
+                let s = store.clone();
+                let t = settings.hostname_template.clone();
+                Box::new(move || renewal::wanted_domains(&s, &t))
+                    as Box<dyn Fn() -> Vec<String> + Send + Sync>
+            };
+            let manager = Arc::new(hoster::nginx::NginxManager::new(
+                backend,
+                cert_store.clone(),
+                wanted_for_mgr,
+                settings.listen.clone(),
+                nginx_status.clone(),
+            ));
+            manager.apply_now(); // startup apply (non-fatal: records status, logs on failure)
+            let mgr = manager.clone();
+            Some(Arc::new(move || mgr.apply_now()))
+        } else {
+            None
+        };
+
         renewal_task = Some(tokio::spawn(renewal::run_loop(
             issuer,
             cert_store,
             shared,
             wanted,
             renewal_trigger.clone(),
+            on_change,
         )));
     }
 

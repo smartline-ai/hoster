@@ -105,6 +105,9 @@ pub struct Engine<R: ContainerRuntime> {
     /// here because the engine is the shared state the control API already
     /// holds, and the control API is what exposes the trigger.
     renewal_trigger: Option<crate::renewal::RenewalTrigger>,
+    /// Status handle for the nginx reverse-proxy manager, so the control API
+    /// can report the last apply. `None` outside nginx mode.
+    nginx_status: Option<crate::nginx::NginxStatusHandle>,
     /// Dedup cache for `ensure_wildcard_dns`: wildcard base -> the public IP
     /// it was last successfully pointed at. Lets repeated deploys of the same
     /// project (e.g. its next branch) skip the redundant provider call, while
@@ -146,6 +149,7 @@ impl<R: ContainerRuntime> Engine<R> {
             urls: Mutex::new(BTreeMap::new()),
             swap_lock: tokio::sync::Mutex::new(()),
             renewal_trigger: None,
+            nginx_status: None,
             ensured_dns: Mutex::new(HashMap::new()),
             dns_provider_builder: Box::new(crate::dns::build_provider),
         }
@@ -179,6 +183,18 @@ impl<R: ContainerRuntime> Engine<R> {
     /// The renewal trigger, if a renewal loop is running.
     pub fn renewal_trigger(&self) -> Option<&crate::renewal::RenewalTrigger> {
         self.renewal_trigger.as_ref()
+    }
+
+    /// Attach the nginx manager's status handle. Called only in nginx mode,
+    /// where a manager exists to record applies.
+    pub fn with_nginx_status(mut self, h: crate::nginx::NginxStatusHandle) -> Self {
+        self.nginx_status = Some(h);
+        self
+    }
+
+    /// The nginx apply-status handle, if running in nginx mode.
+    pub fn nginx_status(&self) -> Option<&crate::nginx::NginxStatusHandle> {
+        self.nginx_status.as_ref()
     }
 
     /// The project environment store, for the control API's project routes.
