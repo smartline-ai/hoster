@@ -35,6 +35,15 @@ pub struct IssuedCert {
 }
 
 /// Issues certificates from an ACME directory using DNS-01.
+///
+/// Defaults to the Let's Encrypt **staging** directory. Staging certificates
+/// are **not trusted by browsers or other standard TLS clients** — they chain
+/// to a distinct root kept only for testing — so a successful staging
+/// issuance visibly proves the whole DNS-01 flow works end-to-end before
+/// production is switched on. Call [`Issuer::use_production`] to opt into the
+/// production directory, where mistakes are expensive: only 5 authorization
+/// failures per identifier per hour, and 5 duplicate certificates per
+/// identical name set per week.
 pub struct Issuer {
     account_credentials_path: PathBuf,
     email: String,
@@ -44,7 +53,9 @@ pub struct Issuer {
 }
 
 impl Issuer {
-    /// An issuer against the Let's Encrypt production directory.
+    /// An issuer against the Let's Encrypt **staging** directory (the safe
+    /// default — see the type-level docs). Call [`Issuer::use_production`]
+    /// once the flow has been proven here.
     pub fn new(
         account_credentials_path: PathBuf,
         email: String,
@@ -54,15 +65,18 @@ impl Issuer {
             account_credentials_path,
             email,
             dns,
-            directory_url: LetsEncrypt::Production.url().to_string(),
+            directory_url: LetsEncrypt::Staging.url().to_string(),
             propagation_timeout: DEFAULT_PROPAGATION_TIMEOUT,
         }
     }
 
-    /// Point at another ACME directory — Let's Encrypt *staging* for manual
-    /// end-to-end verification, where the rate limits are far more forgiving.
-    pub fn with_directory_url(mut self, url: String) -> Self {
-        self.directory_url = url;
+    /// Opt into the Let's Encrypt **production** directory. Only call this
+    /// once DNS-01 issuance has been verified end-to-end against staging
+    /// (the default): production allows just 5 authorization failures per
+    /// identifier per hour, and 5 duplicate certificates per identical name
+    /// set per week, so a wiring mistake here is expensive to wait out.
+    pub fn use_production(mut self) -> Self {
+        self.directory_url = LetsEncrypt::Production.url().to_string();
         self
     }
 
@@ -205,17 +219,39 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
+
+    // `mode(0o600)` below only takes effect when the `open` call actually
+    // creates the file. A `.tmp` left behind by a crashed run — with
+    // whatever permissions it happened to have — would otherwise be reused
+    // as-is. Removing it first guarantees the open always creates a fresh
+    // file, so the mode always applies.
+    let _ = std::fs::remove_file(&tmp);
+
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&tmp)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, path)?;
+
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    // On any failure below, remove the temp file rather than leave key
+    // material sitting at a well-known path outside the intended location.
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -263,6 +299,17 @@ pub async fn wait_for_txt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_path(name: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "hoster-acme-test-{}-{n}-{name}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn challenge_name_is_prefixed_and_stripped_of_the_wildcard() {
@@ -302,6 +349,53 @@ mod tests {
                 "_acme-challenge.dev.example.com".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn issuer_defaults_to_staging_and_production_requires_opt_in() {
+        use crate::dns::FakeDns;
+
+        let staging = Issuer::new(
+            temp_path("account-staging.json"),
+            "ops@example.com".to_string(),
+            Arc::new(FakeDns::new()) as Arc<dyn DnsProvider>,
+        );
+        assert_eq!(staging.directory_url, LetsEncrypt::Staging.url());
+
+        let production = Issuer::new(
+            temp_path("account-production.json"),
+            "ops@example.com".to_string(),
+            Arc::new(FakeDns::new()) as Arc<dyn DnsProvider>,
+        )
+        .use_production();
+        assert_eq!(production.directory_url, LetsEncrypt::Production.url());
+    }
+
+    #[test]
+    fn write_private_sets_0600_even_when_a_looser_tmp_file_already_exists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("account.json");
+        let tmp = path.with_extension("tmp");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
+
+        // Simulate a leftover temp file from a crashed run, with wide
+        // permissions that must not survive into the reused file.
+        std::fs::write(&tmp, b"leftover from a crashed run").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private(&path, "fresh account credentials").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "final file must be 0600, got {mode:o}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fresh account credentials"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[tokio::test]
