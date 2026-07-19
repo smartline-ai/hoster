@@ -27,6 +27,8 @@ fn settings(password: Option<&str>) -> Arc<Settings> {
         registry: "reg.example.com".into(),
         token: "secret".into(),
         dashboard_password: password.map(str::to_string),
+        https_listen: None,
+        cert_dir: "/tmp/hoster-test-certs".into(),
     })
 }
 

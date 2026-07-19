@@ -46,11 +46,46 @@ struct ProjectData {
     hostname_template: Option<String>,
 }
 
+/// A DNS provider's credentials. The token can rewrite DNS — treat it as the
+/// most dangerous secret in the store. It leaves this module only through
+/// [`Store::acme_config`], which exists solely to feed issuance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsProviderConfig {
+    pub kind: String,
+    pub token: String,
+}
+
+/// The ACME account settings, plus (optionally) the DNS credentials issuance
+/// needs. Global, not per-project: one account issues for every domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcmeConfig {
+    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<DnsProviderConfig>,
+}
+
+/// ACME configuration as exposed to the UI/API: **never** the token.
+///
+/// This is a separate type rather than a serde attribute on [`AcmeConfig`] so
+/// that leaking the token is not a matter of remembering to skip a field —
+/// there is simply no field here that could carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MaskedAcme {
+    pub email: String,
+    pub control_hostname: Option<String>,
+    pub provider_kind: Option<String>,
+    pub token_set: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Data {
     version: u32,
     #[serde(default)]
     projects: BTreeMap<String, ProjectData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acme: Option<AcmeConfig>,
 }
 
 impl Default for Data {
@@ -58,6 +93,7 @@ impl Default for Data {
         Data {
             version: 1,
             projects: BTreeMap::new(),
+            acme: None,
         }
     }
 }
@@ -299,6 +335,101 @@ impl Store {
                 hostname_template: p.hostname_template.clone(),
             })
             .collect()
+    }
+
+    /// Set the ACME account email and optional control hostname, keeping any
+    /// stored DNS credentials — changing the email must not silently discard
+    /// the token, or the next renewal pass would fail with no visible cause.
+    pub fn set_acme_config(
+        &self,
+        email: &str,
+        control_hostname: Option<&str>,
+    ) -> Result<(), String> {
+        if !email.contains('@') || email.len() < 3 {
+            return Err(format!("{email:?} is not a valid email address"));
+        }
+        if let Some(h) = control_hostname {
+            crate::settings::validate_hostname(h)?;
+        }
+        let mut data = self.data.lock().unwrap();
+        match data.acme.as_mut() {
+            Some(a) => {
+                a.email = email.to_string();
+                a.control_hostname = control_hostname.map(str::to_string);
+            }
+            None => {
+                data.acme = Some(AcmeConfig {
+                    email: email.to_string(),
+                    control_hostname: control_hostname.map(str::to_string),
+                    provider: None,
+                })
+            }
+        }
+        self.persist(&data).map_err(|e| e.to_string())
+    }
+
+    /// Set the DNS provider credentials. Requires the ACME email to be set
+    /// first, since issuance needs both.
+    pub fn set_dns_token(&self, kind: &str, token: &str) -> Result<(), String> {
+        if kind != "cloudflare" {
+            return Err(format!(
+                "unknown DNS provider {kind:?}; supported providers: cloudflare"
+            ));
+        }
+        if token.trim().is_empty() {
+            return Err("DNS API token must not be empty".to_string());
+        }
+        if token.len() > MAX_VALUE_LEN {
+            return Err(format!("token too long (max {MAX_VALUE_LEN} bytes)"));
+        }
+        let mut data = self.data.lock().unwrap();
+        let Some(acme) = data.acme.as_mut() else {
+            return Err("set the ACME account email before adding DNS credentials".to_string());
+        };
+        acme.provider = Some(DnsProviderConfig {
+            kind: kind.to_string(),
+            token: token.to_string(),
+        });
+        self.persist(&data).map_err(|e| e.to_string())
+    }
+
+    /// Remove the DNS credentials, keeping the rest of the ACME config.
+    pub fn delete_dns_token(&self) -> anyhow::Result<()> {
+        let mut data = self.data.lock().unwrap();
+        if let Some(a) = data.acme.as_mut() {
+            a.provider = None;
+        }
+        self.persist(&data)
+    }
+
+    /// Full ACME config including the token — for issuance only, never a read
+    /// path. Everything user-facing must go through [`Store::masked_acme`].
+    pub fn acme_config(&self) -> Option<AcmeConfig> {
+        self.data.lock().unwrap().acme.clone()
+    }
+
+    /// ACME config for display. Structurally cannot carry the token.
+    pub fn masked_acme(&self) -> Option<MaskedAcme> {
+        self.data.lock().unwrap().acme.as_ref().map(|a| MaskedAcme {
+            email: a.email.clone(),
+            control_hostname: a.control_hostname.clone(),
+            provider_kind: a.provider.as_ref().map(|p| p.kind.clone()),
+            token_set: a.provider.is_some(),
+        })
+    }
+
+    /// Every distinct hostname template configured on a project. Used to work
+    /// out which wildcard certificates are needed.
+    pub fn project_hostname_templates(&self) -> Vec<String> {
+        let data = self.data.lock().unwrap();
+        let mut out: Vec<String> = data
+            .projects
+            .values()
+            .filter_map(|p| p.hostname_template.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Serialize and write atomically with owner-only permissions.
@@ -765,6 +896,116 @@ mod tests {
             s2.hostname_template_for("p").as_deref(),
             Some("{branch}.demo.example.com")
         );
+    }
+
+    #[test]
+    fn masked_acme_never_exposes_the_dns_token() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_acme_config("me@example.com", Some("hoster.example.com"))
+            .unwrap();
+        s.set_dns_token("cloudflare", "cf_topsecret_token").unwrap();
+        let masked = s.masked_acme().unwrap();
+        let json = serde_json::to_string(&masked).unwrap();
+        assert!(!json.contains("cf_topsecret_token"), "token leaked: {json}");
+        assert!(json.contains("me@example.com"));
+        assert!(masked.token_set);
+    }
+
+    #[test]
+    fn acme_config_round_trips_including_the_token() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_acme_config("me@example.com", None).unwrap();
+        s.set_dns_token("cloudflare", "tok").unwrap();
+        let cfg = s.acme_config().unwrap();
+        assert_eq!(cfg.email, "me@example.com");
+        assert_eq!(cfg.provider.unwrap().token, "tok");
+    }
+
+    #[test]
+    fn delete_dns_token_keeps_the_email() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_acme_config("me@example.com", None).unwrap();
+        s.set_dns_token("cloudflare", "tok").unwrap();
+        s.delete_dns_token().unwrap();
+        let masked = s.masked_acme().unwrap();
+        assert_eq!(masked.email, "me@example.com");
+        assert!(!masked.token_set);
+    }
+
+    #[test]
+    fn set_acme_config_rejects_an_email_without_an_at_sign() {
+        let s = Store::load(temp_file()).unwrap();
+        assert!(s.set_acme_config("not-an-email", None).is_err());
+    }
+
+    #[test]
+    fn set_dns_token_rejects_an_unknown_provider_kind() {
+        let s = Store::load(temp_file()).unwrap();
+        assert!(s.set_dns_token("bind9", "tok").is_err());
+    }
+
+    #[test]
+    fn set_dns_token_requires_the_email_first() {
+        let s = Store::load(temp_file()).unwrap();
+        assert!(s.set_dns_token("cloudflare", "tok").is_err());
+    }
+
+    #[test]
+    fn set_acme_config_keeps_an_existing_dns_token() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_acme_config("me@example.com", None).unwrap();
+        s.set_dns_token("cloudflare", "tok").unwrap();
+        s.set_acme_config("other@example.com", Some("hoster.example.com"))
+            .unwrap();
+        let cfg = s.acme_config().unwrap();
+        assert_eq!(cfg.email, "other@example.com");
+        assert_eq!(
+            cfg.provider.map(|p| p.token),
+            Some("tok".to_string()),
+            "changing the email must not discard the DNS credentials"
+        );
+    }
+
+    #[test]
+    fn set_acme_config_rejects_an_invalid_control_hostname() {
+        let s = Store::load(temp_file()).unwrap();
+        assert!(
+            s.set_acme_config("me@example.com", Some("Not A Hostname"))
+                .is_err()
+        );
+        assert!(
+            s.masked_acme().is_none(),
+            "nothing should be stored on rejection"
+        );
+    }
+
+    #[test]
+    fn acme_config_persists_and_reloads_from_disk() {
+        let path = temp_file();
+        {
+            let s = Store::load(&path).unwrap();
+            s.set_acme_config("me@example.com", Some("hoster.example.com"))
+                .unwrap();
+            s.set_dns_token("cloudflare", "tok").unwrap();
+        }
+        let s2 = Store::load(&path).unwrap();
+        let cfg = s2.acme_config().unwrap();
+        assert_eq!(cfg.control_hostname.as_deref(), Some("hoster.example.com"));
+        assert_eq!(cfg.provider.unwrap().token, "tok");
+    }
+
+    #[test]
+    fn a_file_without_acme_config_still_loads() {
+        let path = temp_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"projects":{"p":{"vars":{"K":{"value":"v","services":[]}}}}}"#,
+        )
+        .unwrap();
+        let s = Store::load(&path).unwrap();
+        assert!(s.acme_config().is_none());
+        assert!(s.masked_acme().is_none());
     }
 
     #[test]

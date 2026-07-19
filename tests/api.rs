@@ -28,6 +28,8 @@ async fn spawn() -> (String, Arc<FakeRuntime>) {
         registry: "reg.example.com".into(),
         token: "secret".into(),
         dashboard_password: None,
+        https_listen: None,
+        cert_dir: "/tmp/hoster-test-certs".into(),
     });
     let engine = Arc::new(Engine::with_readiness(
         rt.clone(),

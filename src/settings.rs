@@ -6,6 +6,12 @@ pub struct Settings {
     pub registry: String,
     pub token: String,
     pub dashboard_password: Option<String>,
+    /// Where to accept HTTPS. `None` disables TLS entirely: no listener, no
+    /// renewal loop, and no issuance, so upgrading an existing install
+    /// changes nothing until it is set.
+    pub https_listen: Option<String>,
+    /// Root directory of the certificate store.
+    pub cert_dir: String,
 }
 
 /// Turn an arbitrary git branch into a DNS label: lowercase, non-alphanumeric
@@ -224,6 +230,14 @@ because a TLS wildcard certificate matches only one label"
 
 /// Validate a concrete hostname: total length, label lengths, and the
 /// characters permitted in a DNS label.
+///
+/// Used both on the sample hostname a template produces and on operator-typed
+/// names such as the control hostname, which becomes a certificate identifier
+/// and so must be a real DNS name.
+pub fn validate_hostname(name: &str) -> Result<(), String> {
+    validate_dns_name(name)
+}
+
 fn validate_dns_name(name: &str) -> Result<(), String> {
     if name.len() > 253 {
         return Err(format!(

@@ -10,6 +10,7 @@ pub mod imageref;
 pub mod labels;
 pub mod proxy;
 pub mod readiness;
+pub mod renewal;
 pub mod routing;
 pub mod runtime;
 pub mod secrets;

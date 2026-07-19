@@ -479,6 +479,8 @@ mod tests {
             registry: "reg.example.com".into(),
             token: "t".into(),
             dashboard_password: None,
+            https_listen: None,
+            cert_dir: "/tmp/hoster-test-certs".into(),
         })
     }
 

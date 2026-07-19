@@ -34,6 +34,23 @@ pub struct IssuedCert {
     pub key_pem: String,
 }
 
+/// Anything that can obtain a certificate for a domain.
+///
+/// The renewal loop depends on this rather than on [`Issuer`] directly, so its
+/// backoff and scheduling can be tested without ever contacting an ACME
+/// server.
+#[async_trait::async_trait]
+pub trait CertIssuer: Send + Sync {
+    async fn issue(&self, domain: &str) -> anyhow::Result<IssuedCert>;
+}
+
+#[async_trait::async_trait]
+impl CertIssuer for Issuer {
+    async fn issue(&self, domain: &str) -> anyhow::Result<IssuedCert> {
+        self.issue_cert(domain).await
+    }
+}
+
 /// Issues certificates from an ACME directory using DNS-01.
 ///
 /// Defaults to the Let's Encrypt **staging** directory. Staging certificates
@@ -87,7 +104,7 @@ impl Issuer {
     }
 
     /// Obtain a certificate covering `domain` (and, for a wildcard, its parent).
-    pub async fn issue(&self, domain: &str) -> anyhow::Result<IssuedCert> {
+    pub async fn issue_cert(&self, domain: &str) -> anyhow::Result<IssuedCert> {
         let account = self.account().await?;
         let identifiers = cert_identifiers(domain)
             .into_iter()
@@ -148,9 +165,26 @@ impl Issuer {
         // Wait for real visibility. Asking Let's Encrypt to validate before the
         // record resolves burns one of the five authorization failures allowed
         // per identifier per hour, so a fixed sleep is not good enough.
-        let resolver = TokioResolver::builder_tokio()?.build()?;
+        //
+        // The poll must go to the zone's *authoritative* nameservers, not to a
+        // recursive resolver. A recursive resolver that was asked for
+        // `_acme-challenge.<domain>` before the record existed — which a failed
+        // first attempt guarantees — caches the NXDOMAIN for the zone's SOA
+        // minimum (1800s at Cloudflare). That outlives the 300s propagation
+        // timeout here, so every retry would wait out the full timeout and
+        // fail, wedging the domain indefinitely. Querying the authoritative
+        // servers directly sees the record the moment it is published.
+        //
+        // Failing here is cheap: no challenge has been marked ready yet, so a
+        // resolver problem costs no authorization attempt.
+        let mut resolvers: std::collections::HashMap<String, TokioResolver> =
+            std::collections::HashMap::new();
         for (name, value) in published.iter() {
-            wait_for_txt(&resolver, name, value, self.propagation_timeout).await?;
+            if !resolvers.contains_key(name) {
+                resolvers.insert(name.clone(), authoritative_resolver(name).await?);
+            }
+            let resolver = &resolvers[name];
+            wait_for_txt(resolver, name, value, self.propagation_timeout).await?;
         }
 
         // Pass 2: only now mark the challenges ready. The authorization states
@@ -253,6 +287,84 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
         return Err(err.into());
     }
     Ok(())
+}
+
+/// The zone names to try an NS lookup against, most specific first, when
+/// hunting for the authoritative servers for `name`.
+///
+/// The `_acme-challenge` label is dropped before walking: asking a recursive
+/// resolver about a name that does not exist yet is exactly what poisons its
+/// negative cache for the name we are about to poll. The walk stops before the
+/// public suffix — a single-label candidate like `com` is never useful and only
+/// costs a query.
+fn zone_candidates(name: &str) -> Vec<String> {
+    let base = name
+        .strip_prefix("_acme-challenge.")
+        .unwrap_or(name)
+        .trim_end_matches('.');
+    let labels: Vec<&str> = base.split('.').filter(|l| !l.is_empty()).collect();
+    (0..labels.len().saturating_sub(1))
+        .map(|i| labels[i..].join("."))
+        .collect()
+}
+
+/// Build a resolver that queries `addrs` directly, with caching off so a
+/// repeated poll always reflects what the server holds right now.
+fn resolver_for(addrs: &[std::net::IpAddr]) -> anyhow::Result<TokioResolver> {
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+
+    if addrs.is_empty() {
+        anyhow::bail!("no nameserver addresses to query");
+    }
+    let config = ResolverConfig::from_parts(
+        None,
+        vec![],
+        addrs
+            .iter()
+            .map(|ip| NameServerConfig::udp(*ip))
+            .collect::<Vec<_>>(),
+    );
+    let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+    builder.options_mut().cache_size = 0;
+    Ok(builder.build()?)
+}
+
+/// A resolver pointed at the authoritative nameservers for `name`'s zone.
+///
+/// See the call site in `run_order` for why a recursive resolver is not
+/// acceptable here.
+async fn authoritative_resolver(name: &str) -> anyhow::Result<TokioResolver> {
+    use hickory_resolver::proto::rr::RecordType;
+
+    let system = TokioResolver::builder_tokio()?.build()?;
+    for zone in zone_candidates(name) {
+        let Ok(lookup) = system.lookup(zone.clone(), RecordType::NS).await else {
+            continue;
+        };
+        let mut hosts = Vec::new();
+        for record in lookup.answers() {
+            if let RData::NS(ns) = &record.data {
+                hosts.push(ns.0.to_utf8());
+            }
+        }
+        let mut addrs = Vec::new();
+        for host in &hosts {
+            match system.lookup_ip(host.as_str()).await {
+                Ok(ips) => addrs.extend(ips.iter()),
+                Err(e) => tracing::warn!(%host, error = %e, "could not resolve a nameserver"),
+            }
+        }
+        if !addrs.is_empty() {
+            tracing::debug!(%zone, servers = addrs.len(), "polling authoritative nameservers");
+            return resolver_for(&addrs);
+        }
+    }
+    anyhow::bail!(
+        "could not find the authoritative nameservers for {name}; \
+refusing to poll a recursive resolver, whose cached NXDOMAIN would outlive \
+the propagation timeout"
+    )
 }
 
 /// A TXT record's value: its character-strings joined, as RFC 1035 intends.
@@ -396,6 +508,41 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn zone_candidates_drop_the_challenge_label_and_stop_before_the_tld() {
+        assert_eq!(
+            zone_candidates("_acme-challenge.dev.example.com"),
+            vec![
+                "dev.example.com".to_string(),
+                "example.com".to_string(),
+                // `com` is deliberately absent: a single-label candidate can
+                // never be the zone we need and only costs a query.
+            ]
+        );
+    }
+
+    #[test]
+    fn zone_candidates_tolerate_a_trailing_dot_and_a_bare_name() {
+        assert_eq!(
+            zone_candidates("_acme-challenge.example.com."),
+            vec!["example.com".to_string()]
+        );
+        assert_eq!(zone_candidates("localhost"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn resolver_for_refuses_an_empty_nameserver_set() {
+        // Silently falling back to the system resolver here would reintroduce
+        // the cached-NXDOMAIN wedge this whole path exists to avoid.
+        assert!(resolver_for(&[]).is_err());
+    }
+
+    #[test]
+    fn resolver_for_builds_a_resolver_pointed_at_the_given_address() {
+        use std::net::{IpAddr, Ipv4Addr};
+        assert!(resolver_for(&[IpAddr::V4(Ipv4Addr::LOCALHOST)]).is_ok());
     }
 
     #[tokio::test]
