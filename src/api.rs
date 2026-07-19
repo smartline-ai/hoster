@@ -313,24 +313,42 @@ struct SetAcmeConfigBody {
     control_hostname: Option<String>,
 }
 
-/// The body of `PUT /acme/dns`.
+/// The body of `PUT /acme/dns`. Covers every provider `kind`'s fields (only
+/// the ones the given `kind` needs must be present — see
+/// [`crate::secrets::DnsProviderConfig::validate`]), for both the global
+/// default and, when `project` is set, a single project's override.
 #[derive(Deserialize)]
-struct SetDnsTokenBody {
+struct SetDnsProviderBody {
     kind: String,
-    token: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    api_user: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    /// When present, sets this project's override instead of the global
+    /// default.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 /// A hand-written, redacting `Debug` — the same reasoning as
 /// [`crate::secrets::DnsProviderConfig`], [`crate::secrets::RegistryCred`],
-/// and [`crate::secrets::Var`]. `token` here is the plaintext DNS provider
-/// credential straight off the wire; a derived `Debug` would print it in full
-/// the moment anything logs or formats this body, and "nothing formats it
-/// today" is not a property that survives the next edit.
-impl std::fmt::Debug for SetDnsTokenBody {
+/// and [`crate::secrets::Var`]. `token`/`api_key` here are the plaintext DNS
+/// provider credentials straight off the wire; a derived `Debug` would print
+/// them in full the moment anything logs or formats this body, and "nothing
+/// formats it today" is not a property that survives the next edit.
+impl std::fmt::Debug for SetDnsProviderBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SetDnsTokenBody")
+        f.debug_struct("SetDnsProviderBody")
             .field("kind", &self.kind)
-            .field("token", &"[redacted]")
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .field("api_user", &self.api_user)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("username", &self.username)
+            .field("project", &self.project)
             .finish()
     }
 }
@@ -482,7 +500,7 @@ async fn handle_set_dns_token<R: ContainerRuntime>(
         Ok(c) => c.to_bytes(),
         Err(_) => return Ok(text(StatusCode::BAD_REQUEST, "could not read request body")),
     };
-    let body: SetDnsTokenBody = match serde_json::from_slice(&bytes) {
+    let body: SetDnsProviderBody = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
             return Ok(text_owned(
@@ -492,13 +510,17 @@ async fn handle_set_dns_token<R: ContainerRuntime>(
         }
     };
     let cfg = crate::secrets::DnsProviderConfig {
-        kind: body.kind.clone(),
-        token: Some(body.token.clone()),
-        api_user: None,
-        api_key: None,
-        username: None,
+        kind: body.kind,
+        token: body.token,
+        api_user: body.api_user,
+        api_key: body.api_key,
+        username: body.username,
     };
-    match engine.store().set_dns_provider(cfg) {
+    let result = match body.project {
+        Some(project) => engine.store().set_project_dns_provider(&project, cfg),
+        None => engine.store().set_dns_provider(cfg),
+    };
+    match result {
         Ok(()) => Ok(text(StatusCode::NO_CONTENT, "")),
         Err(msg) => Ok(text_owned(StatusCode::BAD_REQUEST, msg)),
     }
@@ -1946,6 +1968,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_sets_global_and_project_dns_providers_without_leaking_secrets() {
+        let (engine, settings, sessions) = api_harness();
+
+        // Precondition: ACME email must be set before any DNS provider.
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/acme/config",
+            r#"{"email":"me@example.com"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // 1. POST a hetzner global default.
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/acme/dns",
+            r#"{"kind":"hetzner","token":"hetzner_topsecret"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // 2. The masked read shows the provider kind but never the token.
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::GET,
+            "/acme/status",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_string(res).await;
+        assert!(body.contains("hetzner"), "body: {body}");
+        assert!(
+            !body.contains("hetzner_topsecret"),
+            "token leaked: {body}"
+        );
+
+        // 3. A namecheap provider missing `api_key` is rejected with a 4xx
+        // that names the missing field.
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/acme/dns",
+            r#"{"kind":"namecheap","api_user":"user","username":"user"}"#,
+        )
+        .await;
+        assert!(res.status().is_client_error(), "status: {}", res.status());
+        let body = body_string(res).await;
+        assert!(body.contains("api_key"), "body: {body}");
+
+        // 4. A per-project provider is reflected by `project_dns_provider`,
+        // and does not disturb the global default.
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/acme/dns",
+            r#"{"kind":"cloudflare","token":"alpha_secret","project":"alpha"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let project_cfg = engine
+            .store()
+            .project_dns_provider("alpha")
+            .expect("alpha's per-project provider should be set");
+        assert_eq!(project_cfg.kind, "cloudflare");
+        assert_eq!(project_cfg.token.as_deref(), Some("alpha_secret"));
+        // The global default (hetzner) is untouched by the per-project write.
+        let global_cfg = engine
+            .store()
+            .acme_config()
+            .unwrap()
+            .provider
+            .expect("global provider should still be set");
+        assert_eq!(global_cfg.kind, "hetzner");
+    }
+
+    #[tokio::test]
     async fn acme_endpoints_require_the_bearer_token() {
         let (engine, settings, sessions) = api_harness();
         let res = call_without_token(
@@ -2329,18 +2440,26 @@ mod tests {
         assert!(rows.contains(&"hoster.example.com".to_string()));
     }
 
-    /// The DNS token must never be printable through `Debug`, the same
-    /// guarantee the stored credential types give.
+    /// The DNS token and api_key must never be printable through `Debug`,
+    /// the same guarantee the stored credential types give.
     #[test]
     fn dns_token_body_debug_is_redacted() {
-        let body = SetDnsTokenBody {
-            kind: "cloudflare".into(),
-            token: "cf_topsecret".into(),
+        let body = SetDnsProviderBody {
+            kind: "namecheap".into(),
+            token: Some("cf_topsecret".into()),
+            api_user: Some("user".into()),
+            api_key: Some("nc_topsecret".into()),
+            username: Some("acct".into()),
+            project: Some("alpha".into()),
         };
         let shown = format!("{body:?}");
         assert!(!shown.contains("cf_topsecret"), "token leaked: {shown}");
+        assert!(!shown.contains("nc_topsecret"), "api_key leaked: {shown}");
         assert!(shown.contains("[redacted]"));
-        assert!(shown.contains("cloudflare"));
+        assert!(shown.contains("namecheap"));
+        assert!(shown.contains("user"));
+        assert!(shown.contains("acct"));
+        assert!(shown.contains("alpha"));
     }
 
     #[test]
