@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use crate::certs::{CertRow, CertSeverity};
 use crate::secrets::{MaskedAcme, MaskedProject};
-use crate::settings::Settings;
+use crate::settings::{ProxyMode, Settings};
 use crate::ui::components::html_escape;
 
 pub fn settings_body(
@@ -11,6 +11,7 @@ pub fn settings_body(
     env: &[MaskedProject],
     acme: Option<&MaskedAcme>,
     certs: &[CertRow],
+    nginx_status: Option<&crate::nginx::ApplyRecord>,
 ) -> String {
     let mut body = String::from(
         "<div class=\"page-head\"><h1>Settings</h1>\
@@ -32,6 +33,12 @@ pub fn settings_body(
     row(&mut body, "API listen", &settings.api_listen);
     row(&mut body, "Version", env!("CARGO_PKG_VERSION"));
     body.push_str("</div></div></section>");
+    render_proxy(
+        &mut body,
+        settings.proxy_mode,
+        &settings.nginx_conf_path,
+        nginx_status,
+    );
     let bases = project_base_domains(settings, env);
     render_tls(
         &mut body,
@@ -57,6 +64,67 @@ fn project_base_domains(settings: &Settings, env: &[MaskedProject]) -> Vec<Strin
     out.sort();
     out.dedup();
     out
+}
+
+/// The read-only Proxy section: proxy mode, and (nginx mode) the generated
+/// config path plus the last apply result. Mode is env-set, so nothing here
+/// is editable — it mirrors how the DNS panel surfaces state.
+fn render_proxy(
+    body: &mut String,
+    mode: ProxyMode,
+    conf_path: &str,
+    last: Option<&crate::nginx::ApplyRecord>,
+) {
+    body.push_str(
+        "<section class=\"panel\"><div class=\"col\"><div class=\"col-label\">Proxy</div>",
+    );
+    let mode_str = match mode {
+        ProxyMode::Standalone => "standalone",
+        ProxyMode::Nginx => "nginx",
+    };
+    let _ = write!(
+        body,
+        "<div class=\"env-row\"><span class=\"k\">Mode</span>\
+<div class=\"env-meta\"><span class=\"tag\">{}</span></div></div>",
+        html_escape(mode_str),
+    );
+    if mode == ProxyMode::Nginx {
+        let _ = write!(
+            body,
+            "<div class=\"env-row\"><span class=\"k\">Nginx config</span>\
+<div class=\"env-meta\"><span class=\"tag\">{}</span></div></div>",
+            html_escape(conf_path),
+        );
+        match last {
+            None => body.push_str(
+                "<div class=\"env-row\"><span class=\"k\">Last apply</span>\
+<div class=\"env-meta\"><span class=\"tag warn\">not yet applied</span></div></div>",
+            ),
+            Some(r) => {
+                let (class, label) = if r.validated && r.reloaded {
+                    ("tag", "reloaded")
+                } else if r.validated {
+                    ("tag bad", "validated, reload failed")
+                } else {
+                    ("tag bad", "nginx -t failed")
+                };
+                let _ = write!(
+                    body,
+                    "<div class=\"env-row\"><span class=\"k\">Last apply</span>\
+<div class=\"env-meta\"><span class=\"{class}\">{}</span></div></div>",
+                    html_escape(label),
+                );
+                if let Some(msg) = &r.message {
+                    let _ = write!(
+                        body,
+                        "<div class=\"env-meta\"><pre>{}</pre></div>",
+                        html_escape(msg),
+                    );
+                }
+            }
+        }
+    }
+    body.push_str("</div></section>");
 }
 
 /// The TLS & DNS section: the ACME account, the DNS provider credential, the
@@ -465,7 +533,7 @@ mod tests {
 
     #[test]
     fn shows_system_info_but_never_secrets() {
-        let html = settings_body(&settings(), &[], None, &[]);
+        let html = settings_body(&settings(), &[], None, &[], None);
         assert!(html.contains("{service}-{branch}.dev.example.com"));
         assert!(html.contains("ghcr.io"));
         assert!(html.contains("0.0.0.0:8081"));
@@ -478,7 +546,7 @@ mod tests {
     /// an operator could mistake for a working configuration.
     #[test]
     fn shows_setup_prompt_when_acme_is_unconfigured() {
-        let html = settings_body(&settings(), &[], None, &[]);
+        let html = settings_body(&settings(), &[], None, &[], None);
         assert!(html.to_lowercase().contains("tls"));
         assert!(html.to_lowercase().contains("not configured"));
         // the form that configures it is still reachable
@@ -496,7 +564,7 @@ mod tests {
     /// actual rendered page.
     #[test]
     fn renders_the_dns_provider_masked_and_with_manage_actions() {
-        let html = settings_body(&settings(), &[], Some(&acme()), &[]);
+        let html = settings_body(&settings(), &[], Some(&acme()), &[], None);
         // the provider is named and the token shown only as bullets
         assert!(html.contains("cloudflare"));
         assert!(html.contains('\u{2022}'));
@@ -509,7 +577,7 @@ mod tests {
     /// credentials is waiting up to six hours for the next scheduled pass.
     #[test]
     fn shows_retry_control_once_acme_is_configured() {
-        let configured = settings_body(&settings(), &[], Some(&acme()), &[]);
+        let configured = settings_body(&settings(), &[], Some(&acme()), &[], None);
         assert!(configured.contains("action=\"/ui/acme/renew\""));
         assert!(configured.contains("me@example.com"));
         assert!(configured.contains("hoster.example.com"));
@@ -532,7 +600,7 @@ mod tests {
                 CertSeverity::Failed,
             ),
         ];
-        let html = settings_body(&settings(), &[], Some(&acme()), &rows);
+        let html = settings_body(&settings(), &[], Some(&acme()), &rows, None);
         assert!(html.contains("a.example.com"));
         assert!(html.contains("valid until 2026-10-01"));
         assert!(html.contains("b.example.com"));
@@ -550,7 +618,7 @@ mod tests {
             "failed: <script>alert(1)</script>",
             CertSeverity::Failed,
         )];
-        let html = settings_body(&settings(), &[], Some(&acme()), &rows);
+        let html = settings_body(&settings(), &[], Some(&acme()), &rows, None);
         assert!(!html.contains("<script>alert(1)"));
         assert!(!html.contains("<b>d</b>"));
         assert!(html.contains("&lt;script&gt;"));
@@ -569,7 +637,7 @@ mod tests {
             "DNS challenge could not be completed",
             CertSeverity::Failed,
         )];
-        let html = settings_body(&settings(), &[], Some(&acme()), &rows);
+        let html = settings_body(&settings(), &[], Some(&acme()), &rows, None);
         assert!(
             html.contains("tag bad"),
             "a Failed row must render with the bad/red styling regardless of wording: {html}"
@@ -592,7 +660,7 @@ mod tests {
         unconfigured.provider_kind = None;
         unconfigured.token_set = false;
         let env = [project(None)];
-        let html = settings_body(&s, &env, Some(&unconfigured), &[]);
+        let html = settings_body(&s, &env, Some(&unconfigured), &[], None);
         for kind in PROVIDER_KINDS {
             assert!(
                 html.contains(&format!("value=\"{kind}\"")),
@@ -651,13 +719,13 @@ mod tests {
         no_ip.public_ip = None;
         let cloudflare = acme(); // provider_kind: Some("cloudflare")
 
-        let html = settings_body(&no_ip, &[], Some(&cloudflare), &[]);
+        let html = settings_body(&no_ip, &[], Some(&cloudflare), &[], None);
         assert!(html.to_lowercase().contains("hoster_public_ip"));
         assert!(html.contains(WARNING), "must warn the IP is unset: {html}");
 
         let mut with_ip = settings();
         with_ip.public_ip = Some("9.9.9.9".to_string());
-        let html_ok = settings_body(&with_ip, &[], Some(&cloudflare), &[]);
+        let html_ok = settings_body(&with_ip, &[], Some(&cloudflare), &[], None);
         assert!(
             !html_ok.contains(WARNING),
             "no warning once the IP is set: {html_ok}"
@@ -665,7 +733,7 @@ mod tests {
 
         let mut manual = acme();
         manual.provider_kind = Some("manual".to_string());
-        let html_manual = settings_body(&no_ip, &[], Some(&manual), &[]);
+        let html_manual = settings_body(&no_ip, &[], Some(&manual), &[], None);
         assert!(
             !html_manual.contains(WARNING),
             "manual mode never needs HOSTER_PUBLIC_IP: {html_manual}"
@@ -687,7 +755,7 @@ mod tests {
     /// automation to verify) and an unconfigured provider get none.
     #[test]
     fn dns_panel_shows_a_check_affordance_only_for_a_saved_non_manual_provider() {
-        let html = settings_body(&settings(), &[], Some(&acme()), &[]);
+        let html = settings_body(&settings(), &[], Some(&acme()), &[], None);
         assert!(
             html.contains("Check DNS"),
             "expected a check affordance: {html}"
@@ -695,12 +763,12 @@ mod tests {
 
         let mut manual = acme();
         manual.provider_kind = Some("manual".to_string());
-        let html_manual = settings_body(&settings(), &[], Some(&manual), &[]);
+        let html_manual = settings_body(&settings(), &[], Some(&manual), &[], None);
         assert!(!html_manual.contains("Check DNS"));
 
         let mut none_yet = acme();
         none_yet.provider_kind = None;
-        let html_none = settings_body(&settings(), &[], Some(&none_yet), &[]);
+        let html_none = settings_body(&settings(), &[], Some(&none_yet), &[], None);
         assert!(!html_none.contains("Check DNS"));
     }
 
@@ -715,7 +783,7 @@ mod tests {
         let mut s = settings();
         s.public_ip = Some("<script>alert(1)</script>".to_string());
         let env = [project(None)];
-        let html = settings_body(&s, &env, Some(&acme()), &[]);
+        let html = settings_body(&s, &env, Some(&acme()), &[], None);
         assert!(
             !html.contains("<script>alert(1)"),
             "public IP must be escaped: {html}"
@@ -734,11 +802,53 @@ mod tests {
         let env = [project(Some(
             "{service}.<script>alert(1)</script>.example.com",
         ))];
-        let html = settings_body(&settings(), &env, Some(&acme()), &[]);
+        let html = settings_body(&settings(), &env, Some(&acme()), &[], None);
         assert!(
             !html.contains("<script>alert(1)"),
             "project base domain must be escaped: {html}"
         );
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    }
+
+    /// The Proxy section in nginx mode names the mode, the generated conf
+    /// path, and shows a success indicator once the last apply both
+    /// validated and reloaded cleanly.
+    #[test]
+    fn proxy_section_shows_mode_and_last_apply() {
+        use crate::nginx::ApplyRecord;
+        let mut body = String::new();
+        render_proxy(
+            &mut body,
+            ProxyMode::Nginx,
+            "/etc/nginx/conf.d/hoster.conf",
+            Some(&ApplyRecord {
+                validated: true,
+                reloaded: true,
+                message: None,
+                at: 0,
+            }),
+        );
+        assert!(body.contains("nginx"), "{body}");
+        assert!(body.contains("/etc/nginx/conf.d/hoster.conf"), "{body}");
+        assert!(body.contains("reloaded"), "{body}");
+    }
+
+    /// In standalone mode the nginx conf path and last-apply status are not
+    /// hoster's concern — nothing here is editable, and there is nothing to
+    /// report, so those details must not appear.
+    #[test]
+    fn proxy_section_standalone_hides_nginx_details() {
+        let mut body = String::new();
+        render_proxy(
+            &mut body,
+            ProxyMode::Standalone,
+            "/etc/nginx/conf.d/hoster.conf",
+            None,
+        );
+        assert!(body.contains("standalone"), "{body}");
+        assert!(
+            !body.contains("hoster.conf"),
+            "no nginx path in standalone: {body}"
+        );
     }
 }
