@@ -55,7 +55,11 @@ impl CertIssuer for StoreIssuer {
         if provider.kind != "cloudflare" {
             anyhow::bail!("unsupported DNS provider {:?}", provider.kind);
         }
-        let dns: Arc<dyn DnsProvider> = Arc::new(CloudflareProvider::new(provider.token));
+        let token = provider
+            .token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("cloudflare provider missing token"))?;
+        let dns: Arc<dyn DnsProvider> = Arc::new(CloudflareProvider::new(token));
         let issuer = Issuer::new(self.account_path.clone(), cfg.email, dns);
         let issuer = if self.production {
             issuer.use_production()

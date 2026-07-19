@@ -254,7 +254,7 @@ mod tests {
     /// holding the plaintext token in the first place — that guarantee comes
     /// from `MaskedAcme`'s shape, plus the end-to-end
     /// `dashboard_pages_never_render_the_dns_token` test in `crate::api`,
-    /// which stores a real token through `set_dns_token` and inspects the
+    /// which stores a real token through `set_dns_provider` and inspects the
     /// actual rendered page.
     #[test]
     fn renders_the_dns_provider_masked_and_with_manage_actions() {

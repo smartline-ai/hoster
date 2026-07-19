@@ -71,26 +71,76 @@ struct ProjectData {
     hostname_template: Option<String>,
 }
 
-/// A DNS provider's credentials. The token can rewrite DNS — treat it as the
-/// most dangerous secret in the store. It leaves this module only through
-/// [`Store::acme_config`], which exists solely to feed issuance.
+/// A DNS provider's credentials. Every secret field here can rewrite DNS —
+/// treat all of them as the most dangerous secrets in the store. This leaves
+/// this module only through [`Store::acme_config`], which exists solely to
+/// feed issuance.
+///
+/// Different providers need different fields: Cloudflare and Hetzner use a
+/// single API `token`; Namecheap needs `api_user` + `api_key` + `username`.
+/// Rather than an enum (which would break the on-disk format for existing
+/// `{"kind":"cloudflare","token":"..."}` configs), every field stays flat and
+/// optional — `kind` says which ones matter, and [`DnsProviderConfig::validate`]
+/// enforces that per kind.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsProviderConfig {
     pub kind: String,
-    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
-/// A hand-written `Debug` that redacts `token` while still showing `kind` —
-/// the masked [`MaskedAcme`] type protects serialization, but a derived
-/// `Debug` here would print the token in full the moment anything (now or in
-/// future code) formats this with `{:?}`. `Debug` gets no such protection
-/// from a separate type, so it has to be redacted by hand.
+/// A hand-written `Debug` that redacts `token` and `api_key` while still
+/// showing `kind`, `api_user`, and `username` — the masked [`MaskedAcme`] type
+/// protects serialization, but a derived `Debug` here would print the secrets
+/// in full the moment anything (now or in future code) formats this with
+/// `{:?}`. `Debug` gets no such protection from a separate type, so it has to
+/// be redacted by hand.
 impl std::fmt::Debug for DnsProviderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DnsProviderConfig")
             .field("kind", &self.kind)
-            .field("token", &"[redacted]")
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .field("api_user", &self.api_user)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("username", &self.username)
             .finish()
+    }
+}
+
+impl DnsProviderConfig {
+    /// Checks that the fields the provider `kind` needs are present and
+    /// non-blank. Called before a config is ever stored, so a partially
+    /// filled-in credential never sits on disk waiting to fail at the next
+    /// renewal pass instead of at submission time.
+    pub fn validate(&self) -> Result<(), String> {
+        let need = |o: &Option<String>, f: &str| -> Result<(), String> {
+            match o {
+                Some(v) if v.trim().is_empty() => Err(format!("{} requires {f}", self.kind)),
+                Some(v) if v.len() > MAX_VALUE_LEN => {
+                    Err(format!("{f} too long (max {MAX_VALUE_LEN} bytes)"))
+                }
+                Some(_) => Ok(()),
+                None => Err(format!("{} requires {f}", self.kind)),
+            }
+        };
+        match self.kind.as_str() {
+            "cloudflare" | "hetzner" => need(&self.token, "an API token"),
+            "namecheap" => {
+                need(&self.api_user, "api_user")?;
+                need(&self.api_key, "api_key")?;
+                need(&self.username, "username")
+            }
+            "manual" => Ok(()),
+            other => Err(format!(
+                "unknown DNS provider {other:?}; supported: cloudflare, hetzner, namecheap, manual"
+            )),
+        }
     }
 }
 
@@ -407,28 +457,17 @@ impl Store {
         self.persist(&data).map_err(|e| e.to_string())
     }
 
-    /// Set the DNS provider credentials. Requires the ACME email to be set
-    /// first, since issuance needs both.
-    pub fn set_dns_token(&self, kind: &str, token: &str) -> Result<(), String> {
-        if kind != "cloudflare" {
-            return Err(format!(
-                "unknown DNS provider {kind:?}; supported providers: cloudflare"
-            ));
-        }
-        if token.trim().is_empty() {
-            return Err("DNS API token must not be empty".to_string());
-        }
-        if token.len() > MAX_VALUE_LEN {
-            return Err(format!("token too long (max {MAX_VALUE_LEN} bytes)"));
-        }
+    /// Set the global default DNS provider credentials. Requires the ACME
+    /// email to be set first, since issuance needs both. Validates the
+    /// config against its `kind` before storing anything.
+    pub fn set_dns_provider(&self, cfg: DnsProviderConfig) -> Result<(), String> {
+        cfg.validate()?;
         let mut data = self.data.lock().unwrap();
-        let Some(acme) = data.acme.as_mut() else {
-            return Err("set the ACME account email before adding DNS credentials".to_string());
-        };
-        acme.provider = Some(DnsProviderConfig {
-            kind: kind.to_string(),
-            token: token.to_string(),
-        });
+        let acme = data
+            .acme
+            .as_mut()
+            .ok_or("set the ACME email before a DNS provider")?;
+        acme.provider = Some(cfg);
         self.persist(&data).map_err(|e| e.to_string())
     }
 
@@ -514,6 +553,19 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A minimal Cloudflare-shaped `DnsProviderConfig` for tests that only
+    /// care about the token — most of the DNS-provider test suite predates
+    /// the `api_user`/`api_key`/`username` fields.
+    fn cf(token: &str) -> DnsProviderConfig {
+        DnsProviderConfig {
+            kind: "cloudflare".to_string(),
+            token: Some(token.to_string()),
+            api_user: None,
+            api_key: None,
+            username: None,
+        }
+    }
 
     /// A unique, non-existent path under the OS temp dir for one test.
     fn temp_file() -> PathBuf {
@@ -942,7 +994,7 @@ mod tests {
         let s = Store::load(temp_file()).unwrap();
         s.set_acme_config("me@example.com", Some("hoster.example.com"))
             .unwrap();
-        s.set_dns_token("cloudflare", "cf_topsecret_token").unwrap();
+        s.set_dns_provider(cf("cf_topsecret_token")).unwrap();
         let masked = s.masked_acme().unwrap();
         let json = serde_json::to_string(&masked).unwrap();
         assert!(!json.contains("cf_topsecret_token"), "token leaked: {json}");
@@ -954,17 +1006,17 @@ mod tests {
     fn acme_config_round_trips_including_the_token() {
         let s = Store::load(temp_file()).unwrap();
         s.set_acme_config("me@example.com", None).unwrap();
-        s.set_dns_token("cloudflare", "tok").unwrap();
+        s.set_dns_provider(cf("tok")).unwrap();
         let cfg = s.acme_config().unwrap();
         assert_eq!(cfg.email, "me@example.com");
-        assert_eq!(cfg.provider.unwrap().token, "tok");
+        assert_eq!(cfg.provider.unwrap().token.as_deref(), Some("tok"));
     }
 
     #[test]
     fn delete_dns_token_keeps_the_email() {
         let s = Store::load(temp_file()).unwrap();
         s.set_acme_config("me@example.com", None).unwrap();
-        s.set_dns_token("cloudflare", "tok").unwrap();
+        s.set_dns_provider(cf("tok")).unwrap();
         s.delete_dns_token().unwrap();
         let masked = s.masked_acme().unwrap();
         assert_eq!(masked.email, "me@example.com");
@@ -978,28 +1030,35 @@ mod tests {
     }
 
     #[test]
-    fn set_dns_token_rejects_an_unknown_provider_kind() {
+    fn set_dns_provider_rejects_an_unknown_provider_kind() {
         let s = Store::load(temp_file()).unwrap();
-        assert!(s.set_dns_token("bind9", "tok").is_err());
+        let bad = DnsProviderConfig {
+            kind: "bind9".to_string(),
+            token: Some("tok".to_string()),
+            api_user: None,
+            api_key: None,
+            username: None,
+        };
+        assert!(s.set_dns_provider(bad).is_err());
     }
 
     #[test]
-    fn set_dns_token_requires_the_email_first() {
+    fn set_dns_provider_requires_the_email_first() {
         let s = Store::load(temp_file()).unwrap();
-        assert!(s.set_dns_token("cloudflare", "tok").is_err());
+        assert!(s.set_dns_provider(cf("tok")).is_err());
     }
 
     #[test]
     fn set_acme_config_keeps_an_existing_dns_token() {
         let s = Store::load(temp_file()).unwrap();
         s.set_acme_config("me@example.com", None).unwrap();
-        s.set_dns_token("cloudflare", "tok").unwrap();
+        s.set_dns_provider(cf("tok")).unwrap();
         s.set_acme_config("other@example.com", Some("hoster.example.com"))
             .unwrap();
         let cfg = s.acme_config().unwrap();
         assert_eq!(cfg.email, "other@example.com");
         assert_eq!(
-            cfg.provider.map(|p| p.token),
+            cfg.provider.and_then(|p| p.token),
             Some("tok".to_string()),
             "changing the email must not discard the DNS credentials"
         );
@@ -1025,12 +1084,12 @@ mod tests {
             let s = Store::load(&path).unwrap();
             s.set_acme_config("me@example.com", Some("hoster.example.com"))
                 .unwrap();
-            s.set_dns_token("cloudflare", "tok").unwrap();
+            s.set_dns_provider(cf("tok")).unwrap();
         }
         let s2 = Store::load(&path).unwrap();
         let cfg = s2.acme_config().unwrap();
         assert_eq!(cfg.control_hostname.as_deref(), Some("hoster.example.com"));
-        assert_eq!(cfg.provider.unwrap().token, "tok");
+        assert_eq!(cfg.provider.unwrap().token.as_deref(), Some("tok"));
     }
 
     #[test]
@@ -1066,10 +1125,7 @@ mod tests {
 
     #[test]
     fn dns_provider_config_debug_redacts_the_token() {
-        let cfg = DnsProviderConfig {
-            kind: "cloudflare".to_string(),
-            token: "cf_topsecret_token".to_string(),
-        };
+        let cfg = cf("cf_topsecret_token");
         let dbg = format!("{cfg:?}");
         assert!(
             !dbg.contains("cf_topsecret_token"),
@@ -1106,6 +1162,59 @@ mod tests {
     }
 
     #[test]
+    fn dns_config_debug_redacts_all_secrets() {
+        let cfg = DnsProviderConfig {
+            kind: "namecheap".into(),
+            token: None,
+            api_user: Some("u".into()),
+            api_key: Some("SECRETKEY".into()),
+            username: Some("u".into()),
+        };
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("SECRETKEY"), "api_key leaked: {shown}");
+        assert!(shown.contains("namecheap"));
+    }
+
+    #[test]
+    fn dns_config_validation_requires_kind_specific_fields() {
+        let missing = DnsProviderConfig {
+            kind: "namecheap".into(),
+            token: None,
+            api_user: Some("u".into()),
+            api_key: None,
+            username: Some("u".into()),
+        };
+        assert!(
+            missing.validate().is_err(),
+            "namecheap without api_key must fail"
+        );
+        let ok = DnsProviderConfig {
+            kind: "hetzner".into(),
+            token: Some("t".into()),
+            api_user: None,
+            api_key: None,
+            username: None,
+        };
+        assert!(ok.validate().is_ok());
+        let bad_kind = DnsProviderConfig {
+            kind: "route53".into(),
+            token: Some("t".into()),
+            api_user: None,
+            api_key: None,
+            username: None,
+        };
+        assert!(bad_kind.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_cloudflare_token_still_deserializes() {
+        let legacy: DnsProviderConfig =
+            serde_json::from_str(r#"{"kind":"cloudflare","token":"cf_tok"}"#).unwrap();
+        assert_eq!(legacy.kind, "cloudflare");
+        assert_eq!(legacy.token.as_deref(), Some("cf_tok"));
+    }
+
+    #[test]
     fn acme_config_debug_redacts_the_token_through_the_nested_provider() {
         // `AcmeConfig` still derives `Debug`; this pins that the redaction
         // in `DnsProviderConfig` is enough on its own — no separate
@@ -1113,10 +1222,7 @@ mod tests {
         let cfg = AcmeConfig {
             email: "me@example.com".to_string(),
             control_hostname: None,
-            provider: Some(DnsProviderConfig {
-                kind: "cloudflare".to_string(),
-                token: "cf_topsecret_token".to_string(),
-            }),
+            provider: Some(cf("cf_topsecret_token")),
         };
         let dbg = format!("{cfg:?}");
         assert!(

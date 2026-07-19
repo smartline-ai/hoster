@@ -491,7 +491,14 @@ async fn handle_set_dns_token<R: ContainerRuntime>(
             ));
         }
     };
-    match engine.store().set_dns_token(&body.kind, &body.token) {
+    let cfg = crate::secrets::DnsProviderConfig {
+        kind: body.kind.clone(),
+        token: Some(body.token.clone()),
+        api_user: None,
+        api_key: None,
+        username: None,
+    };
+    match engine.store().set_dns_provider(cfg) {
         Ok(()) => Ok(text(StatusCode::NO_CONTENT, "")),
         Err(msg) => Ok(text_owned(StatusCode::BAD_REQUEST, msg)),
     }
@@ -1118,7 +1125,14 @@ async fn ui_acme<R: ContainerRuntime>(
         };
         let kind = form_field(&bytes, "kind").unwrap_or_default();
         let token = form_field(&bytes, "token").unwrap_or_default();
-        return match engine.store().set_dns_token(&kind, &token) {
+        let cfg = crate::secrets::DnsProviderConfig {
+            kind,
+            token: Some(token),
+            api_user: None,
+            api_key: None,
+            username: None,
+        };
+        return match engine.store().set_dns_provider(cfg) {
             Ok(()) => redirect("/settings"),
             Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
         };
@@ -1211,8 +1225,20 @@ mod tests {
     use crate::engine::{AlwaysReady, Engine};
     use crate::routing::{RoutingTable, SharedRoutes};
     use crate::runtime::FakeRuntime;
-    use crate::secrets::Store;
+    use crate::secrets::{DnsProviderConfig, Store};
     use crate::session::Sessions;
+
+    /// A minimal Cloudflare-shaped `DnsProviderConfig` for tests that only
+    /// care about the token.
+    fn cf_provider(token: &str) -> DnsProviderConfig {
+        DnsProviderConfig {
+            kind: "cloudflare".to_string(),
+            token: Some(token.to_string()),
+            api_user: None,
+            api_key: None,
+            username: None,
+        }
+    }
 
     /// A unique, non-existent store path per test, so tests never share state.
     fn temp_store() -> Arc<Store> {
@@ -1823,8 +1849,9 @@ mod tests {
                 .unwrap()
                 .provider
                 .unwrap()
-                .token,
-            "cf_secret"
+                .token
+                .as_deref(),
+            Some("cf_secret")
         );
     }
 
@@ -1837,7 +1864,7 @@ mod tests {
             .unwrap();
         engine
             .store()
-            .set_dns_token("cloudflare", "cf_topsecret")
+            .set_dns_provider(cf_provider("cf_topsecret"))
             .unwrap();
         let res = call(
             &engine,
@@ -1900,7 +1927,7 @@ mod tests {
             .store()
             .set_acme_config("me@example.com", None)
             .unwrap();
-        engine.store().set_dns_token("cloudflare", "tok").unwrap();
+        engine.store().set_dns_provider(cf_provider("tok")).unwrap();
         let res = call(
             &engine,
             &settings,
@@ -1988,8 +2015,9 @@ mod tests {
                 .unwrap()
                 .provider
                 .unwrap()
-                .token,
-            "cf_topsecret"
+                .token
+                .as_deref(),
+            Some("cf_topsecret")
         );
         let res =
             call_with_cookie(&engine, &settings, &sessions, Method::GET, "/", "", &cookie).await;
@@ -2008,7 +2036,7 @@ mod tests {
             .store()
             .set_acme_config("me@example.com", None)
             .unwrap();
-        engine.store().set_dns_token("cloudflare", "tok").unwrap();
+        engine.store().set_dns_provider(cf_provider("tok")).unwrap();
         let res = call_with_cookie(
             &engine,
             &settings,
@@ -2035,7 +2063,7 @@ mod tests {
             .store()
             .set_acme_config("me@example.com", None)
             .unwrap();
-        engine.store().set_dns_token("cloudflare", "tok").unwrap();
+        engine.store().set_dns_provider(cf_provider("tok")).unwrap();
 
         for (path, body) in [
             ("/ui/acme/config", "email=me%40example.com"),
@@ -2090,7 +2118,7 @@ mod tests {
     /// This is the real leak-protection test — unlike a fixture-built
     /// `MaskedAcme` (which structurally cannot carry the plaintext token, so
     /// asserting its absence proves nothing), this stores an actual token
-    /// through `set_dns_token` and inspects the actual rendered response.
+    /// through `set_dns_provider` and inspects the actual rendered response.
     /// `/settings` additionally must show the masked placeholder, so a page
     /// that rendered nothing at all — which would vacuously satisfy "does
     /// not contain the token" — cannot pass either.
@@ -2103,7 +2131,7 @@ mod tests {
             .unwrap();
         engine
             .store()
-            .set_dns_token("cloudflare", "cf_topsecret")
+            .set_dns_provider(cf_provider("cf_topsecret"))
             .unwrap();
         for path in ["/", "/settings"] {
             let res = call_with_cookie(
