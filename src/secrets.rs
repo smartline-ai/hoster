@@ -69,6 +69,8 @@ struct ProjectData {
     registry: Option<RegistryCred>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hostname_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dns_provider: Option<DnsProviderConfig>,
 }
 
 /// A DNS provider's credentials. Every secret field here can rewrite DNS —
@@ -508,6 +510,60 @@ impl Store {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Set (replace) the project's own DNS provider credentials, overriding
+    /// the global default for domains that resolve to this project. Validates
+    /// the config against its `kind` before storing anything, same as the
+    /// global setter.
+    pub fn set_project_dns_provider(
+        &self,
+        project: &str,
+        cfg: DnsProviderConfig,
+    ) -> Result<(), String> {
+        cfg.validate()?;
+        let mut data = self.data.lock().unwrap();
+        data.projects
+            .entry(project.to_string())
+            .or_default()
+            .dns_provider = Some(cfg);
+        self.persist(&data).map_err(|e| e.to_string())
+    }
+
+    /// The project's own DNS provider credentials, if it has one (does not
+    /// fall back to the global default — see [`Store::dns_provider_for`]).
+    pub fn project_dns_provider(&self, project: &str) -> Option<DnsProviderConfig> {
+        self.data
+            .lock()
+            .unwrap()
+            .projects
+            .get(project)
+            .and_then(|p| p.dns_provider.clone())
+    }
+
+    /// Resolve the DNS provider that owns `base` (a `*.suffix` wildcard
+    /// base): the project whose (own or default) hostname template produces
+    /// `base` wins with its own provider if set, else the global default
+    /// (`acme.provider`).
+    pub fn dns_provider_for(
+        &self,
+        base: &str,
+        default_template: &str,
+    ) -> Option<DnsProviderConfig> {
+        let data = self.data.lock().unwrap();
+        for p in data.projects.values() {
+            let tmpl = p
+                .hostname_template
+                .clone()
+                .unwrap_or_else(|| default_template.to_string());
+            if crate::settings::wildcard_base(&tmpl).as_deref() == Some(base) {
+                if let Some(cfg) = &p.dns_provider {
+                    return Some(cfg.clone());
+                }
+                break;
+            }
+        }
+        data.acme.as_ref().and_then(|a| a.provider.clone())
     }
 
     /// Serialize and write atomically with owner-only permissions.
@@ -1229,5 +1285,39 @@ mod tests {
             !dbg.contains("cf_topsecret_token"),
             "token leaked via Debug: {dbg}"
         );
+    }
+
+    #[test]
+    fn resolver_prefers_project_provider_then_global_default() {
+        let s = Store::load(temp_file()).unwrap();
+        s.set_acme_config("me@example.com", None).unwrap();
+        // global default = cloudflare
+        s.set_dns_provider(cf("cf")).unwrap();
+        // project "alpha" overrides with hetzner and its own template
+        s.set_hostname_template("alpha", "{service}-{branch}.alpha.example.com")
+            .unwrap();
+        s.set_project_dns_provider(
+            "alpha",
+            DnsProviderConfig {
+                kind: "hetzner".into(),
+                token: Some("hz".into()),
+                api_user: None,
+                api_key: None,
+                username: None,
+            },
+        )
+        .unwrap();
+
+        let default_tmpl = "{service}-{branch}.dev.example.com";
+        // alpha's base resolves to hetzner
+        let a = s
+            .dns_provider_for("*.alpha.example.com", default_tmpl)
+            .unwrap();
+        assert_eq!(a.kind, "hetzner");
+        // an unclaimed base falls back to the global default
+        let d = s
+            .dns_provider_for("*.dev.example.com", default_tmpl)
+            .unwrap();
+        assert_eq!(d.kind, "cloudflare");
     }
 }
