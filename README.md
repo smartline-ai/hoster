@@ -42,6 +42,7 @@ the HTTP `Host` header, and keeps each branch on its own Docker network.
   - [The dashboard](#the-dashboard)
   - [Project environment & secrets](#project-environment--secrets)
   - [Private registry credentials](#private-registry-credentials)
+  - [Per-project domains](#per-project-domains)
 - [Verifying your setup](#verifying-your-setup)
 - [Deploying a project](#deploying-a-project)
 - [Releasing (maintainers)](#releasing-maintainers)
@@ -352,6 +353,41 @@ curl -fsS -X PUT "$API/projects/odinvestor/registry" \
 curl -fsS -X DELETE "$API/projects/odinvestor/registry" \
   -H "Authorization: Bearer $HOSTER_TOKEN"
 ```
+
+### Per-project domains
+
+By default every branch of every project lands on `HOSTER_HOSTNAME_TEMPLATE`.
+A project can override that with its own template, so one hoster can serve
+`dev.example.com` for one project and `demo.example.com` for another.
+
+In the dashboard, each project's **Domain** panel shows its effective template —
+either its own, or the global default marked as the default — with a form to
+change it.
+
+Or through the API:
+
+```bash
+curl -fsS -X PUT "$API/projects/myproj/domain" \
+  -H "Authorization: Bearer $HOSTER_TOKEN" \
+  -d '{"hostname_template":"{branch}.demo.example.com"}'
+```
+
+`DELETE /projects/myproj/domain` reverts the project to the global default.
+
+The template must contain `{branch}` — without it, every branch of the project
+would resolve to one hostname and each deploy would displace the previous. It
+must also include a parent domain (`{branch}.demo.example.com`, not bare
+`{branch}`), and every placeholder must fall within the template's first
+label — a TLS wildcard certificate only ever covers one label, so a template
+that spreads placeholders across labels is rejected. `{service}` itself is
+optional, so `{branch}.demo.example.com` works for a single-service project.
+
+Changing a project's domain affects **subsequent** deploys only. Branches
+already running keep the hostnames they were deployed with, because each
+container records its own hostname; redeploy a branch to move it.
+
+Each domain still needs its own wildcard DNS record, and — until hoster
+terminates TLS itself — its own certificate and reverse-proxy server block.
 
 ---
 
