@@ -1,0 +1,337 @@
+//! Obtaining certificates from Let's Encrypt over DNS-01.
+//!
+//! The challenge record for `*.dev.example.com` and for `dev.example.com` is
+//! the same name, so a certificate covering both publishes two values there at
+//! once — the DNS provider must append, never replace.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use hickory_resolver::TokioResolver;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::proto::rr::rdata::TXT;
+use instant_acme::{
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
+    NewAccount, NewOrder, Order, OrderStatus, RetryPolicy,
+};
+
+use crate::dns::DnsProvider;
+use crate::settings::cert_identifiers;
+
+/// How long to wait for a published challenge value to become visible in DNS.
+const DEFAULT_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The TXT record name a domain's DNS-01 challenge is published at.
+pub fn challenge_name(domain: &str) -> String {
+    let bare = domain.strip_prefix("*.").unwrap_or(domain);
+    format!("_acme-challenge.{bare}")
+}
+
+/// A certificate chain and its matching private key, both PEM-encoded.
+pub struct IssuedCert {
+    pub chain_pem: String,
+    pub key_pem: String,
+}
+
+/// Issues certificates from an ACME directory using DNS-01.
+pub struct Issuer {
+    account_credentials_path: PathBuf,
+    email: String,
+    dns: Arc<dyn DnsProvider>,
+    directory_url: String,
+    propagation_timeout: Duration,
+}
+
+impl Issuer {
+    /// An issuer against the Let's Encrypt production directory.
+    pub fn new(
+        account_credentials_path: PathBuf,
+        email: String,
+        dns: Arc<dyn DnsProvider>,
+    ) -> Self {
+        Self {
+            account_credentials_path,
+            email,
+            dns,
+            directory_url: LetsEncrypt::Production.url().to_string(),
+            propagation_timeout: DEFAULT_PROPAGATION_TIMEOUT,
+        }
+    }
+
+    /// Point at another ACME directory — Let's Encrypt *staging* for manual
+    /// end-to-end verification, where the rate limits are far more forgiving.
+    pub fn with_directory_url(mut self, url: String) -> Self {
+        self.directory_url = url;
+        self
+    }
+
+    /// Override how long issuance waits for challenge records to propagate.
+    pub fn with_propagation_timeout(mut self, timeout: Duration) -> Self {
+        self.propagation_timeout = timeout;
+        self
+    }
+
+    /// Obtain a certificate covering `domain` (and, for a wildcard, its parent).
+    pub async fn issue(&self, domain: &str) -> anyhow::Result<IssuedCert> {
+        let account = self.account().await?;
+        let identifiers = cert_identifiers(domain)
+            .into_iter()
+            .map(Identifier::Dns)
+            .collect::<Vec<_>>();
+        let mut order = account
+            .new_order(&NewOrder::new(identifiers.as_slice()))
+            .await?;
+
+        // Every published record must be removed even when issuance fails: a
+        // stale TXT value is picked up by the next attempt and fails it too.
+        // The published pairs are collected outside the fallible block so the
+        // cleanup below cannot be skipped by an early return.
+        let mut published: Vec<(String, String)> = Vec::new();
+        let result = self.run_order(&mut order, &mut published).await;
+
+        for (name, value) in &published {
+            if let Err(err) = self.dns.delete_txt(name, value).await {
+                tracing::warn!(
+                    %name,
+                    error = %err,
+                    "failed to remove ACME challenge record; it may block the next issuance"
+                );
+            }
+        }
+
+        result
+    }
+
+    /// The issuance steps that may fail. Kept separate from `issue` so its
+    /// caller can clean up unconditionally.
+    async fn run_order(
+        &self,
+        order: &mut Order,
+        published: &mut Vec<(String, String)>,
+    ) -> anyhow::Result<IssuedCert> {
+        // Pass 1: publish every challenge value. A wildcard and its parent
+        // share one record name, so both values must be present at that name
+        // before either challenge is marked ready.
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
+            match authz.status {
+                AuthorizationStatus::Pending => {}
+                AuthorizationStatus::Valid => continue,
+                other => anyhow::bail!("unexpected authorization status: {other:?}"),
+            }
+
+            let challenge = authz.challenge(ChallengeType::Dns01).ok_or_else(|| {
+                anyhow::anyhow!("no dns-01 challenge offered for this identifier")
+            })?;
+            let name = challenge_name(&challenge.identifier().to_string());
+            let value = challenge.key_authorization().dns_value();
+            self.dns.upsert_txt(&name, &value).await?;
+            published.push((name, value));
+        }
+
+        // Wait for real visibility. Asking Let's Encrypt to validate before the
+        // record resolves burns one of the five authorization failures allowed
+        // per identifier per hour, so a fixed sleep is not good enough.
+        let resolver = TokioResolver::builder_tokio()?.build()?;
+        for (name, value) in published.iter() {
+            wait_for_txt(&resolver, name, value, self.propagation_timeout).await?;
+        }
+
+        // Pass 2: only now mark the challenges ready. The authorization states
+        // were fetched in pass 1 and are cached on the order, so this does not
+        // re-fetch them.
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
+            if authz.status != AuthorizationStatus::Pending {
+                continue;
+            }
+            let mut challenge = authz.challenge(ChallengeType::Dns01).ok_or_else(|| {
+                anyhow::anyhow!("no dns-01 challenge offered for this identifier")
+            })?;
+            challenge.set_ready().await?;
+        }
+
+        let status = order.poll_ready(&RetryPolicy::default()).await?;
+        if status != OrderStatus::Ready {
+            anyhow::bail!("order did not become ready: {status:?}");
+        }
+
+        // `finalize` generates a fresh key pair, builds the CSR from the
+        // order's identifiers, and returns the private key as PEM.
+        let key_pem = order.finalize().await?;
+        let chain_pem = order.poll_certificate(&RetryPolicy::default()).await?;
+        Ok(IssuedCert { chain_pem, key_pem })
+    }
+
+    /// The ACME account: restored from disk when credentials exist, otherwise
+    /// registered once and persisted. Registering again on every run would
+    /// walk into Let's Encrypt's new-account rate limit.
+    async fn account(&self) -> anyhow::Result<Account> {
+        if self.account_credentials_path.exists() {
+            let raw = std::fs::read_to_string(&self.account_credentials_path)?;
+            let credentials: AccountCredentials = serde_json::from_str(&raw)?;
+            return Ok(Account::builder()?.from_credentials(credentials).await?);
+        }
+
+        let contact = format!("mailto:{}", self.email);
+        let (account, credentials) = Account::builder()?
+            .create(
+                &NewAccount {
+                    contact: &[contact.as_str()],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                self.directory_url.clone(),
+                None,
+            )
+            .await?;
+        write_private(
+            &self.account_credentials_path,
+            &serde_json::to_string_pretty(&credentials)?,
+        )?;
+        Ok(account)
+    }
+}
+
+/// Write `contents` so that only the owner can read it. The account key is in
+/// there, and it authenticates every future request for a certificate.
+fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// A TXT record's value: its character-strings joined, as RFC 1035 intends.
+/// A challenge value is short enough to arrive in one chunk, but a resolver is
+/// free to split it and comparing chunk-by-chunk would then never match.
+fn txt_value(txt: &TXT) -> String {
+    txt.txt_data
+        .iter()
+        .map(|chunk| String::from_utf8_lossy(chunk))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Poll DNS until `expected` appears among the TXT values at `name`.
+///
+/// A fixed sleep is not enough: propagation time varies by provider and by
+/// record, and every premature validation attempt burns one of the five
+/// authorization failures Let's Encrypt allows per identifier per hour.
+pub async fn wait_for_txt(
+    resolver: &TokioResolver,
+    name: &str,
+    expected: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut delay = Duration::from_secs(2);
+    loop {
+        if let Ok(lookup) = resolver.txt_lookup(name).await
+            && lookup.answers().iter().any(|record| match &record.data {
+                RData::TXT(txt) => txt_value(txt) == expected,
+                _ => false,
+            })
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for TXT {name} to publish the challenge value");
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(15));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn challenge_name_is_prefixed_and_stripped_of_the_wildcard() {
+        assert_eq!(
+            challenge_name("*.dev.example.com"),
+            "_acme-challenge.dev.example.com"
+        );
+        assert_eq!(
+            challenge_name("dev.example.com"),
+            "_acme-challenge.dev.example.com"
+        );
+        assert_eq!(
+            challenge_name("hoster.example.com"),
+            "_acme-challenge.hoster.example.com"
+        );
+    }
+
+    #[test]
+    fn wildcard_and_parent_share_one_challenge_name() {
+        // This is why the DNS provider must append rather than overwrite.
+        assert_eq!(
+            challenge_name("*.dev.example.com"),
+            challenge_name("dev.example.com")
+        );
+    }
+
+    #[test]
+    fn every_identifier_of_a_wildcard_cert_uses_the_same_challenge_name() {
+        let names = cert_identifiers("*.dev.example.com")
+            .iter()
+            .map(|id| challenge_name(id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "_acme-challenge.dev.example.com".to_string(),
+                "_acme-challenge.dev.example.com".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_txt_gives_up_at_the_deadline() {
+        // A nameserver on loopback that answers nothing: the lookup fails, the
+        // deadline passes, and the wait reports a timeout rather than hanging
+        // or claiming the record is present. No external network involved.
+        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let config = ResolverConfig::from_parts(
+            None,
+            vec![],
+            vec![NameServerConfig::udp(IpAddr::V4(Ipv4Addr::LOCALHOST))],
+        );
+        let mut builder =
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+        builder.options_mut().timeout = Duration::from_millis(50);
+        builder.options_mut().attempts = 0;
+        let resolver = builder.build().unwrap();
+
+        let err = wait_for_txt(
+            &resolver,
+            "_acme-challenge.dev.example.com",
+            "expected-value",
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+}
