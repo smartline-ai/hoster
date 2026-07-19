@@ -1282,6 +1282,7 @@ mod tests {
             dashboard_password: None,
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
+            public_ip: None,
         });
         let engine = Engine::with_readiness(
             rt,
@@ -1391,6 +1392,7 @@ mod tests {
             dashboard_password: Some("dashpw".into()),
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
+            public_ip: None,
         });
         let engine = Arc::new(
             Engine::with_readiness(

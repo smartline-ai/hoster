@@ -205,6 +205,7 @@ mod tests {
             dashboard_password: Some("hunter2".into()),
             https_listen: None,
             cert_dir: "/var/lib/hoster/certs".into(),
+            public_ip: None,
         }
     }
 

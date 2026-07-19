@@ -183,6 +183,9 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .filter(|s| !s.is_empty()),
         cert_dir: env_or("HOSTER_CERT_DIR", "/var/lib/hoster/certs"),
+        public_ip: std::env::var("HOSTER_PUBLIC_IP")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
     });
 
     let runtime = Arc::new(DockerRuntime::connect().context("connect to Docker")?);

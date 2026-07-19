@@ -29,6 +29,7 @@ fn settings(password: Option<&str>) -> Arc<Settings> {
         dashboard_password: password.map(str::to_string),
         https_listen: None,
         cert_dir: "/tmp/hoster-test-certs".into(),
+        public_ip: None,
     })
 }
 
