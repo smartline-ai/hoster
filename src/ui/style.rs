@@ -55,6 +55,7 @@ code{font-family:var(--mono)}h1,h2,h3{margin:0}button{font-family:inherit;cursor
 .panel-body{display:grid;grid-template-columns:1.55fr 1fr;gap:0}
 .col{padding:1rem 1.2rem}
 .col.environment{border-left:1px solid var(--line);background:color-mix(in srgb,var(--panel-2) 55%,transparent)}
+.col.domain{grid-column:1/-1;border-top:1px solid var(--line)}
 .col.registry{grid-column:1/-1;border-top:1px solid var(--line)}
 .col-label{font-size:.68rem;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);font-weight:600;
   margin-bottom:.7rem;display:flex;align-items:center;gap:.5rem}
@@ -106,6 +107,13 @@ details.config>summary::-webkit-details-marker{display:none}
 .env-row form{grid-row:1/3;grid-column:2;align-self:center}
 .tag{font-family:var(--mono);font-size:.68rem;color:var(--muted);background:var(--panel-2);border:1px solid var(--line);padding:.05rem .4rem;border-radius:5px}
 .tag.all{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
+.tag.default{color:var(--muted);border-style:dashed;border-color:var(--line-2)}
+.tag.ok{color:var(--run);border-color:color-mix(in srgb,var(--run) 35%,var(--line));background:var(--run-bg)}
+.tag.warn{color:var(--prov);border-color:color-mix(in srgb,var(--prov) 35%,var(--line));background:var(--prov-bg)}
+.tag.bad{color:var(--fail);border-color:color-mix(in srgb,var(--fail) 35%,var(--line));background:var(--fail-bg)}
+.env-meta .reason{margin-top:0;font-size:.73rem}
+.retry{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-top:.9rem}
+.retry .hint{color:var(--muted);font-size:.78rem}
 .add-var{display:grid;grid-template-columns:1fr;gap:.45rem;padding:.8rem;border:1px dashed var(--line-2);border-radius:9px}
 .add-var input{width:100%;font-family:var(--mono);font-size:.8rem;color:var(--ink);background:var(--panel);
   border:1px solid var(--line-2);border-radius:7px;padding:.5rem .6rem}

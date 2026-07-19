@@ -6,7 +6,12 @@ use crate::secrets::MaskedProject;
 use crate::ui::components::{EXT_ICON, html_escape, plural};
 use crate::ui::overview::status_word;
 
-pub fn project_body(project: &str, deps: &[&DeploymentView], env: &[MaskedProject]) -> String {
+pub fn project_body(
+    project: &str,
+    deps: &[&DeploymentView],
+    env: &[MaskedProject],
+    default_template: &str,
+) -> String {
     let vars = env
         .iter()
         .find(|p| p.project == project)
@@ -30,6 +35,7 @@ pub fn project_body(project: &str, deps: &[&DeploymentView], env: &[MaskedProjec
     );
     render_deployments(&mut body, project, deps);
     render_environment(&mut body, project, env);
+    render_domain(&mut body, project, env, default_template);
     render_registry(&mut body, project, env);
     body.push_str("</div></section>");
 
@@ -187,6 +193,54 @@ onsubmit=\"return confirm('Delete this variable?')\">\
     );
 }
 
+/// The project's *effective* hostname template: its own if it has set one,
+/// otherwise the global default. An inherited default is labelled as such —
+/// the two must never look alike, or an operator will read a server-wide
+/// default as a setting this project owns, and be surprised when changing the
+/// server's default moves this project's domains.
+fn render_domain(body: &mut String, project: &str, env: &[MaskedProject], default_template: &str) {
+    let own = env
+        .iter()
+        .find(|p| p.project == project)
+        .and_then(|p| p.hostname_template.as_deref());
+    let proj = html_escape(project);
+
+    body.push_str("<aside class=\"col domain\"><div class=\"col-label\">Domain</div>");
+    let _ = write!(
+        body,
+        "<div class=\"env-list\"><div class=\"env-row\"><span class=\"k\">{}</span>",
+        html_escape(own.unwrap_or(default_template)),
+    );
+    // Only an explicitly-set template can be reverted; there is nothing to
+    // reset when the project is already following the default.
+    if own.is_some() {
+        let _ = write!(
+            body,
+            "<form method=\"post\" action=\"/ui/projects/{proj}/domain/delete\" \
+onsubmit=\"return confirm('Revert this project to the default domain?')\">\
+<button class=\"icon-btn\" type=\"submit\" title=\"Revert to the default domain\">\u{2715}</button></form>",
+        );
+    }
+    body.push_str("<div class=\"env-meta\">");
+    body.push_str(match own {
+        Some(_) => "<span class=\"tag all\">project domain</span>",
+        None => "<span class=\"tag default\">inherited \u{2014} server default</span>",
+    });
+    body.push_str("</div></div></div>");
+
+    let _ = write!(
+        body,
+        "<form class=\"add-var\" method=\"post\" action=\"/ui/projects/{proj}/domain\">\
+<input name=\"hostname_template\" placeholder=\"{{branch}}.example.com\" required>\
+<button class=\"btn primary\" type=\"submit\">{}</button></form></aside>",
+        if own.is_some() {
+            "Replace domain"
+        } else {
+            "Set project domain"
+        },
+    );
+}
+
 fn render_registry(body: &mut String, project: &str, env: &[MaskedProject]) {
     let cred = env
         .iter()
@@ -283,6 +337,8 @@ mod tests {
         }
     }
 
+    const DEFAULT_TPL: &str = "{service}-{branch}.dev.example.com";
+
     #[test]
     fn renders_deployments_env_registry_and_log_toggle() {
         let deps = [view("b1", "running")];
@@ -291,7 +347,7 @@ mod tests {
             &[("SECRET", &["backend"])],
             Some(("ghcr.io", "bot")),
         )];
-        let html = project_body("odin", &refs, &env);
+        let html = project_body("odin", &refs, &env, DEFAULT_TPL);
         assert!(html.contains("b1"));
         assert!(html.contains("reg/backend:abc"));
         assert!(html.contains("SECRET"));
@@ -311,7 +367,47 @@ mod tests {
     fn escapes_failed_status_reason() {
         let deps = [view("b", "failed: <script>alert(1)</script>")];
         let refs: Vec<&DeploymentView> = deps.iter().collect();
-        let html = project_body("odin", &refs, &[]);
+        let html = project_body("odin", &refs, &[], DEFAULT_TPL);
+        assert!(!html.contains("<script>alert(1)"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    /// A project that has set its own template shows that template, does not
+    /// claim it is inherited, and offers the control that reverts to default.
+    #[test]
+    fn renders_project_own_domain_with_reset_control() {
+        let mut p = masked(&[], None);
+        p.hostname_template = Some("{branch}.odin.example.com".to_string());
+        let html = project_body("odin", &[], &[p], DEFAULT_TPL);
+        assert!(html.contains("{branch}.odin.example.com"));
+        // the global default is not what this project resolves to
+        assert!(!html.contains(DEFAULT_TPL));
+        // reverting to the default is reachable from the page
+        assert!(html.contains("action=\"/ui/projects/odin/domain/delete\""));
+        // and it is not mislabelled as inherited
+        assert!(!html.to_lowercase().contains("inherited"));
+    }
+
+    /// With no project template the global default renders, explicitly marked
+    /// as inherited so it can't be mistaken for an explicit setting.
+    #[test]
+    fn renders_global_default_domain_marked_inherited() {
+        let html = project_body("odin", &[], &[masked(&[], None)], DEFAULT_TPL);
+        assert!(html.contains(DEFAULT_TPL));
+        assert!(html.to_lowercase().contains("inherited"));
+        // nothing to reset when nothing is set
+        assert!(!html.contains("action=\"/ui/projects/odin/domain/delete\""));
+        // but the form that sets one is present
+        assert!(html.contains("action=\"/ui/projects/odin/domain\""));
+    }
+
+    /// The template is operator-supplied text and must be escaped like every
+    /// other dynamic value on the page.
+    #[test]
+    fn escapes_domain_template() {
+        let mut p = masked(&[], None);
+        p.hostname_template = Some("<script>alert(1)</script>".to_string());
+        let html = project_body("odin", &[], &[p], DEFAULT_TPL);
         assert!(!html.contains("<script>alert(1)"));
         assert!(html.contains("&lt;script&gt;"));
     }

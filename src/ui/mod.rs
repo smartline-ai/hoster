@@ -13,8 +13,9 @@ mod style;
 pub use components::html_escape;
 pub use login::login_page;
 
+use crate::certs::CertRow;
 use crate::engine::DeploymentView;
-use crate::secrets::MaskedProject;
+use crate::secrets::{MaskedAcme, MaskedProject};
 use crate::settings::Settings;
 use shell::{Nav, app_shell};
 
@@ -54,23 +55,26 @@ pub fn project_page(
     project: &str,
     deployments: &[DeploymentView],
     env: &[MaskedProject],
+    settings: &Settings,
 ) -> String {
     let projects = project_names(deployments, env);
     let deps: Vec<&DeploymentView> = deployments
         .iter()
         .filter(|d| d.project == project)
         .collect();
-    let body = project::project_body(project, &deps, env);
+    let body = project::project_body(project, &deps, env, &settings.hostname_template);
     app_shell(Nav::Project(project), &projects, &body)
 }
 
-/// `GET /settings` — read-only system information.
+/// `GET /settings` — system information plus the TLS & DNS configuration.
 pub fn settings_page(
     settings: &Settings,
     deployments: &[DeploymentView],
     env: &[MaskedProject],
+    acme: Option<&MaskedAcme>,
+    certs: &[CertRow],
 ) -> String {
     let projects = project_names(deployments, env);
-    let body = settings::settings_body(settings);
+    let body = settings::settings_body(settings, acme, certs);
     app_shell(Nav::Settings, &projects, &body)
 }

@@ -837,7 +837,7 @@ async fn ui_project<R: ContainerRuntime>(
     let env = engine.store().list_masked();
     html(
         StatusCode::OK,
-        ui::project_page(project, &deployments, &env),
+        ui::project_page(project, &deployments, &env, settings),
     )
 }
 
@@ -942,9 +942,11 @@ async fn ui_settings<R: ContainerRuntime>(
     }
     let deployments = engine.deployment_views().await.unwrap_or_default();
     let env = engine.store().list_masked();
+    let acme = engine.store().masked_acme();
+    let certs = cert_rows(engine, settings);
     html(
         StatusCode::OK,
-        ui::settings_page(settings, &deployments, &env),
+        ui::settings_page(settings, &deployments, &env, acme.as_ref(), &certs),
     )
 }
 
@@ -2030,18 +2032,11 @@ mod tests {
         }
     }
 
-    /// Coverage parked for the follow-up UI port, NOT abandoned.
-    ///
-    /// `main` rebuilt the dashboard as `crate::ui` and could not port the TLS &
-    /// DNS section, so `/settings` currently renders no TLS panel at all and
-    /// these assertions cannot pass. The configuration itself is still fully
-    /// reachable over the API (`/acme/config`, `/acme/dns`, `/acme/status`,
-    /// `/acme/renew`), which the tests above cover.
-    ///
-    /// The follow-up task that adds the TLS & DNS section to
-    /// `src/ui/settings.rs` must delete the `#[ignore]` and make this pass.
+    /// End-to-end proof that the TLS & DNS section reaches a served page: the
+    /// ACME configuration an operator set is visible on `/settings`, not only
+    /// over the API. The markup itself is covered in `crate::ui::settings`;
+    /// this asserts the wiring between the store and the rendered response.
     #[tokio::test]
-    #[ignore = "TLS & DNS panel not yet ported into src/ui/settings.rs"]
     async fn settings_page_shows_the_tls_panel() {
         let (engine, settings, sessions, cookie) = dashboard_harness();
         engine
