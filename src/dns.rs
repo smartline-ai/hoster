@@ -342,6 +342,206 @@ impl DnsProvider for CloudflareProvider {
     }
 }
 
+const HETZNER_API: &str = "https://dns.hetzner.com/api/v1";
+
+/// Hetzner DNS over its v1 API. Record `name` is zone-relative (unlike
+/// Cloudflare's fully-qualified names), so every call converts the
+/// fully-qualified name crossing the trait via [`HetznerProvider::relative`].
+pub struct HetznerProvider {
+    token: String,
+    base_url: String,
+    http: reqwest::Client,
+    zone_cache: Mutex<BTreeMap<String, (String, String)>>, // name -> (zone_id, zone_name)
+}
+
+#[derive(Deserialize)]
+struct HzZone {
+    id: String,
+    name: String,
+}
+#[derive(Deserialize)]
+struct HzZones {
+    zones: Vec<HzZone>,
+}
+#[derive(Deserialize)]
+struct HzRecord {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    name: String,
+    value: String,
+}
+#[derive(Deserialize)]
+struct HzRecords {
+    records: Vec<HzRecord>,
+}
+
+impl HetznerProvider {
+    pub fn new(token: String) -> Self {
+        Self::with_base_url(token, HETZNER_API.to_string())
+    }
+
+    /// Construct against an arbitrary base URL, so tests can point at a local
+    /// mock server instead of Hetzner.
+    pub fn with_base_url(token: String, base_url: String) -> Self {
+        HetznerProvider {
+            token,
+            base_url,
+            http: reqwest::Client::new(),
+            zone_cache: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Attach Hetzner's custom auth header (not bearer auth).
+    fn req(&self, r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        r.header("Auth-API-Token", &self.token)
+    }
+
+    /// The zone owning `name`: the longest zone name that is a suffix of it.
+    async fn zone(&self, name: &str) -> anyhow::Result<(String, String)> {
+        if let Some(hit) = self.zone_cache.lock().unwrap().get(name).cloned() {
+            return Ok(hit);
+        }
+        let url = format!("{}/zones", self.base_url);
+        let zones: HzZones = self
+            .req(self.http.get(url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let best = zones
+            .zones
+            .into_iter()
+            .filter(|z| name == z.name || name.ends_with(&format!(".{}", z.name)))
+            .max_by_key(|z| z.name.len())
+            .ok_or_else(|| anyhow::anyhow!("no Hetzner zone found for {name}"))?;
+        let out = (best.id.clone(), best.name.clone());
+        self.zone_cache
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), out.clone());
+        Ok(out)
+    }
+
+    /// Convert a fully-qualified `name` to Hetzner's zone-relative form.
+    fn relative(name: &str, zone: &str) -> String {
+        if name == zone {
+            return "@".to_string();
+        }
+        name.strip_suffix(&format!(".{zone}"))
+            .unwrap_or(name)
+            .to_string()
+    }
+
+    async fn records(&self, zone_id: &str) -> anyhow::Result<Vec<HzRecord>> {
+        let url = format!("{}/records?zone_id={zone_id}", self.base_url);
+        let recs: HzRecords = self
+            .req(self.http.get(url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(recs.records)
+    }
+}
+
+#[async_trait]
+impl DnsProvider for HetznerProvider {
+    async fn upsert_txt(&self, name: &str, value: &str) -> anyhow::Result<()> {
+        let (zid, zname) = self.zone(name).await?;
+        let rel = Self::relative(name, &zname);
+        // TXT appends: only create if this exact value is absent.
+        let quoted = format!("\"{value}\"");
+        let exists = self
+            .records(&zid)
+            .await?
+            .into_iter()
+            .any(|r| r.kind == "TXT" && r.name == rel && r.value.trim_matches('"') == value);
+        if exists {
+            return Ok(());
+        }
+        let url = format!("{}/records", self.base_url);
+        let body = serde_json::json!({ "zone_id": zid, "type": "TXT", "name": rel, "value": quoted, "ttl": 60 });
+        self.req(self.http.post(url))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn delete_txt(&self, name: &str, value: &str) -> anyhow::Result<()> {
+        let (zid, zname) = self.zone(name).await?;
+        let rel = Self::relative(name, &zname);
+        let Some(rec) = self
+            .records(&zid)
+            .await?
+            .into_iter()
+            .find(|r| r.kind == "TXT" && r.name == rel && r.value.trim_matches('"') == value)
+        else {
+            return Ok(());
+        };
+        let url = format!("{}/records/{}", self.base_url, rec.id);
+        self.req(self.http.delete(url))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn upsert_a(&self, name: &str, ip: &str) -> anyhow::Result<()> {
+        let (zid, zname) = self.zone(name).await?;
+        let rel = Self::relative(name, &zname);
+        let existing = self
+            .records(&zid)
+            .await?
+            .into_iter()
+            .find(|r| r.kind == "A" && r.name == rel);
+        let body =
+            serde_json::json!({ "zone_id": zid, "type": "A", "name": rel, "value": ip, "ttl": 60 });
+        match existing {
+            Some(rec) => {
+                let url = format!("{}/records/{}", self.base_url, rec.id);
+                self.req(self.http.put(url))
+                    .json(&body)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+            None => {
+                let url = format!("{}/records", self.base_url);
+                self.req(self.http.post(url))
+                    .json(&body)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_a(&self, name: &str) -> anyhow::Result<()> {
+        let (zid, zname) = self.zone(name).await?;
+        let rel = Self::relative(name, &zname);
+        let Some(rec) = self
+            .records(&zid)
+            .await?
+            .into_iter()
+            .find(|r| r.kind == "A" && r.name == rel)
+        else {
+            return Ok(());
+        };
+        let url = format!("{}/records/{}", self.base_url, rec.id);
+        self.req(self.http.delete(url))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +839,45 @@ mod tests {
         assert_eq!(reqs[2].0, "POST", "first upsert with no record must POST");
         assert_eq!(reqs[4].0, "PUT", "second upsert must PUT the existing record");
         assert!(reqs[4].2.contains("2.2.2.2"));
+    }
+
+    #[tokio::test]
+    async fn hetzner_upsert_a_uses_zone_relative_name_and_token_header() {
+        let zones = r#"{"zones":[{"id":"z1","name":"example.com"}]}"#;
+        let none = r#"{"records":[]}"#;
+        let created = r#"{"record":{"id":"r1"}}"#;
+        let (addr, seen) = mock_server(vec![
+            (200, zones.into()),
+            (200, none.into()),
+            (200, created.into()),
+        ])
+        .await;
+        let h = HetznerProvider::with_base_url("tok".into(), format!("http://{addr}"));
+        h.upsert_a("*.dev.example.com", "1.2.3.4").await.unwrap();
+        let reqs = seen.lock().unwrap().clone();
+        let create = reqs.last().unwrap();
+        assert_eq!(create.0, "POST");
+        assert!(
+            create.2.contains("\"name\":\"*.dev\""),
+            "zone-relative name; got {}",
+            create.2
+        );
+        assert!(create.2.contains("1.2.3.4"));
+    }
+
+    #[tokio::test]
+    async fn hetzner_relative_name_is_apex_when_name_equals_zone() {
+        assert_eq!(
+            HetznerProvider::relative("dev.example.com", "dev.example.com"),
+            "@"
+        );
+        assert_eq!(
+            HetznerProvider::relative("*.dev.example.com", "example.com"),
+            "*.dev"
+        );
+        assert_eq!(
+            HetznerProvider::relative("*.dev.example.com", "dev.example.com"),
+            "*"
+        );
     }
 }
