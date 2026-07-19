@@ -18,10 +18,12 @@ the HTTP `Host` header, and keeps each branch on its own Docker network.
       backend-mybranch.dev.example.com  →  10.x.x.x:8080
 ```
 
-> **Status.** hoster serves **plain HTTP** (no built-in TLS) and authenticates
-> the control API with **one shared token**. It targets internal testing
-> environments, not public production. Front it with a TLS terminator for
-> HTTPS. See [Limitations](#limitations).
+> **Status.** hoster authenticates the control API with **one shared token**
+> and targets internal testing environments, not public production. TLS is
+> supported and opt-in: set `HOSTER_HTTPS_LISTEN` to have hoster obtain and
+> terminate its own Let's Encrypt certificates, or front it with your own TLS
+> terminator instead. See [Built-in TLS](#built-in-tls) and
+> [Limitations](#limitations).
 
 ## Contents
 
@@ -224,9 +226,11 @@ Set `HOSTER_HOSTNAME_TEMPLATE` to match the domain you chose.
 
 ### HTTPS with a reverse proxy
 
-hoster speaks plain HTTP. For HTTPS, terminate TLS in front of it and forward
-requests, preserving the `Host` header (hoster routes on it). Point the proxy
-listener at localhost and let the terminator own the public ports:
+This is the alternative to [Built-in TLS](#built-in-tls): instead of having
+hoster obtain and terminate its own certificates, terminate TLS in front of it
+with your own reverse proxy and forward requests, preserving the `Host`
+header (hoster routes on it). Point the proxy listener at localhost and let
+the terminator own the public ports:
 
 ```
 HOSTER_LISTEN=127.0.0.1:8080
@@ -615,8 +619,12 @@ build, tests, and shellcheck on every pull request and push to `main`.
 
 Known and deliberate for this build — plan around them:
 
-- **Plain HTTP, no built-in TLS.** Branch URLs are `http://`. Run hoster behind
-  a TLS terminator for HTTPS.
+- **Built-in TLS is opt-in and Cloudflare-only.** Leave `HOSTER_HTTPS_LISTEN`
+  unset and hoster serves plain HTTP, as before. Set it, and hoster
+  terminates TLS and manages Let's Encrypt certificates itself — but only
+  Cloudflare is supported as a DNS provider, and each domain still needs its
+  own wildcard DNS record and its own certificate. See
+  [Built-in TLS](#built-in-tls).
 - **One shared token.** Every CI caller uses the same `HOSTER_TOKEN`. Keep the
   control API off the public internet.
 - **HTTP services only.** Public routing works by the HTTP `Host` header. Raw
