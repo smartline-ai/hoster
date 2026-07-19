@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -11,6 +11,18 @@ use crate::runtime::{ContainerRuntime, ContainerSpec, LogStream, RunningContaine
 use crate::secrets::Store;
 use crate::settings::{Settings, hostname_for, sanitize_branch};
 use crate::template::{TemplateVars, substitute};
+
+/// Builds a live DNS provider from stored credentials — the signature of
+/// [`crate::dns::build_provider`]. A type alias because the `Box<dyn Fn(..)
+/// -> ..>` spelled out inline trips clippy's `type_complexity` lint.
+type DnsProviderBuilder = Box<
+    dyn Fn(
+            &crate::secrets::DnsProviderConfig,
+            &str,
+        ) -> anyhow::Result<Arc<dyn crate::dns::DnsProvider>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployStatus {
@@ -93,6 +105,17 @@ pub struct Engine<R: ContainerRuntime> {
     /// here because the engine is the shared state the control API already
     /// holds, and the control API is what exposes the trigger.
     renewal_trigger: Option<crate::renewal::RenewalTrigger>,
+    /// Dedup cache for `ensure_wildcard_dns`: wildcard base -> the public IP
+    /// it was last successfully pointed at. Lets repeated deploys of the same
+    /// project (e.g. its next branch) skip the redundant provider call, while
+    /// still re-ensuring if the box's public IP ever changes.
+    ensured_dns: Mutex<HashMap<String, String>>,
+    /// Builds the live DNS provider from stored credentials, used by
+    /// `ensure_wildcard_dns`. Production always leaves this at
+    /// `crate::dns::build_provider`; tests substitute a `FakeDns`-backed
+    /// builder (via `with_dns_provider_builder`) so the real `deploy` path
+    /// can be exercised without reaching real DNS APIs.
+    dns_provider_builder: DnsProviderBuilder,
 }
 
 impl<R: ContainerRuntime> Engine<R> {
@@ -123,6 +146,8 @@ impl<R: ContainerRuntime> Engine<R> {
             urls: Mutex::new(BTreeMap::new()),
             swap_lock: tokio::sync::Mutex::new(()),
             renewal_trigger: None,
+            ensured_dns: Mutex::new(HashMap::new()),
+            dns_provider_builder: Box::new(crate::dns::build_provider),
         }
     }
 
@@ -130,6 +155,24 @@ impl<R: ContainerRuntime> Engine<R> {
     /// a loop actually exists to be triggered.
     pub fn with_renewal_trigger(mut self, trigger: crate::renewal::RenewalTrigger) -> Self {
         self.renewal_trigger = Some(trigger);
+        self
+    }
+
+    /// Substitute the DNS provider builder `ensure_wildcard_dns` uses — test
+    /// only, so a deploy can exercise the real wildcard-DNS wiring against a
+    /// `FakeDns` instead of reaching real DNS APIs.
+    #[cfg(test)]
+    pub fn with_dns_provider_builder<F>(mut self, f: F) -> Self
+    where
+        F: Fn(
+                &crate::secrets::DnsProviderConfig,
+                &str,
+            ) -> anyhow::Result<Arc<dyn crate::dns::DnsProvider>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.dns_provider_builder = Box::new(f);
         self
     }
 
@@ -147,6 +190,12 @@ impl<R: ContainerRuntime> Engine<R> {
         self.status.lock().unwrap().get(branch).cloned()
     }
 
+    /// Snapshot of the wildcard-DNS dedup cache, for tests.
+    #[cfg(test)]
+    pub fn ensured_dns_snapshot(&self) -> HashMap<String, String> {
+        self.ensured_dns.lock().unwrap().clone()
+    }
+
     fn set_status(&self, branch: &str, s: DeployStatus) {
         self.status.lock().unwrap().insert(branch.to_string(), s);
     }
@@ -155,6 +204,11 @@ impl<R: ContainerRuntime> Engine<R> {
         config::validate(&req.config).map_err(|m| anyhow::anyhow!(m))?;
         let branch = sanitize_branch(&req.branch);
         self.set_status(&branch, DeployStatus::Provisioning);
+
+        // 0. best-effort: point the project's wildcard A record at this
+        // box's public IP. Never blocks or fails the deploy — see
+        // `ensure_wildcard_dns`.
+        self.ensure_wildcard_dns(&req.config.project).await;
 
         // 1. hostnames + urls for exposed services
         let urls = self.urls_for(&req.config.services, &branch, &req.config.project);
@@ -369,6 +423,70 @@ impl<R: ContainerRuntime> Engine<R> {
             .unwrap_or_else(|| self.settings.hostname_template.clone())
     }
 
+    /// Ensure the project's wildcard A record points at the box's public IP.
+    /// Best-effort: any DNS failure is logged and swallowed so a deploy is
+    /// never blocked by DNS. Skips when the resolved provider is
+    /// manual/absent, when the template has no wildcard base, or when
+    /// already ensured for this (base -> ip); re-ensures when the IP
+    /// changed. Builds the provider via `self.dns_provider_builder`, which
+    /// production leaves at `crate::dns::build_provider` and tests can
+    /// substitute (see `with_dns_provider_builder`) to avoid reaching real
+    /// DNS APIs.
+    async fn ensure_wildcard_dns(&self, project: &str) {
+        let template = self.template_for(project);
+        let Some(base) = crate::settings::wildcard_base(&template) else {
+            return;
+        };
+        let Some(cfg) = self
+            .store
+            .dns_provider_for(&base, &self.settings.hostname_template)
+        else {
+            return;
+        };
+        if cfg.kind == "manual" {
+            return;
+        }
+        // Not trimmed at the source (env vars are read verbatim), so guard
+        // here rather than let stray whitespace produce a bad DNS value.
+        let Some(ip) = self
+            .settings
+            .public_ip
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            tracing::warn!(
+                project = %project,
+                base = %base,
+                "DNS provider set but HOSTER_PUBLIC_IP is unset; skipping wildcard A"
+            );
+            return;
+        };
+        let ip = ip.to_string();
+        if self.ensured_dns.lock().unwrap().get(&base) == Some(&ip) {
+            return;
+        }
+        let provider = match (self.dns_provider_builder)(&cfg, &ip) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(project = %project, base = %base, error = %e, "failed to build DNS provider");
+                return;
+            }
+        };
+        match provider.upsert_a(&base, &ip).await {
+            Ok(()) => {
+                self.ensured_dns
+                    .lock()
+                    .unwrap()
+                    .insert(base.clone(), ip.clone());
+                tracing::info!(project = %project, base = %base, ip = %ip, "ensured wildcard A record");
+            }
+            Err(e) => {
+                tracing::error!(project = %project, base = %base, error = %e, "failed to ensure wildcard A record (deploy continues)");
+            }
+        }
+    }
+
     /// Compute the public URLs for a service map on a branch — the URL of every
     /// exposed service. Deterministic from config + branch + the project's
     /// template, so it works for views reconstructed from labels after a
@@ -518,9 +636,12 @@ fn branch_label(branch: &str) -> BTreeMap<String, String> {
 mod tests {
     use super::*;
     use crate::config;
+    use crate::dns::{DnsProvider, FakeDns};
     use crate::routing::SharedRoutes;
     use crate::runtime::FakeRuntime;
+    use crate::secrets::DnsProviderConfig;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn settings() -> Arc<crate::settings::Settings> {
         Arc::new(crate::settings::Settings {
@@ -532,6 +653,7 @@ mod tests {
             dashboard_password: None,
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
+            public_ip: None,
         })
     }
 
@@ -540,6 +662,14 @@ mod tests {
         Arc::new(crate::settings::Settings {
             https_listen: Some("0.0.0.0:8443".into()),
             ..(*settings()).clone()
+        })
+    }
+
+    /// `tls_settings()` plus a public IP, for wildcard-DNS tests.
+    fn tls_settings_with_ip(ip: &str) -> Arc<crate::settings::Settings> {
+        Arc::new(crate::settings::Settings {
+            public_ip: Some(ip.to_string()),
+            ..(*tls_settings()).clone()
         })
     }
 
@@ -600,6 +730,75 @@ mod tests {
         "postgres":{"image":"postgres:16"},
         "backend":{"image":"{{registry}}/backend:{{tag}}","env":{"DATABASE_URL":"postgres://postgres:5432/app","PUBLIC_URL":"{{url.backend}}"},"expose":{"port":8080}}
     }}"#;
+
+    /// A minimal, valid config for `myproj` — no exposed services needed for
+    /// the wildcard-DNS tests below, just something `config::validate` accepts.
+    const MYPROJ_CONFIG: &str =
+        r#"{"project":"myproj","services":{"web":{"image":"nginx:latest"}}}"#;
+
+    /// A `DnsProviderConfig` requiring no real credentials to construct or
+    /// validate — enough to route `ensure_wildcard_dns` past the `manual`
+    /// skip and into the (test-substituted) provider builder.
+    fn cloudflare_cfg() -> DnsProviderConfig {
+        DnsProviderConfig {
+            kind: "cloudflare".into(),
+            token: Some("tok".into()),
+            api_user: None,
+            api_key: None,
+            username: None,
+        }
+    }
+
+    fn manual_cfg() -> DnsProviderConfig {
+        DnsProviderConfig {
+            kind: "manual".into(),
+            token: None,
+            api_user: None,
+            api_key: None,
+            username: None,
+        }
+    }
+
+    /// `DnsProvider` whose `upsert_a` always fails — for asserting a deploy
+    /// survives a real-world DNS API error without ever inserting into the
+    /// dedup cache.
+    struct FailingDns;
+    #[async_trait]
+    impl DnsProvider for FailingDns {
+        async fn upsert_txt(&self, _name: &str, _value: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_txt(&self, _name: &str, _value: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn upsert_a(&self, _name: &str, _ip: &str) -> anyhow::Result<()> {
+            anyhow::bail!("simulated DNS API failure")
+        }
+        async fn delete_a(&self, _name: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Wires an `Engine<FakeRuntime>` the same as `engine_with_store`, but
+    /// with the DNS provider builder replaced by `build`, so
+    /// `ensure_wildcard_dns` (called internally by every `deploy`) can be
+    /// exercised deterministically instead of reaching real DNS APIs.
+    fn engine_with_dns_builder<F>(
+        store: Arc<Store>,
+        settings: Arc<crate::settings::Settings>,
+        build: F,
+    ) -> Engine<FakeRuntime>
+    where
+        F: Fn(&DnsProviderConfig, &str) -> anyhow::Result<Arc<dyn DnsProvider>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let rt = Arc::new(FakeRuntime::new());
+        let routes = SharedRoutes::new(crate::routing::RoutingTable::new());
+        Engine::with_readiness(rt, routes, settings, Arc::new(AlwaysReady), store)
+            .with_dns_provider_builder(build)
+    }
 
     #[tokio::test]
     async fn deploy_runs_all_services_and_routes_exposed_one() {
@@ -1201,5 +1400,228 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // -- wildcard DNS on deploy ------------------------------------------
+
+    /// Two deploys of the same project (its next branch) must ensure the
+    /// wildcard A record exactly once: the dedup cache ends up with one
+    /// base -> ip entry, AND the provider builder itself is invoked only
+    /// once. The second assertion matters — without it, a HashMap re-insert
+    /// of the same base/ip on every deploy would still leave `len() == 1`,
+    /// hiding a regression where the dedup skip was silently dropped and
+    /// every deploy re-hit the DNS API.
+    #[tokio::test]
+    async fn deploy_ensures_wildcard_once_per_base() {
+        let store = empty_store();
+        store.set_acme_config("me@example.com", None).unwrap();
+        store.set_dns_provider(cloudflare_cfg()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake = Arc::new(FakeDns::new());
+        let eng = {
+            let calls = calls.clone();
+            let fake = fake.clone();
+            engine_with_dns_builder(store, tls_settings_with_ip("1.2.3.4"), move |_cfg, _ip| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fake.clone() as Arc<dyn DnsProvider>)
+            })
+        };
+
+        deploy_config(&eng, "feature-a", MYPROJ_CONFIG)
+            .await
+            .unwrap();
+        deploy_config(&eng, "feature-b", MYPROJ_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "provider builder must run once despite two deploys"
+        );
+        let ensured = eng.ensured_dns_snapshot();
+        assert_eq!(
+            ensured.get("*.dev.example.com").map(String::as_str),
+            Some("1.2.3.4")
+        );
+        assert_eq!(ensured.len(), 1, "one base ensured despite two deploys");
+        assert_eq!(
+            fake.a_value("*.dev.example.com"),
+            Some("1.2.3.4".to_string())
+        );
+    }
+
+    /// If the box's public IP changes between deploys, the wildcard A record
+    /// must be re-ensured (not skipped by the dedup cache keyed on the old
+    /// value), and the cache must reflect the new IP afterward.
+    #[tokio::test]
+    async fn deploy_reensures_wildcard_when_public_ip_changes() {
+        let store = empty_store();
+        store.set_acme_config("me@example.com", None).unwrap();
+        store.set_dns_provider(cloudflare_cfg()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake = Arc::new(FakeDns::new());
+        let eng = {
+            let calls = calls.clone();
+            let fake = fake.clone();
+            engine_with_dns_builder(store, tls_settings_with_ip("5.6.7.8"), move |_cfg, _ip| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fake.clone() as Arc<dyn DnsProvider>)
+            })
+        };
+        // Pretend a previous run already ensured this base at a stale IP.
+        eng.ensured_dns
+            .lock()
+            .unwrap()
+            .insert("*.dev.example.com".to_string(), "1.1.1.1".to_string());
+
+        deploy_config(&eng, "feature-a", MYPROJ_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "re-ensured once for the new IP"
+        );
+        let ensured = eng.ensured_dns_snapshot();
+        assert_eq!(
+            ensured.get("*.dev.example.com").map(String::as_str),
+            Some("5.6.7.8"),
+            "cache must reflect the new IP, not the stale one"
+        );
+    }
+
+    /// A manual (or absent) DNS provider must skip wildcard-DNS management
+    /// entirely: no provider is built, no dedup entry is recorded, and the
+    /// deploy still succeeds.
+    #[tokio::test]
+    async fn deploy_skips_dns_for_manual_provider() {
+        let store = empty_store();
+        store.set_acme_config("me@example.com", None).unwrap();
+        store.set_dns_provider(manual_cfg()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let eng = {
+            let calls = calls.clone();
+            engine_with_dns_builder(store, tls_settings_with_ip("1.2.3.4"), move |_cfg, _ip| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(FakeDns::new()) as Arc<dyn DnsProvider>)
+            })
+        };
+
+        deploy_config(&eng, "feature-a", MYPROJ_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "manual must never build a provider"
+        );
+        assert!(
+            eng.ensured_dns_snapshot().is_empty(),
+            "manual must never populate the dedup cache"
+        );
+    }
+
+    /// A DNS provider is configured, but the operator hasn't set
+    /// `HOSTER_PUBLIC_IP` (`settings.public_ip` is `None`): the deploy must
+    /// still succeed, no provider is built, and nothing is recorded as
+    /// ensured (so it's retried once the IP is actually set).
+    #[tokio::test]
+    async fn deploy_warns_and_skips_when_public_ip_unset() {
+        let store = empty_store();
+        store.set_acme_config("me@example.com", None).unwrap();
+        store.set_dns_provider(cloudflare_cfg()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // `tls_settings()` (no `_with_ip`) leaves `public_ip: None`.
+        let eng = {
+            let calls = calls.clone();
+            engine_with_dns_builder(store, tls_settings(), move |_cfg, _ip| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(FakeDns::new()) as Arc<dyn DnsProvider>)
+            })
+        };
+
+        deploy_config(&eng, "feature-a", MYPROJ_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(eng.ensured_dns_snapshot().is_empty());
+    }
+
+    /// A project whose hostname template has no wildcard base (its first
+    /// label carries no placeholder) needs no wildcard certificate or A
+    /// record — `ensure_wildcard_dns` must skip before ever touching the
+    /// store's DNS provider.
+    #[tokio::test]
+    async fn deploy_skips_dns_when_template_has_no_wildcard_base() {
+        let settings = Arc::new(crate::settings::Settings {
+            hostname_template: "static.example.com".to_string(),
+            public_ip: Some("1.2.3.4".to_string()),
+            ..(*settings()).clone()
+        });
+        let store = empty_store();
+        store.set_acme_config("me@example.com", None).unwrap();
+        store.set_dns_provider(cloudflare_cfg()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let eng = {
+            let calls = calls.clone();
+            engine_with_dns_builder(store, settings, move |_cfg, _ip| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(FakeDns::new()) as Arc<dyn DnsProvider>)
+            })
+        };
+
+        deploy_config(&eng, "feature-a", MYPROJ_CONFIG)
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(eng.ensured_dns_snapshot().is_empty());
+    }
+
+    /// A DNS API failure while ensuring the wildcard A record must not fail
+    /// the deploy, and must not be recorded as ensured (so the next deploy
+    /// retries it rather than silently believing it succeeded).
+    #[tokio::test]
+    async fn deploy_continues_when_dns_upsert_fails() {
+        let store = empty_store();
+        store.set_acme_config("me@example.com", None).unwrap();
+        store.set_dns_provider(cloudflare_cfg()).unwrap();
+        let eng = engine_with_dns_builder(store, tls_settings_with_ip("1.2.3.4"), |_cfg, _ip| {
+            Ok(Arc::new(FailingDns) as Arc<dyn DnsProvider>)
+        });
+
+        let accepted = deploy_config(&eng, "feature-a", MYPROJ_CONFIG).await;
+        assert!(
+            accepted.is_ok(),
+            "a DNS upsert failure must not fail the deploy"
+        );
+        assert!(
+            eng.ensured_dns_snapshot().is_empty(),
+            "a failed upsert must not be recorded as ensured"
+        );
+    }
+
+    /// A failure to build the provider itself (e.g. invalid stored
+    /// credentials) is the other non-fatal path — it must be logged and
+    /// swallowed just like an upsert failure.
+    #[tokio::test]
+    async fn deploy_continues_when_dns_provider_build_fails() {
+        let store = empty_store();
+        store.set_acme_config("me@example.com", None).unwrap();
+        store.set_dns_provider(cloudflare_cfg()).unwrap();
+        let eng = engine_with_dns_builder(store, tls_settings_with_ip("1.2.3.4"), |_cfg, _ip| {
+            anyhow::bail!("simulated credential failure")
+        });
+
+        let accepted = deploy_config(&eng, "feature-a", MYPROJ_CONFIG).await;
+        assert!(
+            accepted.is_ok(),
+            "a provider build failure must not fail the deploy"
+        );
+        assert!(eng.ensured_dns_snapshot().is_empty());
     }
 }

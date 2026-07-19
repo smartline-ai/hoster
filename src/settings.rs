@@ -12,6 +12,9 @@ pub struct Settings {
     pub https_listen: Option<String>,
     /// Root directory of the certificate store.
     pub cert_dir: String,
+    /// The box's public IP, published as the wildcard A record's target.
+    /// Required once any non-manual DNS provider is configured.
+    pub public_ip: Option<String>,
 }
 
 impl Settings {
@@ -52,6 +55,7 @@ impl std::fmt::Debug for Settings {
             )
             .field("https_listen", &self.https_listen)
             .field("cert_dir", &self.cert_dir)
+            .field("public_ip", &self.public_ip)
             .finish()
     }
 }
@@ -348,6 +352,7 @@ mod tests {
             dashboard_password: None,
             https_listen: https_listen.map(str::to_string),
             cert_dir: "/tmp/hoster-test-certs".into(),
+            public_ip: None,
         }
     }
 
@@ -677,6 +682,22 @@ branch_len={branch_len}: label {label:?} has an invalid byte"
     }
 
     #[test]
+    fn settings_carries_public_ip() {
+        let s = Settings {
+            listen: "127.0.0.1:0".into(),
+            api_listen: "127.0.0.1:0".into(),
+            hostname_template: "{service}-{branch}.dev.example.com".into(),
+            registry: "".into(),
+            token: "t".into(),
+            dashboard_password: None,
+            https_listen: None,
+            cert_dir: "/tmp".into(),
+            public_ip: Some("1.2.3.4".into()),
+        };
+        assert_eq!(s.public_ip.as_deref(), Some("1.2.3.4"));
+    }
+
+    #[test]
     fn settings_debug_redacts_the_token_and_dashboard_password() {
         let settings = Settings {
             listen: "127.0.0.1:8080".to_string(),
@@ -687,6 +708,7 @@ branch_len={branch_len}: label {label:?} has an invalid byte"
             dashboard_password: Some("topsecret_dashboard_password".to_string()),
             https_listen: None,
             cert_dir: "/var/lib/hoster/certs".to_string(),
+            public_ip: None,
         };
         let dbg = format!("{settings:?}");
         assert!(

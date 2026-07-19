@@ -81,11 +81,13 @@ the HTTP `Host` header, and keeps each branch on its own Docker network.
    [Wildcard DNS](#wildcard-dns)).
 3. **A container registry** your CI pushes images to and the host can pull from.
 4. **`curl` or `wget`** on the host (the installer uses whichever is present).
-5. **For built-in TLS only: the domain's DNS zone hosted at Cloudflare.**
-   Certificates are issued over the ACME DNS-01 challenge, and **Cloudflare is
-   the only DNS provider implemented** — hoster needs an API token that can
-   write TXT records in the zone. If your DNS lives elsewhere, terminate TLS in
-   front of hoster instead (see
+5. **For built-in TLS only: the domain's DNS zone reachable by a supported
+   provider.** Certificates are issued over the ACME DNS-01 challenge.
+   **Cloudflare, Hetzner, and Namecheap** are implemented (hoster needs an API
+   credential that can write TXT records in the zone); a **manual** mode is also
+   available, where hoster manages no records and you create them yourself. If
+   your DNS lives somewhere without a provider, use manual mode or terminate TLS
+   in front of hoster instead (see
    [HTTPS with a reverse proxy](#https-with-a-reverse-proxy)).
 
 New host? Follow [Setting up a host, end to end](#setting-up-a-host-end-to-end)
@@ -678,7 +680,12 @@ hoster can terminate TLS itself, issuing and renewing its own Let's Encrypt
 certificates instead of sitting behind nginx or another reverse proxy.
 Certificates are issued via the ACME **DNS-01** challenge, so they can be
 wildcards — one certificate per domain covers every branch's hostname.
-**Only Cloudflare is supported as a DNS provider today.**
+**Cloudflare, Hetzner, and Namecheap are supported as DNS providers**, plus a
+**manual** mode where hoster manages no records and you create them yourself.
+The provider can be set globally and overridden per project. When a non-manual
+provider is configured and `HOSTER_PUBLIC_IP` is set, hoster also keeps each
+project's wildcard `A` record (`*.<base>` → the host IP) up to date, so you no
+longer have to create it by hand.
 
 This section is the reference. For the order to do it in on a new host — plain
 HTTP first, then staging on a high port, then production — follow
@@ -935,13 +942,12 @@ build, tests, and shellcheck on every pull request and push to `main`.
 
 Known and deliberate for this build — plan around them:
 
-- **Built-in TLS is opt-in and Cloudflare-only.** Leave `HOSTER_HTTPS_LISTEN`
-  unset and hoster serves plain HTTP, as before. Set it, and hoster
-  terminates TLS and manages Let's Encrypt certificates itself — but only
-  Cloudflare is supported as a DNS provider, and each domain still needs its
-  own wildcard DNS record and its own certificate. Issuance has **not yet been
-  exercised against a live ACME server**, so start on staging. See
-  [Built-in TLS](#built-in-tls).
+- **Built-in TLS is opt-in.** Leave `HOSTER_HTTPS_LISTEN` unset and hoster
+  serves plain HTTP, as before. Set it, and hoster terminates TLS and manages
+  Let's Encrypt certificates itself. DNS-01 issuance supports Cloudflare,
+  Hetzner, and Namecheap (or manual mode); each domain gets its own wildcard
+  certificate. Issuance has **not yet been exercised against a live ACME
+  server**, so start on staging. See [Built-in TLS](#built-in-tls).
 - **One shared token.** Every CI caller uses the same `HOSTER_TOKEN`. Keep the
   control API off the public internet.
 - **HTTP services only.** Public routing works by the HTTP `Host` header. Raw

@@ -75,6 +75,6 @@ pub fn settings_page(
     certs: &[CertRow],
 ) -> String {
     let projects = project_names(deployments, env);
-    let body = settings::settings_body(settings, acme, certs);
+    let body = settings::settings_body(settings, env, acme, certs);
     app_shell(Nav::Settings, &projects, &body)
 }

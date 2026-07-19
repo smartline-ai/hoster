@@ -45,10 +45,38 @@ your own project at it.
    socket and dials container IPs directly.
 2. **Wildcard DNS** pointing at the host. If your hostname template is
    `{service}-{branch}.dev.example.com`, create an `A` record for
-   `*.dev.example.com` → the host's IP.
+   `*.dev.example.com` → the host's IP. See [DNS providers](#dns-providers) if
+   you'd rather hoster keep that record (and TLS certificates) in sync itself.
 3. **A container registry** your CI pushes images to and the host can pull from.
 4. **The `hoster` binary** — `cargo build --release`, then run
    `target/release/hoster`.
+
+---
+
+## DNS providers
+
+hoster can manage its own wildcard `A` record — and, with an ACME account
+configured, the `_acme-challenge` TXT records DNS-01 issuance needs — instead
+of you maintaining the zone by hand. Configure this from the dashboard's
+`/settings` page (**TLS & DNS** → **DNS setup**), which offers a guided picker
+for four provider kinds:
+
+| Kind | Fields | Notes |
+| --- | --- | --- |
+| `cloudflare` | `token` | A scoped API token with `Zone:DNS:Edit` on the zone your base domain lives in. |
+| `hetzner` | `token` | An API token from the Hetzner DNS console for that zone. |
+| `namecheap` | `api_user`, `api_key`, `username` | **Requires an IP allowlist first**: Namecheap rejects API calls from any IP not allowlisted under *API Access* in your account, before it even looks at the credentials — allowlist `HOSTER_PUBLIC_IP` there before saving. |
+| `manual` | *(none)* | hoster does not touch DNS. The `/settings` panel still lists the exact records to create by hand — one wildcard `A` record per project base domain, plus the `_acme-challenge` TXT note while TLS is on. |
+
+Any provider except `manual` needs **`HOSTER_PUBLIC_IP`** set to the host's
+public IP — it's the target of every wildcard `A` record hoster writes. Leave
+it unset only for `manual` mode; the dashboard warns inline if a non-manual
+provider is configured without it, since the wildcard record is silently
+skipped rather than deploys failing loudly.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HOSTER_PUBLIC_IP` | *(unset)* | The host's public IP, published as every wildcard `A` record's target. Required once any non-manual DNS provider is configured. |
 
 ---
 
