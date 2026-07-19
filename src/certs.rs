@@ -64,6 +64,16 @@ impl CertStore {
         };
         for entry in entries.flatten() {
             let dir = entry.path();
+            // Only directories are certificates. Files that legitimately live
+            // in the store root — the renewal loop's `renewal-state.json`, and
+            // the `.tmp` file that exists mid-`write_atomic` — are not
+            // certificates that failed to load, so they must not be warned
+            // about; `load_all` runs on every dashboard request, and a warning
+            // per request for a file that is exactly where it belongs is noise
+            // that hides the real ones.
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
             let Ok(domain) = std::fs::read_to_string(dir.join("domain")) else {
                 tracing::warn!(dir = %dir.display(), "missing or unreadable domain file; ignoring");
                 continue;
@@ -509,6 +519,24 @@ mod tests {
         // directory some other process left behind.
         std::fs::remove_file(store.dir_for("*.dev.example.com").join("domain")).unwrap();
         assert!(store.load_all(now_ts()).is_empty());
+    }
+
+    /// The renewal loop persists `renewal-state.json` in the store root, and
+    /// `write_atomic` leaves a `.tmp` sibling mid-write. Neither is a
+    /// certificate directory, so the scan must pass over both silently rather
+    /// than treating them as certificates that failed to load.
+    #[test]
+    fn load_all_ignores_plain_files_in_the_store_root() {
+        let root = temp_dir();
+        let store = CertStore::new(root.clone());
+        let (chain, key, _) = self_signed("dev.example.com", 3600);
+        store.save("*.dev.example.com", &chain, &key).unwrap();
+        std::fs::write(root.join("renewal-state.json"), b"{}").unwrap();
+        std::fs::write(root.join("renewal-state.json.tmp"), b"{").unwrap();
+
+        let all = store.load_all(now_ts());
+        assert_eq!(all.len(), 1, "only the certificate directory is a cert");
+        assert_eq!(all[0].domain, "*.dev.example.com");
     }
 
     #[test]
