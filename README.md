@@ -789,15 +789,15 @@ a domain.
 
 #### Cutting over from nginx
 
-The same sequence as steps 6c–6f of
+The same sequence as step 6 of
 [Setting up a host, end to end](#setting-up-a-host-end-to-end), condensed for
 an install that already serves traffic. To move an existing nginx-terminated
 install to built-in TLS without a gap:
 
-1. Set `HOSTER_HTTPS_LISTEN=0.0.0.0:8443` (or any free port) so hoster runs
-   its HTTPS listener *alongside* nginx, which keeps `:443` for now.
-2. Configure the ACME account and Cloudflare token as above, staying on
+1. Configure the ACME account and Cloudflare token as above, staying on
    staging.
+2. Set `HOSTER_HTTPS_LISTEN=0.0.0.0:8443` (or any free port) so hoster runs
+   its HTTPS listener *alongside* nginx, which keeps `:443` for now.
 3. Watch the certificate table until every domain you care about reads
    `valid`, then confirm a branch actually serves over it:
    ```bash
