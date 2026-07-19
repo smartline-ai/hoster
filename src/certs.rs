@@ -31,6 +31,13 @@ impl CertStore {
         CertStore { dir }
     }
 
+    /// The store's root directory — the natural home for files that travel
+    /// alongside the certificates, such as the renewal loop's persisted
+    /// per-domain backoff state.
+    pub fn root(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     /// The directory holding one domain's files. This mapping only needs to
     /// be collision-free, not reversible: the exact domain is written into a
     /// `domain` file inside the directory at `save()` time and read back by
@@ -194,7 +201,11 @@ fn parse_validity(pem: &str) -> Option<(i64, i64)> {
 /// already in effect (never created with a default, wider mode and chmod'd
 /// afterward — that would leave a window where e.g. a private key is
 /// world-readable), then renamed into place.
-fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+///
+/// `pub(crate)` so [`crate::renewal`] can persist its backoff state next to
+/// the certificates with the same atomicity guarantee, without duplicating
+/// this logic.
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     let tmp = path.with_extension("tmp");

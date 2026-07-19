@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Settings {
     pub listen: String,
     pub api_listen: String,
@@ -12,6 +12,29 @@ pub struct Settings {
     pub https_listen: Option<String>,
     /// Root directory of the certificate store.
     pub cert_dir: String,
+}
+
+/// A hand-written `Debug` that redacts `token` (the bearer credential that
+/// authenticates the whole control API) and `dashboard_password` — the same
+/// reasoning as [`crate::secrets::DnsProviderConfig`]'s impl: a derived
+/// `Debug` would print both in full the moment anything logs or formats a
+/// `Settings` value.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("listen", &self.listen)
+            .field("api_listen", &self.api_listen)
+            .field("hostname_template", &self.hostname_template)
+            .field("registry", &self.registry)
+            .field("token", &"[redacted]")
+            .field(
+                "dashboard_password",
+                &self.dashboard_password.as_ref().map(|_| "[redacted]"),
+            )
+            .field("https_listen", &self.https_listen)
+            .field("cert_dir", &self.cert_dir)
+            .finish()
+    }
 }
 
 /// Turn an arbitrary git branch into a DNS label: lowercase, non-alphanumeric
@@ -612,6 +635,33 @@ branch_len={branch_len}: label {label:?} has an invalid byte"
         assert_eq!(
             cert_identifiers("hoster.example.com"),
             vec!["hoster.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn settings_debug_redacts_the_token_and_dashboard_password() {
+        let settings = Settings {
+            listen: "127.0.0.1:8080".to_string(),
+            api_listen: "127.0.0.1:8081".to_string(),
+            hostname_template: "{service}-{branch}.dev.example.com".to_string(),
+            registry: "localhost:5000".to_string(),
+            token: "topsecret_bearer_token".to_string(),
+            dashboard_password: Some("topsecret_dashboard_password".to_string()),
+            https_listen: None,
+            cert_dir: "/var/lib/hoster/certs".to_string(),
+        };
+        let dbg = format!("{settings:?}");
+        assert!(
+            !dbg.contains("topsecret_bearer_token"),
+            "bearer token leaked via Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("topsecret_dashboard_password"),
+            "dashboard password leaked via Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("127.0.0.1:8080"),
+            "non-secret fields should still be visible: {dbg}"
         );
     }
 }

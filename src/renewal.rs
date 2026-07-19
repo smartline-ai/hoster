@@ -1,8 +1,11 @@
 //! The background certificate renewal loop.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use crate::acme::CertIssuer;
 use crate::certs::{CertStore, StoredCert};
@@ -34,11 +37,53 @@ pub fn next_attempt(failures: u32, last_attempt: i64) -> i64 {
 }
 
 /// Per-domain failure state, for backoff and for display.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DomainState {
     pub failures: u32,
     pub last_attempt: i64,
     pub last_error: Option<String>,
+}
+
+/// Where per-domain renewal state is persisted: alongside the certificates,
+/// under the store's root — the natural home, per the design this fixes.
+fn state_path(store: &CertStore) -> PathBuf {
+    store.root().join("renewal-state.json")
+}
+
+/// Persist per-domain failure state atomically, the same way certificates
+/// are written, so a crash mid-write never leaves a half-written (and thus
+/// unparseable) file behind.
+///
+/// This is the fix for a restart resetting the backoff: without it, a crash
+/// loop (a flapping Docker socket, say) reissues with zero backoff on every
+/// boot, and five restarts within an hour can exhaust Let's Encrypt's
+/// five-authorization-failures-per-identifier-per-hour limit.
+pub fn save_state(store: &CertStore, state: &BTreeMap<String, DomainState>) -> anyhow::Result<()> {
+    let path = state_path(store);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(state)?;
+    crate::certs::write_atomic(&path, json.as_bytes(), 0o600)
+}
+
+/// Load persisted per-domain failure state. A missing file (first boot, or
+/// an upgrade from a version that didn't persist state) or an unparseable
+/// one (a corrupt write, a foreign file) is treated as empty state rather
+/// than a startup failure — this file is an optimization the loop can do
+/// without, not a source of truth it depends on.
+pub fn load_state(store: &CertStore) -> BTreeMap<String, DomainState> {
+    let raw = match std::fs::read_to_string(state_path(store)) {
+        Ok(raw) => raw,
+        Err(_) => return BTreeMap::new(),
+    };
+    match serde_json::from_str(&raw) {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::warn!(error = %e, "renewal state file is corrupt; starting with empty state");
+            BTreeMap::new()
+        }
+    }
 }
 
 /// Seconds since the Unix epoch.
@@ -61,27 +106,39 @@ pub async fn run_once(
 ) -> BTreeMap<String, DomainState> {
     let mut changed = false;
     for domain in store.due(wanted, now) {
-        let st = state.entry(domain.clone()).or_default();
-        if now < next_attempt(st.failures, st.last_attempt) {
-            continue;
+        // Scoped so this borrow of `state` ends before the entry is
+        // re-acquired below — `state.remove` on a clean issuance needs
+        // `state` free again, and re-borrowing per branch (rather than
+        // holding one `&mut DomainState` across the whole match) is what
+        // makes that possible.
+        {
+            let st = state.entry(domain.clone()).or_default();
+            if now < next_attempt(st.failures, st.last_attempt) {
+                continue;
+            }
+            st.last_attempt = now;
         }
-        st.last_attempt = now;
         match issuer.issue(&domain).await {
             Ok(cert) => match store.save(&domain, &cert.chain_pem, &cert.key_pem) {
                 Ok(()) => {
                     tracing::info!(domain = %domain, "certificate issued");
-                    st.failures = 0;
-                    st.last_error = None;
+                    // Clear the domain's entry entirely, rather than merely
+                    // zeroing its counters, so a successful issuance doesn't
+                    // leave stale bookkeeping (e.g. a `last_error` from a
+                    // prior failure) sitting in the persisted state file.
+                    state.remove(&domain);
                     changed = true;
                 }
                 Err(e) => {
                     tracing::error!(domain = %domain, error = %e, "failed to save certificate");
+                    let st = state.entry(domain.clone()).or_default();
                     st.failures += 1;
                     st.last_error = Some(e.to_string());
                 }
             },
             Err(e) => {
                 tracing::warn!(domain = %domain, error = %e, "certificate issuance failed");
+                let st = state.entry(domain.clone()).or_default();
                 st.failures += 1;
                 st.last_error = Some(e.to_string());
             }
@@ -111,16 +168,23 @@ fn rebuild(store: &CertStore, shared: &SharedCerts, now: i64) {
 ///
 /// `wanted` is re-evaluated on every pass rather than captured once, so a
 /// project configured after startup gets a certificate without a restart.
+///
+/// Failure state is loaded from disk before the first pass and saved after
+/// every pass, so a restart (a deploy, a crash, a flapping Docker socket)
+/// does not reset backoff to zero — see [`save_state`] for why that matters.
 pub async fn run_loop(
     issuer: Arc<dyn CertIssuer>,
     store: Arc<CertStore>,
     shared: SharedCerts,
     wanted: impl Fn() -> Vec<String> + Send + 'static,
 ) {
-    let mut state = BTreeMap::new();
+    let mut state = load_state(&store);
     loop {
         let now = now_secs();
         state = run_once(issuer.as_ref(), &store, &shared, &wanted(), state, now).await;
+        if let Err(e) = save_state(&store, &state) {
+            tracing::error!(error = %e, "failed to persist renewal state");
+        }
         tokio::time::sleep(PASS_INTERVAL).await;
     }
 }
@@ -164,6 +228,19 @@ mod tests {
     impl crate::acme::CertIssuer for AlwaysFails {
         async fn issue(&self, _domain: &str) -> anyhow::Result<crate::acme::IssuedCert> {
             anyhow::bail!("nope")
+        }
+    }
+
+    struct AlwaysSucceeds;
+
+    #[async_trait::async_trait]
+    impl crate::acme::CertIssuer for AlwaysSucceeds {
+        async fn issue(&self, _domain: &str) -> anyhow::Result<crate::acme::IssuedCert> {
+            Ok(crate::acme::IssuedCert {
+                chain_pem: "not a real chain, but store.save() doesn't validate PEM content"
+                    .to_string(),
+                key_pem: "not a real key either".to_string(),
+            })
         }
     }
 
@@ -243,6 +320,143 @@ mod tests {
         assert!(
             !state.contains_key("*.old.example.com"),
             "state for a domain that is no longer wanted must not linger"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_issuance_clears_the_domains_state() {
+        let store = CertStore::new(temp_dir("clear-on-success"));
+        let shared = SharedCerts::new(CertResolver::from_certs(&[]).unwrap());
+        let wanted = vec!["*.dev.example.com".to_string()];
+
+        let mut failing_state = BTreeMap::new();
+        failing_state.insert(
+            "*.dev.example.com".to_string(),
+            DomainState {
+                failures: 1,
+                last_attempt: 0,
+                last_error: Some("previous failure".to_string()),
+            },
+        );
+
+        // failures=1, last_attempt=0 backs off only until `next_attempt(1,
+        // 0) == 900`; `now` below (1000) is past that, so the pass actually
+        // attempts issuance instead of being skipped for still being in
+        // backoff.
+        let state = run_once(
+            &AlwaysSucceeds,
+            &store,
+            &shared,
+            &wanted,
+            failing_state,
+            1000,
+        )
+        .await;
+        assert!(
+            !state.contains_key("*.dev.example.com"),
+            "a successful issuance must clear the domain's entry, not just zero its counters"
+        );
+    }
+
+    #[test]
+    fn renewal_state_round_trips_through_save_and_load() {
+        let store = CertStore::new(temp_dir("round-trip"));
+        let mut state = BTreeMap::new();
+        state.insert(
+            "*.dev.example.com".to_string(),
+            DomainState {
+                failures: 2,
+                last_attempt: 12345,
+                last_error: Some("nope".to_string()),
+            },
+        );
+        state.insert(
+            "hoster.example.com".to_string(),
+            DomainState {
+                failures: 0,
+                last_attempt: 0,
+                last_error: None,
+            },
+        );
+
+        save_state(&store, &state).unwrap();
+        let loaded = load_state(&store);
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["*.dev.example.com"].failures, 2);
+        assert_eq!(loaded["*.dev.example.com"].last_attempt, 12345);
+        assert_eq!(
+            loaded["*.dev.example.com"].last_error.as_deref(),
+            Some("nope")
+        );
+        assert_eq!(loaded["hoster.example.com"].failures, 0);
+    }
+
+    #[test]
+    fn loading_state_with_no_file_present_yields_empty_state() {
+        // No `save_state` call at all — this is first boot, or an upgrade
+        // from a version that never wrote this file.
+        let store = CertStore::new(temp_dir("no-file"));
+        assert!(load_state(&store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_domain_still_in_backoff_survives_a_restart() {
+        let store = CertStore::new(temp_dir("survives-restart"));
+        let shared = SharedCerts::new(CertResolver::from_certs(&[]).unwrap());
+        let wanted = vec!["*.dev.example.com".to_string()];
+
+        // Fail once, then persist — the write a real `run_loop` would do
+        // after every pass.
+        let state = run_once(
+            &AlwaysFails,
+            &store,
+            &shared,
+            &wanted,
+            Default::default(),
+            1000,
+        )
+        .await;
+        assert_eq!(state["*.dev.example.com"].failures, 1);
+        save_state(&store, &state).unwrap();
+
+        // Simulate a restart: drop the in-memory map entirely and load a
+        // fresh one from disk, exactly as `run_loop` does on boot.
+        drop(state);
+        let restarted_state = load_state(&store);
+        assert_eq!(
+            restarted_state["*.dev.example.com"].failures, 1,
+            "failure count must survive the simulated restart"
+        );
+
+        // One minute after the original failure — still well inside the
+        // 15-minute backoff window. A process that reset backoff on restart
+        // would retry here; the fix must not.
+        let state_after_restart = run_once(
+            &AlwaysFails,
+            &store,
+            &shared,
+            &wanted,
+            restarted_state,
+            1060,
+        )
+        .await;
+        assert_eq!(
+            state_after_restart["*.dev.example.com"].failures, 1,
+            "a domain still inside its persisted backoff window must be skipped after a restart"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_state_file_loads_as_empty_state_rather_than_panicking() {
+        let store = CertStore::new(temp_dir("corrupt"));
+        std::fs::create_dir_all(store.root()).unwrap();
+        std::fs::write(state_path(&store), b"{ this is not valid json").unwrap();
+
+        let state = load_state(&store);
+        assert!(
+            state.is_empty(),
+            "a corrupt state file must load as empty state, not panic or propagate an error"
         );
     }
 }

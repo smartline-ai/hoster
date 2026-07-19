@@ -103,8 +103,14 @@ async fn serve_https(
                     return;
                 }
             };
-            let service =
-                service_fn(move |req| hoster::proxy::handle(req, routes.clone(), client.clone()));
+            let service = service_fn(move |req| {
+                hoster::proxy::handle(
+                    req,
+                    routes.clone(),
+                    client.clone(),
+                    hoster::proxy::Scheme::Https,
+                )
+            });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(tls), service)
                 .with_upgrades()

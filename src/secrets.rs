@@ -20,20 +20,45 @@ pub const MAX_VALUE_LEN: usize = 32 * 1024;
 
 /// One stored variable: its secret value and the services it targets. An empty
 /// `services` list means every service in the project.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Var {
     pub value: String,
     #[serde(default)]
     pub services: Vec<String>,
 }
 
+/// A hand-written `Debug` — the derived one would print `value` (an arbitrary
+/// secret: an API key, a DB password, anything a project stores) in full.
+/// `Debug` is not protected by a masked type the way serialization is, so
+/// this has to redact explicitly rather than by construction.
+impl std::fmt::Debug for Var {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Var")
+            .field("value", &"[redacted]")
+            .field("services", &self.services)
+            .finish()
+    }
+}
+
 /// A project's container-registry credential. One per project; applied at pull
 /// time only to images whose host matches `registry`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryCred {
     pub registry: String,
     pub username: String,
     pub password: String,
+}
+
+/// A hand-written `Debug` that redacts `password` — see [`Var`]'s impl for
+/// why this cannot be `derive`d.
+impl std::fmt::Debug for RegistryCred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryCred")
+            .field("registry", &self.registry)
+            .field("username", &self.username)
+            .field("password", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,10 +74,24 @@ struct ProjectData {
 /// A DNS provider's credentials. The token can rewrite DNS — treat it as the
 /// most dangerous secret in the store. It leaves this module only through
 /// [`Store::acme_config`], which exists solely to feed issuance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsProviderConfig {
     pub kind: String,
     pub token: String,
+}
+
+/// A hand-written `Debug` that redacts `token` while still showing `kind` —
+/// the masked [`MaskedAcme`] type protects serialization, but a derived
+/// `Debug` here would print the token in full the moment anything (now or in
+/// future code) formats this with `{:?}`. `Debug` gets no such protection
+/// from a separate type, so it has to be redacted by hand.
+impl std::fmt::Debug for DnsProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsProviderConfig")
+            .field("kind", &self.kind)
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 /// The ACME account settings, plus (optionally) the DNS credentials issuance
@@ -1023,5 +1062,66 @@ mod tests {
             Some("v")
         );
         assert!(s.hostname_template_for("p").is_none());
+    }
+
+    #[test]
+    fn dns_provider_config_debug_redacts_the_token() {
+        let cfg = DnsProviderConfig {
+            kind: "cloudflare".to_string(),
+            token: "cf_topsecret_token".to_string(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("cf_topsecret_token"),
+            "token leaked via Debug: {dbg}"
+        );
+        assert!(dbg.contains("cloudflare"), "kind should still be visible");
+    }
+
+    #[test]
+    fn registry_cred_debug_redacts_the_password() {
+        let cred = RegistryCred {
+            registry: "ghcr.io".to_string(),
+            username: "bot".to_string(),
+            password: "ghp_topsecret".to_string(),
+        };
+        let dbg = format!("{cred:?}");
+        assert!(
+            !dbg.contains("ghp_topsecret"),
+            "password leaked via Debug: {dbg}"
+        );
+        assert!(dbg.contains("ghcr.io"), "registry should still be visible");
+        assert!(dbg.contains("bot"), "username should still be visible");
+    }
+
+    #[test]
+    fn var_debug_redacts_the_value() {
+        let v = Var {
+            value: "topsecret".to_string(),
+            services: vec!["backend".to_string()],
+        };
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("topsecret"), "value leaked via Debug: {dbg}");
+        assert!(dbg.contains("backend"), "services should still be visible");
+    }
+
+    #[test]
+    fn acme_config_debug_redacts_the_token_through_the_nested_provider() {
+        // `AcmeConfig` still derives `Debug`; this pins that the redaction
+        // in `DnsProviderConfig` is enough on its own — no separate
+        // hand-written impl is needed one level up.
+        let cfg = AcmeConfig {
+            email: "me@example.com".to_string(),
+            control_hostname: None,
+            provider: Some(DnsProviderConfig {
+                kind: "cloudflare".to_string(),
+                token: "cf_topsecret_token".to_string(),
+            }),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("cf_topsecret_token"),
+            "token leaked via Debug: {dbg}"
+        );
     }
 }
