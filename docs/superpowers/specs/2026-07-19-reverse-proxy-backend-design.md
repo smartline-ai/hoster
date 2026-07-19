@@ -27,6 +27,39 @@ to containers, regenerating config per deploy) was rejected: it couples nginx
 config churn to the deploy hot path and duplicates the routing logic
 `RoutingTable` already owns.
 
+## Why this helps operators
+
+"Users" here means the **operator** running hoster on their box — the person who
+picks the mode. nginx mode exists so hoster can be adopted in places it can't
+today:
+
+- **Coexist with an existing nginx edge.** Many operators already run nginx as
+  their front door (other sites, static files, existing TLS, rate limits, IP
+  allowlists). Today hoster insists on owning `:80`/`:443` itself and can't slot
+  in. nginx mode lets hoster sit **behind** the nginx they already run and trust,
+  instead of tearing it out or relocating hoster.
+- **Reuse nginx's edge features for free.** With nginx as the edge, every branch
+  deploy transparently gets HTTP/2, compression, connection/rate limits,
+  `allow`/`deny` rules, custom error pages, WAF, and the operator's existing log
+  pipeline — without hoster having to grow any of it. hoster stays a simple
+  `Host` router.
+- **Satisfy org/ops policy.** Where an approved load balancer or nginx must be
+  the TLS-terminating edge and an app process binding `:443` won't pass review,
+  nginx mode makes hoster deployable without an exception.
+- **Still effortless.** Because of Option 1 + wildcard certs, nginx is
+  configured **once** (hoster writes the server block) and never touched again;
+  new branches just work via `Host` routing. This is the reason Option 2 (rewrite
+  nginx per deploy) was rejected — it would have turned every deploy into nginx
+  churn.
+- **Zero cost if unwanted.** Default is `standalone`, byte-for-byte today's
+  behavior. This is purely additive — a second supported topology, not a
+  migration.
+
+Non-goals to set expectations: nginx mode does **not** make sites survive hoster
+being down (nginx still proxies to hoster — that was Option 2's trade-off, which
+we passed on), and it does **not** remove the localhost hop. Fitting into
+existing infrastructure is the goal, not edge resilience.
+
 ## Why Option 1 needs no per-branch nginx config
 
 hoster issues **wildcard** certificates (`src/acme.rs`, `src/renewal.rs`): one
