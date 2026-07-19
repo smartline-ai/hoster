@@ -1,4 +1,5 @@
 pub mod api;
+pub mod certs;
 pub mod config;
 pub mod dashboard;
 pub mod dns;
