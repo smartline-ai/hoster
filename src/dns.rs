@@ -802,6 +802,26 @@ impl DnsProvider for NamecheapProvider {
     }
 }
 
+/// The "backup" provider: hoster manages no DNS. Each call logs the record the
+/// operator must create themselves and returns Ok.
+#[derive(Default)]
+pub struct ManualProvider;
+impl ManualProvider { pub fn new() -> Self { Self } }
+
+#[async_trait]
+impl DnsProvider for ManualProvider {
+    async fn upsert_txt(&self, name: &str, value: &str) -> anyhow::Result<()> {
+        tracing::info!(record.name = %name, record.value = %value, "manual DNS: create TXT yourself");
+        Ok(())
+    }
+    async fn delete_txt(&self, _name: &str, _value: &str) -> anyhow::Result<()> { Ok(()) }
+    async fn upsert_a(&self, name: &str, ip: &str) -> anyhow::Result<()> {
+        tracing::info!(record.name = %name, record.ip = %ip, "manual DNS: create A record yourself");
+        Ok(())
+    }
+    async fn delete_a(&self, _name: &str) -> anyhow::Result<()> { Ok(()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,5 +1219,14 @@ mod tests {
             "u".into(), "supersecret".into(), "u".into(), "1.2.3.4".into(), format!("http://{addr}"));
         let e = nc.upsert_a("*.dev.example.com", "5.6.7.8").await.unwrap_err();
         assert!(!e.to_string().contains("supersecret"), "api_key leaked in error: {e}");
+    }
+
+    #[tokio::test]
+    async fn manual_provider_is_a_noop() {
+        let m = ManualProvider::new();
+        m.upsert_a("*.dev.example.com", "1.2.3.4").await.unwrap();
+        m.delete_a("*.dev.example.com").await.unwrap();
+        m.upsert_txt("_acme-challenge.dev.example.com", "v").await.unwrap();
+        m.delete_txt("_acme-challenge.dev.example.com", "v").await.unwrap();
     }
 }
