@@ -258,6 +258,26 @@ fn validate_dns_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The wildcard certificate name covering every hostname a template produces.
+/// Returns `None` when the first label has no placeholder, since such a
+/// template yields one fixed hostname needing no wildcard.
+pub fn wildcard_base(template: &str) -> Option<String> {
+    let (first, rest) = template.split_once('.')?;
+    if !first.contains('{') {
+        return None;
+    }
+    Some(format!("*.{rest}"))
+}
+
+/// The identifier set for a certificate. A wildcard does not cover its own
+/// parent, so `*.dev.example.com` is paired with `dev.example.com`.
+pub fn cert_identifiers(name: &str) -> Vec<String> {
+    match name.strip_prefix("*.") {
+        Some(parent) => vec![name.to_string(), parent.to_string()],
+        None => vec![name.to_string()],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,5 +563,41 @@ branch_len={branch_len}: label {label:?} has an invalid byte"
                 }
             }
         }
+    }
+
+    #[test]
+    fn wildcard_base_replaces_the_first_label() {
+        assert_eq!(
+            wildcard_base("{service}-{branch}.dev.example.com").as_deref(),
+            Some("*.dev.example.com")
+        );
+        assert_eq!(
+            wildcard_base("{branch}.demo.example.com").as_deref(),
+            Some("*.demo.example.com")
+        );
+    }
+
+    #[test]
+    fn wildcard_base_is_none_without_a_placeholder() {
+        assert_eq!(wildcard_base("static.example.com"), None);
+    }
+
+    #[test]
+    fn cert_identifiers_include_the_bare_parent() {
+        assert_eq!(
+            cert_identifiers("*.dev.example.com"),
+            vec![
+                "*.dev.example.com".to_string(),
+                "dev.example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn cert_identifiers_of_a_plain_name_is_just_that_name() {
+        assert_eq!(
+            cert_identifiers("hoster.example.com"),
+            vec!["hoster.example.com".to_string()]
+        );
     }
 }
