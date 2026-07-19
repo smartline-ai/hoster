@@ -271,10 +271,25 @@ struct SetAcmeConfigBody {
 }
 
 /// The body of `PUT /acme/dns`.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct SetDnsTokenBody {
     kind: String,
     token: String,
+}
+
+/// A hand-written, redacting `Debug` — the same reasoning as
+/// [`crate::secrets::DnsProviderConfig`], [`crate::secrets::RegistryCred`],
+/// and [`crate::secrets::Var`]. `token` here is the plaintext DNS provider
+/// credential straight off the wire; a derived `Debug` would print it in full
+/// the moment anything logs or formats this body, and "nothing formats it
+/// today" is not a property that survives the next edit.
+impl std::fmt::Debug for SetDnsTokenBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetDnsTokenBody")
+            .field("kind", &self.kind)
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 fn handle_list_projects<R: ContainerRuntime>(engine: &Engine<R>) -> Response<ApiBody> {
@@ -1756,6 +1771,20 @@ mod tests {
         assert!(!body.contains("cf_topsecret"), "token leaked: {body}");
         assert!(body.contains("me@example.com"));
         assert!(body.to_lowercase().contains("tls"));
+    }
+
+    /// The DNS token must never be printable through `Debug`, the same
+    /// guarantee the stored credential types give.
+    #[test]
+    fn dns_token_body_debug_is_redacted() {
+        let body = SetDnsTokenBody {
+            kind: "cloudflare".into(),
+            token: "cf_topsecret".into(),
+        };
+        let shown = format!("{body:?}");
+        assert!(!shown.contains("cf_topsecret"), "token leaked: {shown}");
+        assert!(shown.contains("[redacted]"));
+        assert!(shown.contains("cloudflare"));
     }
 
     #[test]
