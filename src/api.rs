@@ -20,12 +20,14 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
+use crate::certs::CertStore;
 use crate::config::{self, DeployConfig};
-use crate::dashboard;
+use crate::dashboard::{self, CertRow};
 use crate::engine::{DeployRequest, Engine};
+use crate::renewal;
 use crate::runtime::ContainerRuntime;
 use crate::session::{Sessions, constant_time_eq, cookie_value};
-use crate::settings::{Settings, sanitize_branch};
+use crate::settings::{Settings, sanitize_branch, wildcard_base};
 
 /// Response body type. Every response this API produces is small enough to
 /// buffer whole, so there is no need for the boxed streaming body the proxy
@@ -154,6 +156,10 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
             let sub = p.trim_start_matches("/ui/projects/").to_string();
             return Ok(ui_projects(req, engine, &settings, &sessions, sub).await);
         }
+        (&Method::POST, p) if p.starts_with("/ui/acme/") => {
+            let sub = p.trim_start_matches("/ui/acme/").to_string();
+            return Ok(ui_acme(req, &engine, &settings, &sessions, sub).await);
+        }
         _ => {}
     }
 
@@ -193,6 +199,10 @@ pub async fn handle_api<R: ContainerRuntime + 'static>(
             let project = parse_domain_path(p).unwrap();
             Ok(handle_delete_domain(&engine, &project))
         }
+        (Method::PUT, "/acme/config") => handle_set_acme_config(req, &engine).await,
+        (Method::PUT, "/acme/dns") => handle_set_dns_token(req, &engine).await,
+        (Method::DELETE, "/acme/dns") => Ok(handle_delete_dns_token(&engine)),
+        (Method::GET, "/acme/status") => Ok(handle_acme_status(&engine, &settings)),
         _ => Ok(text(StatusCode::NOT_FOUND, "not found")),
     }
 }
@@ -250,6 +260,21 @@ struct SetRegistryBody {
 #[derive(Debug, Deserialize)]
 struct SetDomainBody {
     hostname_template: String,
+}
+
+/// The body of `PUT /acme/config`.
+#[derive(Debug, Deserialize)]
+struct SetAcmeConfigBody {
+    email: String,
+    #[serde(default)]
+    control_hostname: Option<String>,
+}
+
+/// The body of `PUT /acme/dns`.
+#[derive(Debug, Deserialize)]
+struct SetDnsTokenBody {
+    kind: String,
+    token: String,
 }
 
 fn handle_list_projects<R: ContainerRuntime>(engine: &Engine<R>) -> Response<ApiBody> {
@@ -363,6 +388,140 @@ fn handle_delete_domain<R: ContainerRuntime>(
 ) -> Response<ApiBody> {
     let _ = engine.store().delete_hostname_template(project);
     text(StatusCode::NO_CONTENT, "")
+}
+
+async fn handle_set_acme_config<R: ContainerRuntime>(
+    req: Request<Incoming>,
+    engine: &Engine<R>,
+) -> Result<Response<ApiBody>, Infallible> {
+    let bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return Ok(text(StatusCode::BAD_REQUEST, "could not read request body")),
+    };
+    let body: SetAcmeConfigBody = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(text_owned(
+                StatusCode::BAD_REQUEST,
+                format!("invalid request body: {e}"),
+            ));
+        }
+    };
+    match engine
+        .store()
+        .set_acme_config(&body.email, body.control_hostname.as_deref())
+    {
+        Ok(()) => Ok(text(StatusCode::NO_CONTENT, "")),
+        Err(msg) => Ok(text_owned(StatusCode::BAD_REQUEST, msg)),
+    }
+}
+
+async fn handle_set_dns_token<R: ContainerRuntime>(
+    req: Request<Incoming>,
+    engine: &Engine<R>,
+) -> Result<Response<ApiBody>, Infallible> {
+    let bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return Ok(text(StatusCode::BAD_REQUEST, "could not read request body")),
+    };
+    let body: SetDnsTokenBody = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(text_owned(
+                StatusCode::BAD_REQUEST,
+                format!("invalid request body: {e}"),
+            ));
+        }
+    };
+    match engine.store().set_dns_token(&body.kind, &body.token) {
+        Ok(()) => Ok(text(StatusCode::NO_CONTENT, "")),
+        Err(msg) => Ok(text_owned(StatusCode::BAD_REQUEST, msg)),
+    }
+}
+
+fn handle_delete_dns_token<R: ContainerRuntime>(engine: &Engine<R>) -> Response<ApiBody> {
+    let _ = engine.store().delete_dns_token();
+    text(StatusCode::NO_CONTENT, "")
+}
+
+/// `GET /acme/status`: the masked ACME account (never the DNS token — see
+/// [`crate::secrets::MaskedAcme`]) plus the per-domain certificate table, the
+/// same data the dashboard's TLS panel renders.
+fn handle_acme_status<R: ContainerRuntime>(
+    engine: &Engine<R>,
+    settings: &Settings,
+) -> Response<ApiBody> {
+    let payload = serde_json::json!({
+        "acme": engine.store().masked_acme(),
+        "certificates": cert_rows(engine, settings),
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    json_bytes(StatusCode::OK, bytes)
+}
+
+/// Build the certificate status table: one row per domain hoster currently
+/// wants a certificate for — the default hostname template, every project's
+/// own template, and the ACME control hostname if set, each reduced to its
+/// wildcard base the same way `main.rs`'s renewal loop computes `wanted`.
+/// A domain with a valid certificate on disk reads as `"valid until
+/// <date>"`; one that failed its last attempt (from the renewal loop's
+/// persisted state) reads as `"failed: <reason>"`; anything else is
+/// `"pending"` — the certificate table exists so a failure that leaves a
+/// domain on plain HTTP is visible rather than silent.
+fn cert_rows<R: ContainerRuntime>(engine: &Engine<R>, settings: &Settings) -> Vec<CertRow> {
+    let store = engine.store();
+    let mut wanted: Vec<String> = std::iter::once(settings.hostname_template.clone())
+        .chain(store.project_hostname_templates())
+        .filter_map(|t| wildcard_base(&t))
+        .collect();
+    if let Some(h) = store.masked_acme().and_then(|a| a.control_hostname) {
+        wanted.push(h);
+    }
+    wanted.sort();
+    wanted.dedup();
+
+    let cert_store = CertStore::new(std::path::PathBuf::from(&settings.cert_dir));
+    let now = renewal::now_secs();
+    let have = cert_store.load_all(now);
+    let failures = renewal::load_state(&cert_store);
+
+    wanted
+        .into_iter()
+        .map(|domain| {
+            let state = match have.iter().find(|c| c.domain == domain) {
+                Some(c) => format!("valid until {}", format_date(c.not_after)),
+                None => match failures.get(&domain).and_then(|s| s.last_error.as_deref()) {
+                    Some(err) => format!("failed: {err}"),
+                    None => "pending".to_string(),
+                },
+            };
+            CertRow { domain, state }
+        })
+        .collect()
+}
+
+/// A bare `YYYY-MM-DD` for a Unix timestamp — enough for a certificate
+/// expiry column; no timezone-aware date crate is a dependency of this
+/// project, so this is deliberately minimal.
+fn format_date(ts: i64) -> String {
+    let (y, m, d) = civil_from_days(ts.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Howard Hinnant's `civil_from_days`: days since the Unix epoch to a
+/// proleptic-Gregorian (year, month, day).
+/// <http://howardhinnant.github.io/date_algorithms.html>
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    if m <= 2 { (y + 1, m, d) } else { (y, m, d) }
 }
 
 /// Validate synchronously, then hand the actual provisioning to a background
@@ -567,9 +726,17 @@ async fn ui_root<R: ContainerRuntime>(
     }
     let deployments = engine.deployment_views().await.unwrap_or_default();
     let env = engine.store().list_masked();
+    let acme = engine.store().masked_acme();
+    let certs = cert_rows(engine, settings);
     html(
         StatusCode::OK,
-        dashboard::dashboard_page(&deployments, &env, &settings.hostname_template),
+        dashboard::dashboard_page(
+            &deployments,
+            &env,
+            &settings.hostname_template,
+            acme.as_ref(),
+            &certs,
+        ),
     )
 }
 
@@ -672,6 +839,67 @@ async fn ui_projects<R: ContainerRuntime>(
             let _ = engine.store().delete_project(head);
         }
         return redirect("/");
+    }
+
+    text(StatusCode::NOT_FOUND, "not found")
+}
+
+/// The dashboard's TLS-management POST routes, all cookie-authenticated:
+///   `acme/config`     — set/replace the ACME account email + control hostname (form body)
+///   `acme/dns`        — set/replace the DNS provider token (form body)
+///   `acme/dns/delete` — remove the DNS provider token, keeping the rest of the ACME config
+///
+/// `dns/delete` is checked before `dns` for the same reason `ui_projects`
+/// orders `/registry/delete` before `/registry`: an equality match on `sub`
+/// can't actually be fooled either way here (unlike `ui_projects`'s
+/// suffix-stripping), but the ordering keeps the discipline consistent and
+/// makes it obvious this was a deliberate choice, not an oversight.
+async fn ui_acme<R: ContainerRuntime>(
+    req: Request<Incoming>,
+    engine: &Engine<R>,
+    settings: &Settings,
+    sessions: &Sessions,
+    sub: String,
+) -> Response<ApiBody> {
+    if !dashboard_enabled(settings) {
+        return text(StatusCode::SERVICE_UNAVAILABLE, "dashboard not configured");
+    }
+    if !session_of(&req, sessions) {
+        return redirect("/login");
+    }
+
+    if sub == "dns/delete" {
+        let _ = engine.store().delete_dns_token();
+        return redirect("/");
+    }
+
+    if sub == "dns" {
+        let bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return text(StatusCode::BAD_REQUEST, "could not read request body"),
+        };
+        let kind = form_field(&bytes, "kind").unwrap_or_default();
+        let token = form_field(&bytes, "token").unwrap_or_default();
+        return match engine.store().set_dns_token(&kind, &token) {
+            Ok(()) => redirect("/"),
+            Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
+        };
+    }
+
+    if sub == "config" {
+        let bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return text(StatusCode::BAD_REQUEST, "could not read request body"),
+        };
+        let email = form_field(&bytes, "email").unwrap_or_default();
+        let control_hostname = form_field(&bytes, "control_hostname").filter(|s| !s.is_empty());
+        return match engine
+            .store()
+            .set_acme_config(&email, control_hostname.as_deref())
+        {
+            Ok(()) => redirect("/"),
+            Err(msg) => text_owned(StatusCode::BAD_REQUEST, msg),
+        };
     }
 
     text(StatusCode::NOT_FOUND, "not found")
@@ -1261,5 +1489,283 @@ mod tests {
             Some(&"v".to_string()),
             "reverting the domain must not delete the project's variables"
         );
+    }
+
+    #[tokio::test]
+    async fn put_acme_config_then_dns_token_stores_both() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/acme/config",
+            r#"{"email":"me@example.com","control_hostname":"hoster.example.com"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/acme/dns",
+            r#"{"kind":"cloudflare","token":"cf_secret"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            engine
+                .store()
+                .acme_config()
+                .unwrap()
+                .provider
+                .unwrap()
+                .token,
+            "cf_secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn acme_status_never_returns_the_dns_token() {
+        let (engine, settings, sessions) = api_harness();
+        engine
+            .store()
+            .set_acme_config("me@example.com", None)
+            .unwrap();
+        engine
+            .store()
+            .set_dns_token("cloudflare", "cf_topsecret")
+            .unwrap();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::GET,
+            "/acme/status",
+            "",
+        )
+        .await;
+        let body = body_string(res).await;
+        assert!(!body.contains("cf_topsecret"), "token leaked: {body}");
+        assert!(body.contains("me@example.com"));
+    }
+
+    #[tokio::test]
+    async fn acme_status_includes_the_certificate_table() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::GET,
+            "/acme/status",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_string(res).await;
+        // No ACME account configured and no certificates on disk yet: the
+        // default hostname template's wildcard base still shows up as a
+        // pending row, so an operator can see hoster knows it needs one.
+        assert!(body.contains("certificates"), "body: {body}");
+        assert!(body.contains("dev.example.com"), "body: {body}");
+        assert!(body.contains("pending"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn put_dns_token_before_config_is_rejected() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/acme/dns",
+            r#"{"kind":"cloudflare","token":"tok"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_dns_token_removes_it_but_keeps_the_email() {
+        let (engine, settings, sessions) = api_harness();
+        engine
+            .store()
+            .set_acme_config("me@example.com", None)
+            .unwrap();
+        engine.store().set_dns_token("cloudflare", "tok").unwrap();
+        let res = call(
+            &engine,
+            &settings,
+            &sessions,
+            Method::DELETE,
+            "/acme/dns",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let masked = engine.store().masked_acme().unwrap();
+        assert_eq!(masked.email, "me@example.com");
+        assert!(!masked.token_set);
+    }
+
+    #[tokio::test]
+    async fn acme_endpoints_require_the_bearer_token() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call_without_token(
+            &engine,
+            &settings,
+            &sessions,
+            Method::PUT,
+            "/acme/config",
+            r#"{"email":"me@example.com"}"#,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = call_without_token(
+            &engine,
+            &settings,
+            &sessions,
+            Method::GET,
+            "/acme/status",
+            "",
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ui_acme_config_sets_the_account() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/acme/config",
+            "email=me%40example.com&control_hostname=hoster.example.com",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let masked = engine.store().masked_acme().unwrap();
+        assert_eq!(masked.email, "me@example.com");
+        assert_eq!(
+            masked.control_hostname.as_deref(),
+            Some("hoster.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_acme_dns_sets_the_token_and_never_echoes_it() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        engine
+            .store()
+            .set_acme_config("me@example.com", None)
+            .unwrap();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/acme/dns",
+            "kind=cloudflare&token=cf_topsecret",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            engine
+                .store()
+                .acme_config()
+                .unwrap()
+                .provider
+                .unwrap()
+                .token,
+            "cf_topsecret"
+        );
+        let res =
+            call_with_cookie(&engine, &settings, &sessions, Method::GET, "/", "", &cookie).await;
+        let body = body_string(res).await;
+        assert!(!body.contains("cf_topsecret"), "token leaked: {body}");
+    }
+
+    /// Regression guard for the route-ordering requirement: `/dns/delete`
+    /// must be matched before `/dns`. If it isn't, a delete request could
+    /// fall through to the `/dns` form handler and be misread as an attempt
+    /// to set an empty-string token instead of removing it.
+    #[tokio::test]
+    async fn ui_acme_dns_delete_removes_the_token_and_keeps_the_email() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        engine
+            .store()
+            .set_acme_config("me@example.com", None)
+            .unwrap();
+        engine.store().set_dns_token("cloudflare", "tok").unwrap();
+        let res = call_with_cookie(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/acme/dns/delete",
+            "",
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let masked = engine.store().masked_acme().unwrap();
+        assert_eq!(masked.email, "me@example.com");
+        assert!(!masked.token_set);
+    }
+
+    #[tokio::test]
+    async fn ui_acme_routes_require_the_dashboard_session() {
+        let (engine, settings, sessions) = api_harness();
+        let res = call_with_auth(
+            &engine,
+            &settings,
+            &sessions,
+            Method::POST,
+            "/ui/acme/config",
+            "email=me%40example.com",
+            None,
+        )
+        .await;
+        // No dashboard password is configured in `api_harness`, so every
+        // `/ui/*` route answers 503 before session state even matters.
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn dashboard_root_shows_the_tls_panel_and_never_the_token() {
+        let (engine, settings, sessions, cookie) = dashboard_harness();
+        engine
+            .store()
+            .set_acme_config("me@example.com", Some("hoster.example.com"))
+            .unwrap();
+        engine
+            .store()
+            .set_dns_token("cloudflare", "cf_topsecret")
+            .unwrap();
+        let res =
+            call_with_cookie(&engine, &settings, &sessions, Method::GET, "/", "", &cookie).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_string(res).await;
+        assert!(!body.contains("cf_topsecret"), "token leaked: {body}");
+        assert!(body.contains("me@example.com"));
+        assert!(body.to_lowercase().contains("tls"));
+    }
+
+    #[test]
+    fn format_date_renders_the_unix_epoch() {
+        assert_eq!(format_date(0), "1970-01-01");
+    }
+
+    #[test]
+    fn format_date_renders_a_recent_date() {
+        // 2026-01-01T00:00:00Z
+        assert_eq!(format_date(1_767_225_600), "2026-01-01");
     }
 }

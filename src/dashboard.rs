@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use crate::engine::DeploymentView;
-use crate::secrets::MaskedProject;
+use crate::secrets::{MaskedAcme, MaskedProject};
 
 /// Escape the five HTML-significant characters. Applied to every dynamic value
 /// rendered into a page — statuses in particular carry arbitrary error text.
@@ -76,9 +76,8 @@ main{max-width:1080px;margin:0 auto;padding:clamp(1rem,3vw,2rem) clamp(1rem,4vw,
 .panel-meta{color:var(--muted);font-size:.78rem;font-family:var(--mono)}
 .panel-body{display:grid;grid-template-columns:1.55fr 1fr;gap:0}
 .col{padding:1rem 1.2rem}
-.col.environment{border-left:1px solid var(--line);background:color-mix(in srgb,var(--panel-2) 55%,transparent)}
-.col.registry{grid-column:1/-1;border-top:1px solid var(--line)}
-.col.domain{grid-column:1/-1;border-top:1px solid var(--line)}
+.col.environment,.col.dns{border-left:1px solid var(--line);background:color-mix(in srgb,var(--panel-2) 55%,transparent)}
+.col.registry,.col.domain,.col.certs{grid-column:1/-1;border-top:1px solid var(--line)}
 .col-label{font-size:.68rem;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);font-weight:600;
   margin-bottom:.7rem;display:flex;align-items:center;gap:.5rem}
 .col-label .count{color:var(--faint);font-family:var(--mono);letter-spacing:0}
@@ -148,7 +147,7 @@ details.config>summary::-webkit-details-marker{display:none}
 .login-form .btn.primary{padding:.7rem}
 .err{color:var(--fail);font-size:.82rem;margin:0 0 .4rem}
 @media(max-width:760px){.panel-body{grid-template-columns:1fr}
-  .col.environment{border-left:0;border-top:1px solid var(--line)}}
+  .col.environment,.col.dns{border-left:0;border-top:1px solid var(--line)}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 "#;
 
@@ -192,15 +191,31 @@ fn is_running(status: &str) -> bool {
     status == "running"
 }
 
+/// One domain's certificate status, for the TLS panel's certificate table.
+/// `state` is a free-form, human-readable summary — `"valid until
+/// 2026-10-01"`, `"failed: no zone found"`, `"pending"` — built by the
+/// caller from [`crate::certs::CertStore`] and the renewal loop's persisted
+/// state, not by this module.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CertRow {
+    pub domain: String,
+    pub state: String,
+}
+
 /// The dashboard: deployments and hoster-managed environment, grouped by
 /// project. `env` carries only masked variables (keys + target services) —
 /// values are never passed in, so they cannot be rendered. `default_template`
 /// is the global hostname template, shown for any project that has not set
-/// its own.
+/// its own. `acme` and `certs` back the global TLS & DNS panel: `acme` is
+/// `None` until an ACME account email has been set, and structurally cannot
+/// carry the DNS token (see [`MaskedAcme`]); `certs` is the current
+/// certificate table, one row per domain hoster wants a certificate for.
 pub fn dashboard_page(
     deployments: &[DeploymentView],
     env: &[MaskedProject],
     default_template: &str,
+    acme: Option<&MaskedAcme>,
+    certs: &[CertRow],
 ) -> String {
     let mut projects: BTreeSet<&str> = BTreeSet::new();
     for d in deployments {
@@ -224,6 +239,8 @@ pub fn dashboard_page(
             "projects"
         },
     );
+
+    render_tls(&mut body, acme, certs);
 
     if projects.is_empty() {
         body.push_str(
@@ -509,6 +526,101 @@ onsubmit=\"return confirm('Remove this registry credential?')\">\
     );
 }
 
+/// The global TLS & DNS panel: the ACME account (email + optional control
+/// hostname), the DNS provider credential (masked, never rendered — like
+/// `render_registry`'s password row), and the per-domain certificate table.
+/// Unlike the panels below it this is not per-project — one hoster instance
+/// holds one ACME account — so `dashboard_page` renders it once, above the
+/// project loop.
+fn render_tls(body: &mut String, acme: Option<&MaskedAcme>, certs: &[CertRow]) {
+    body.push_str(
+        "<section class=\"panel\"><div class=\"panel-head\">\
+<div class=\"panel-title\"><span class=\"proj-glyph\">\u{25c8}</span><h2>TLS &amp; DNS</h2></div>\
+<div class=\"panel-meta\">Let\u{2019}s Encrypt via DNS-01</div></div><div class=\"panel-body\">",
+    );
+
+    // ACME account: email + control hostname, plus a form to set/replace them.
+    body.push_str("<div class=\"col\"><div class=\"col-label\">ACME account</div>");
+    match acme {
+        None => body.push_str(
+            "<div class=\"empty\">TLS is not configured. Set an account email to start \
+issuing certificates.</div>",
+        ),
+        Some(a) => {
+            let hostname_tag = match &a.control_hostname {
+                Some(h) => format!("<span class=\"tag\">{}</span>", html_escape(h)),
+                None => "<span class=\"tag\">no control hostname</span>".to_string(),
+            };
+            let _ = write!(
+                body,
+                "<div class=\"env-list\"><div class=\"env-row\"><span class=\"k\">{}</span>\
+<div class=\"env-meta\">{hostname_tag}</div></div></div>",
+                html_escape(&a.email),
+            );
+        }
+    }
+    body.push_str(
+        "<form class=\"add-var\" method=\"post\" action=\"/ui/acme/config\">\
+<input name=\"email\" placeholder=\"you@example.com\" required>\
+<input name=\"control_hostname\" placeholder=\"hoster.example.com (optional)\">\
+<button class=\"btn primary\" type=\"submit\">Save ACME account</button></form></div>",
+    );
+
+    // DNS provider: masked token (set/replace + remove), never the token
+    // itself — same discipline as `render_registry`'s password row.
+    body.push_str("<aside class=\"col dns\"><div class=\"col-label\">DNS provider</div>");
+    match acme.and_then(|a| a.provider_kind.as_deref()) {
+        None => body.push_str(
+            "<div class=\"empty\">No DNS provider set. Required to issue wildcard \
+certificates via DNS-01.</div>",
+        ),
+        Some(kind) => {
+            let _ = write!(
+                body,
+                "<div class=\"env-list\"><div class=\"env-row\"><span class=\"k\">{}</span>\
+<form method=\"post\" action=\"/ui/acme/dns/delete\" \
+onsubmit=\"return confirm('Remove the DNS provider token?')\">\
+<button class=\"icon-btn\" type=\"submit\" title=\"Remove DNS token\">\u{2715}</button></form>\
+<div class=\"env-meta\"><span class=\"val\">\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}</span>\
+<span class=\"tag\">token set</span></div></div></div>",
+                html_escape(kind),
+            );
+        }
+    }
+    body.push_str(
+        "<form class=\"add-var\" method=\"post\" action=\"/ui/acme/dns\">\
+<input name=\"kind\" placeholder=\"cloudflare\" required>\
+<input name=\"token\" type=\"password\" placeholder=\"API token\" autocomplete=\"off\" required>\
+<button class=\"btn primary\" type=\"submit\">Save DNS token</button></form></aside>",
+    );
+
+    // Certificates: one row per domain hoster wants a certificate for, so a
+    // failure keeps serving plain HTTP visibly rather than going dark.
+    let _ = write!(
+        body,
+        "<div class=\"col certs\"><div class=\"col-label\">Certificates <span class=\"count\">{}</span></div>",
+        certs.len(),
+    );
+    if certs.is_empty() {
+        body.push_str("<div class=\"empty\">No certificates yet.</div>");
+    } else {
+        body.push_str("<div class=\"env-list\">");
+        for row in certs {
+            let _ = write!(
+                body,
+                "<div class=\"env-row\"><span class=\"k\">{}</span>\
+<div class=\"env-meta\"><span class=\"tag\">{}</span></div></div>",
+                html_escape(&row.domain),
+                html_escape(&row.state),
+            );
+        }
+        body.push_str("</div>");
+    }
+    body.push_str("</div>");
+
+    body.push_str("</div></section>");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +707,8 @@ mod tests {
             &[view("odinvestor", "b1", "running", CFG)],
             &[masked("odinvestor", &[("GOOGLE_API_KEY", &["backend"])])],
             DEFAULT_TEMPLATE,
+            None,
+            &[],
         );
         assert!(html.contains("odinvestor"));
         assert!(html.contains("b1"));
@@ -610,6 +724,8 @@ mod tests {
             &[view("odinvestor", "b1", "running", CFG)],
             &[],
             DEFAULT_TEMPLATE,
+            None,
+            &[],
         );
         assert!(html.contains("reg/backend:abc"));
         assert!(html.contains("PORT"));
@@ -618,7 +734,13 @@ mod tests {
 
     #[test]
     fn masked_var_shows_key_not_value_and_has_forms() {
-        let html = dashboard_page(&[], &[masked("p", &[("SECRET", &[])])], DEFAULT_TEMPLATE);
+        let html = dashboard_page(
+            &[],
+            &[masked("p", &[("SECRET", &[])])],
+            DEFAULT_TEMPLATE,
+            None,
+            &[],
+        );
         assert!(html.contains("SECRET"));
         assert!(html.contains("action=\"/ui/projects/p/vars\""));
         assert!(html.contains("/ui/projects/p/vars/SECRET/delete"));
@@ -634,6 +756,8 @@ mod tests {
             &[],
             &[masked("secretsonly", &[("K", &[])])],
             DEFAULT_TEMPLATE,
+            None,
+            &[],
         );
         assert!(html.contains("secretsonly"));
         assert!(html.contains("No deployments"));
@@ -645,6 +769,8 @@ mod tests {
             &[view("p", "b", "failed: <script>alert(1)</script>", CFG)],
             &[],
             DEFAULT_TEMPLATE,
+            None,
+            &[],
         );
         assert!(!html.contains("<script>alert(1)"));
         assert!(html.contains("&lt;script&gt;"));
@@ -652,14 +778,14 @@ mod tests {
 
     #[test]
     fn dashboard_empty_state() {
-        let html = dashboard_page(&[], &[], DEFAULT_TEMPLATE);
+        let html = dashboard_page(&[], &[], DEFAULT_TEMPLATE, None, &[]);
         assert!(html.to_lowercase().contains("no projects"));
     }
 
     #[test]
     fn registry_row_shows_host_and_username_but_masks_the_password() {
         let env = [masked_with_registry("p", "ghcr.io", "bot")];
-        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE, None, &[]);
         assert!(html.contains("ghcr.io"));
         assert!(html.contains("bot"));
         assert!(html.contains("\u{2022}\u{2022}\u{2022}\u{2022}"));
@@ -669,7 +795,7 @@ mod tests {
     #[test]
     fn project_without_a_registry_shows_the_empty_state_and_a_form() {
         let env = [masked("p", &[("K", &[][..])])];
-        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE, None, &[]);
         assert!(html.contains("No registry credential"));
         assert!(html.contains("action=\"/ui/projects/p/registry\""));
     }
@@ -677,7 +803,7 @@ mod tests {
     #[test]
     fn registry_fields_are_html_escaped() {
         let env = [masked_with_registry("p", "ghcr.io", "<script>x</script>")];
-        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE, None, &[]);
         assert!(!html.contains("<script>x</script>"));
         assert!(html.contains("&lt;script&gt;"));
     }
@@ -685,7 +811,7 @@ mod tests {
     #[test]
     fn shows_a_projects_own_domain_with_a_reset_control() {
         let env = [masked_with_template("p", "{branch}.demo.example.com")];
-        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE, None, &[]);
         assert!(html.contains("demo.example.com"));
         assert!(html.contains("/ui/projects/p/domain/delete"));
     }
@@ -693,7 +819,7 @@ mod tests {
     #[test]
     fn shows_the_global_default_as_inherited_when_unset() {
         let env = [masked("p", &[("K", &[][..])])];
-        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE, None, &[]);
         assert!(html.contains("dev.example.com"));
         assert!(
             html.to_lowercase().contains("default"),
@@ -705,8 +831,47 @@ mod tests {
     #[test]
     fn domain_is_html_escaped() {
         let env = [masked_with_template("p", "{branch}.<script>x</script>.com")];
-        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE);
+        let html = dashboard_page(&[], &env, DEFAULT_TEMPLATE, None, &[]);
         assert!(!html.contains("<script>x</script>"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn tls_section_shows_setup_prompt_when_unconfigured() {
+        let html = dashboard_page(&[], &[], DEFAULT_TEMPLATE, None, &[]);
+        assert!(html.to_lowercase().contains("tls"));
+        assert!(html.contains("/ui/acme/config"));
+    }
+
+    #[test]
+    fn tls_section_never_renders_the_token() {
+        let masked = MaskedAcme {
+            email: "me@example.com".into(),
+            control_hostname: None,
+            provider_kind: Some("cloudflare".into()),
+            token_set: true,
+        };
+        let html = dashboard_page(&[], &[], DEFAULT_TEMPLATE, Some(&masked), &[]);
+        assert!(html.contains("me@example.com"));
+        assert!(html.contains("cloudflare"));
+        assert!(html.contains("\u{2022}\u{2022}\u{2022}\u{2022}"));
+    }
+
+    #[test]
+    fn certificate_table_shows_state_per_domain() {
+        let rows = vec![
+            CertRow {
+                domain: "*.dev.example.com".into(),
+                state: "valid until 2026-10-01".into(),
+            },
+            CertRow {
+                domain: "*.demo.example.com".into(),
+                state: "failed: no zone found".into(),
+            },
+        ];
+        let html = dashboard_page(&[], &[], DEFAULT_TEMPLATE, None, &rows);
+        assert!(html.contains("*.dev.example.com"));
+        assert!(html.contains("valid until 2026-10-01"));
+        assert!(html.contains("no zone found"));
     }
 }
