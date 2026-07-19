@@ -19,12 +19,18 @@ pub trait DnsProvider: Send + Sync {
     async fn upsert_txt(&self, name: &str, value: &str) -> anyhow::Result<()>;
     /// Remove exactly `value` at `name`, keeping other values.
     async fn delete_txt(&self, name: &str, value: &str) -> anyhow::Result<()>;
+    /// Ensure the A record at `name` resolves to `ip`, replacing any existing
+    /// A value(s) at that exact name. Unlike TXT, an A record has one value.
+    async fn upsert_a(&self, name: &str, ip: &str) -> anyhow::Result<()>;
+    /// Remove the A record at `name`. A missing record is not an error.
+    async fn delete_a(&self, name: &str) -> anyhow::Result<()>;
 }
 
 /// In-memory `DnsProvider` for tests.
 #[derive(Default)]
 pub struct FakeDns {
     records: Mutex<BTreeMap<String, Vec<String>>>,
+    a_records: Mutex<BTreeMap<String, String>>,
 }
 
 impl FakeDns {
@@ -40,6 +46,11 @@ impl FakeDns {
             .get(name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The A value currently published at `name` — for test assertions.
+    pub fn a_value(&self, name: &str) -> Option<String> {
+        self.a_records.lock().unwrap().get(name).cloned()
     }
 }
 
@@ -59,6 +70,19 @@ impl DnsProvider for FakeDns {
         if let Some(entry) = r.get_mut(name) {
             entry.retain(|v| v != value);
         }
+        Ok(())
+    }
+
+    async fn upsert_a(&self, name: &str, ip: &str) -> anyhow::Result<()> {
+        self.a_records
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), ip.to_string());
+        Ok(())
+    }
+
+    async fn delete_a(&self, name: &str) -> anyhow::Result<()> {
+        self.a_records.lock().unwrap().remove(name);
         Ok(())
     }
 }
@@ -182,6 +206,25 @@ impl CloudflareProvider {
         env.into_result()
     }
 
+    /// PUT `body` to `url` and check the envelope the same way `cf_get` does.
+    async fn cf_put<T: DeserializeOwned>(
+        &self,
+        url: String,
+        body: serde_json::Value,
+    ) -> anyhow::Result<T> {
+        let env: CfEnvelope<T> = self
+            .http
+            .put(url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        env.into_result()
+    }
+
     /// DELETE `url` and check the envelope the same way `cf_get` does.
     async fn cf_delete(&self, url: String) -> anyhow::Result<()> {
         let env: CfEnvelope<serde_json::Value> = self
@@ -263,6 +306,40 @@ impl DnsProvider for CloudflareProvider {
         let url = format!("{}/zones/{zone}/dns_records/{id}", self.base_url);
         self.cf_delete(url).await
     }
+
+    async fn upsert_a(&self, name: &str, ip: &str) -> anyhow::Result<()> {
+        let zone = self.zone_id(name).await?;
+        let url = format!(
+            "{}/zones/{zone}/dns_records?type=A&name={}",
+            self.base_url,
+            urlencoding::encode(name)
+        );
+        let existing: Vec<CfRecord> = self.cf_get(url).await?;
+        let body = serde_json::json!({ "type": "A", "name": name, "content": ip, "ttl": 60 });
+        if let Some(rec) = existing.into_iter().next() {
+            let url = format!("{}/zones/{zone}/dns_records/{}", self.base_url, rec.id);
+            let _updated: serde_json::Value = self.cf_put(url, body).await?;
+        } else {
+            let url = format!("{}/zones/{zone}/dns_records", self.base_url);
+            let _created: serde_json::Value = self.cf_post(url, body).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_a(&self, name: &str) -> anyhow::Result<()> {
+        let zone = self.zone_id(name).await?;
+        let url = format!(
+            "{}/zones/{zone}/dns_records?type=A&name={}",
+            self.base_url,
+            urlencoding::encode(name)
+        );
+        let existing: Vec<CfRecord> = self.cf_get(url).await?;
+        let Some(rec) = existing.into_iter().next() else {
+            return Ok(());
+        };
+        let url = format!("{}/zones/{zone}/dns_records/{}", self.base_url, rec.id);
+        self.cf_delete(url).await
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +384,22 @@ mod tests {
         dns.delete_txt("_acme-challenge.dev.example.com", "nope")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_upsert_a_replaces_rather_than_appends() {
+        let dns = FakeDns::new();
+        dns.upsert_a("*.dev.example.com", "1.1.1.1").await.unwrap();
+        dns.upsert_a("*.dev.example.com", "2.2.2.2").await.unwrap();
+        assert_eq!(dns.a_value("*.dev.example.com").as_deref(), Some("2.2.2.2"));
+    }
+
+    #[tokio::test]
+    async fn fake_delete_a_removes_the_record() {
+        let dns = FakeDns::new();
+        dns.upsert_a("*.dev.example.com", "1.1.1.1").await.unwrap();
+        dns.delete_a("*.dev.example.com").await.unwrap();
+        assert_eq!(dns.a_value("*.dev.example.com"), None);
     }
 
     use std::net::SocketAddr;
@@ -517,5 +610,34 @@ mod tests {
             !err.to_string().contains("tok"),
             "error must not leak the API token: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn cloudflare_upsert_a_creates_then_updates() {
+        // `zone_id` caches by name (see `zone_cache`), and both calls below
+        // use the same fully-qualified name, so only the first upsert issues
+        // a zone lookup: zones, [A-lookup, create], [A-lookup, update] — 5
+        // requests, not 6.
+        let zones = r#"{"success":true,"result":[{"id":"z","name":"example.com"}]}"#;
+        let none = r#"{"success":true,"result":[]}"#;
+        let created = r#"{"success":true,"result":{"id":"rec1"}}"#;
+        let one = r#"{"success":true,"result":[{"id":"rec1","content":"1.1.1.1"}]}"#;
+        let updated = r#"{"success":true,"result":{"id":"rec1"}}"#;
+        let (addr, seen) = mock_server(vec![
+            (200, zones.into()),
+            (200, none.into()),
+            (200, created.into()),
+            (200, one.into()),
+            (200, updated.into()),
+        ])
+        .await;
+        let cf = CloudflareProvider::with_base_url("tok".into(), format!("http://{addr}"));
+        cf.upsert_a("*.dev.example.com", "1.1.1.1").await.unwrap();
+        cf.upsert_a("*.dev.example.com", "2.2.2.2").await.unwrap();
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 5, "expected zone lookup + 2x(A-lookup+write): {reqs:?}");
+        assert_eq!(reqs[2].0, "POST", "first upsert with no record must POST");
+        assert_eq!(reqs[4].0, "PUT", "second upsert must PUT the existing record");
+        assert!(reqs[4].2.contains("2.2.2.2"));
     }
 }
