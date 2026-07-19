@@ -64,6 +64,7 @@ impl DnsProvider for FakeDns {
 }
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 const CLOUDFLARE_API: &str = "https://api.cloudflare.com/client/v4";
 
@@ -77,11 +78,6 @@ pub struct CloudflareProvider {
 }
 
 #[derive(Deserialize)]
-struct CfList<T> {
-    result: Vec<T>,
-}
-
-#[derive(Deserialize)]
 struct CfZone {
     id: String,
     name: String,
@@ -91,6 +87,48 @@ struct CfZone {
 struct CfRecord {
     id: String,
     content: String,
+}
+
+#[derive(Deserialize)]
+struct CfApiError {
+    code: i64,
+    message: String,
+}
+
+/// Cloudflare's v4 response envelope. Cloudflare can answer with HTTP 200
+/// and `success: false` for validation-type failures (e.g. bad record
+/// content) — an outcome `error_for_status()` never sees, since the HTTP
+/// status itself is fine. Every call must deserialize into this and check
+/// `success` explicitly, or a rejected write silently reports as `Ok(())`.
+#[derive(Deserialize)]
+struct CfEnvelope<T> {
+    success: bool,
+    #[serde(default)]
+    errors: Vec<CfApiError>,
+    // `Option<T>` fields are optional-by-default in serde (a missing key
+    // deserializes as `None`), so no `#[serde(default)]` here — adding one
+    // would make serde's derive require `T: Default`, which callers using
+    // `CfZone`/`CfRecord` don't provide.
+    result: Option<T>,
+}
+
+impl<T> CfEnvelope<T> {
+    fn into_result(self) -> anyhow::Result<T> {
+        if !self.success {
+            let detail = if self.errors.is_empty() {
+                "Cloudflare returned success: false with no error detail".to_string()
+            } else {
+                self.errors
+                    .iter()
+                    .map(|e| format!("{} (code {})", e.message, e.code))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            anyhow::bail!("Cloudflare API call failed: {detail}");
+        }
+        self.result
+            .ok_or_else(|| anyhow::anyhow!("Cloudflare API reported success with no result"))
+    }
 }
 
 impl CloudflareProvider {
@@ -109,13 +147,11 @@ impl CloudflareProvider {
         }
     }
 
-    /// The zone owning `name`: the longest zone name that is a suffix of it.
-    async fn zone_id(&self, name: &str) -> anyhow::Result<String> {
-        if let Some(hit) = self.zone_cache.lock().unwrap().get(name).cloned() {
-            return Ok(hit);
-        }
-        let url = format!("{}/zones", self.base_url);
-        let resp: CfList<CfZone> = self
+    /// GET `url`, decode the Cloudflare envelope, and surface `success: false`
+    /// as an error carrying Cloudflare's own error text (never the token —
+    /// the token only ever goes out in the `Authorization` header).
+    async fn cf_get<T: DeserializeOwned>(&self, url: String) -> anyhow::Result<T> {
+        let env: CfEnvelope<T> = self
             .http
             .get(url)
             .bearer_auth(&self.token)
@@ -124,8 +160,50 @@ impl CloudflareProvider {
             .error_for_status()?
             .json()
             .await?;
-        let best = resp
-            .result
+        env.into_result()
+    }
+
+    /// POST `body` to `url` and check the envelope the same way `cf_get` does.
+    async fn cf_post<T: DeserializeOwned>(
+        &self,
+        url: String,
+        body: serde_json::Value,
+    ) -> anyhow::Result<T> {
+        let env: CfEnvelope<T> = self
+            .http
+            .post(url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        env.into_result()
+    }
+
+    /// DELETE `url` and check the envelope the same way `cf_get` does.
+    async fn cf_delete(&self, url: String) -> anyhow::Result<()> {
+        let env: CfEnvelope<serde_json::Value> = self
+            .http
+            .delete(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        env.into_result().map(|_| ())
+    }
+
+    /// The zone owning `name`: the longest zone name that is a suffix of it.
+    async fn zone_id(&self, name: &str) -> anyhow::Result<String> {
+        if let Some(hit) = self.zone_cache.lock().unwrap().get(name).cloned() {
+            return Ok(hit);
+        }
+        let url = format!("{}/zones", self.base_url);
+        let zones: Vec<CfZone> = self.cf_get(url).await?;
+        let best = zones
             .into_iter()
             .filter(|z| name == z.name || name.ends_with(&format!(".{}", z.name)))
             .max_by_key(|z| z.name.len())
@@ -148,17 +226,8 @@ impl CloudflareProvider {
             self.base_url,
             urlencoding::encode(name)
         );
-        let resp: CfList<CfRecord> = self
-            .http
-            .get(url)
-            .bearer_auth(&self.token)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(resp
-            .result
+        let records: Vec<CfRecord> = self.cf_get(url).await?;
+        Ok(records
             .into_iter()
             .find(|r| r.content.trim_matches('"') == value)
             .map(|r| r.id))
@@ -172,18 +241,17 @@ impl DnsProvider for CloudflareProvider {
         // Creating a second TXT record at the same name adds a value; it does
         // not replace the first. That is required for wildcard + parent.
         let url = format!("{}/zones/{zone}/dns_records", self.base_url);
-        self.http
-            .post(url)
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "type": "TXT",
-                "name": name,
-                "content": value,
-                "ttl": 60,
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
+        let _created: serde_json::Value = self
+            .cf_post(
+                url,
+                serde_json::json!({
+                    "type": "TXT",
+                    "name": name,
+                    "content": value,
+                    "ttl": 60,
+                }),
+            )
+            .await?;
         Ok(())
     }
 
@@ -193,13 +261,7 @@ impl DnsProvider for CloudflareProvider {
             return Ok(());
         };
         let url = format!("{}/zones/{zone}/dns_records/{id}", self.base_url);
-        self.http
-            .delete(url)
-            .bearer_auth(&self.token)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+        self.cf_delete(url).await
     }
 }
 
@@ -310,5 +372,150 @@ mod tests {
         );
         assert!(reqs[1].2.contains("val1"));
         assert_eq!(reqs[1].0, "POST");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_upsert_appends_rather_than_replaces() {
+        let zones = r#"{"success":true,"result":[{"id":"zone123","name":"example.com"}]}"#;
+        let created = r#"{"success":true,"result":{"id":"rec1"}}"#;
+        let (addr, seen) = mock_server(vec![
+            (200, zones.to_string()),
+            (200, created.to_string()),
+            (200, created.to_string()),
+        ])
+        .await;
+
+        let cf = CloudflareProvider::with_base_url("tok".into(), format!("http://{addr}"));
+        cf.upsert_txt("_acme-challenge.dev.example.com", "one")
+            .await
+            .unwrap();
+        cf.upsert_txt("_acme-challenge.dev.example.com", "two")
+            .await
+            .unwrap();
+
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(
+            reqs.len(),
+            3,
+            "expected one zone lookup then two record creates: {reqs:?}"
+        );
+        let posts: Vec<_> = reqs.iter().filter(|(m, _, _)| m == "POST").collect();
+        assert_eq!(
+            posts.len(),
+            2,
+            "each upsert should issue its own record-creating POST: {reqs:?}"
+        );
+        assert!(
+            reqs.iter()
+                .all(|(m, _, _)| m != "PUT" && m != "PATCH" && m != "DELETE"),
+            "upsert must never PUT/PATCH/DELETE an existing record: {reqs:?}"
+        );
+        assert!(posts[0].2.contains("one"));
+        assert!(posts[1].2.contains("two"));
+    }
+
+    #[tokio::test]
+    async fn cloudflare_delete_removes_only_the_matching_record() {
+        let zones = r#"{"success":true,"result":[{"id":"zone123","name":"example.com"}]}"#;
+        let records = r#"{"success":true,"result":[
+            {"id":"recA","content":"one"},
+            {"id":"recB","content":"two"},
+            {"id":"recC","content":"three"}
+        ]}"#;
+        let deleted = r#"{"success":true,"result":{"id":"recB"}}"#;
+        let (addr, seen) = mock_server(vec![
+            (200, zones.to_string()),
+            (200, records.to_string()),
+            (200, deleted.to_string()),
+        ])
+        .await;
+
+        let cf = CloudflareProvider::with_base_url("tok".into(), format!("http://{addr}"));
+        cf.delete_txt("_acme-challenge.dev.example.com", "two")
+            .await
+            .unwrap();
+
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(
+            reqs.len(),
+            3,
+            "expected zone lookup, record lookup, then delete: {reqs:?}"
+        );
+        assert_eq!(reqs[2].0, "DELETE");
+        assert!(
+            reqs[2].1.ends_with("/dns_records/recB"),
+            "must delete the record matching the requested value, got: {}",
+            reqs[2].1
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudflare_delete_of_a_missing_value_issues_no_delete() {
+        let zones = r#"{"success":true,"result":[{"id":"zone123","name":"example.com"}]}"#;
+        let records = r#"{"success":true,"result":[{"id":"recA","content":"one"}]}"#;
+        let (addr, seen) =
+            mock_server(vec![(200, zones.to_string()), (200, records.to_string())]).await;
+
+        let cf = CloudflareProvider::with_base_url("tok".into(), format!("http://{addr}"));
+        cf.delete_txt("_acme-challenge.dev.example.com", "nope")
+            .await
+            .unwrap();
+
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "a missing value must not trigger any delete request: {reqs:?}"
+        );
+        assert!(reqs.iter().all(|(m, _, _)| m != "DELETE"));
+    }
+
+    #[tokio::test]
+    async fn cloudflare_zone_lookup_picks_the_longest_matching_suffix() {
+        let zones = r#"{"success":true,"result":[
+            {"id":"zoneRoot","name":"example.com"},
+            {"id":"zoneDev","name":"dev.example.com"}
+        ]}"#;
+        let (addr, _seen) = mock_server(vec![(200, zones.to_string())]).await;
+
+        let cf = CloudflareProvider::with_base_url("tok".into(), format!("http://{addr}"));
+        let zone = cf.zone_id("_acme-challenge.dev.example.com").await.unwrap();
+        assert_eq!(zone, "zoneDev");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_zone_lookup_errors_when_no_zone_matches() {
+        let zones = r#"{"success":true,"result":[{"id":"zoneRoot","name":"example.com"}]}"#;
+        let (addr, _seen) = mock_server(vec![(200, zones.to_string())]).await;
+
+        let cf = CloudflareProvider::with_base_url("tok".into(), format!("http://{addr}"));
+        let err = cf.zone_id("_acme-challenge.other.org").await.unwrap_err();
+        assert!(
+            err.to_string().contains("other.org"),
+            "error should name the record it couldn't place: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudflare_upsert_surfaces_api_level_failure_despite_http_200() {
+        let zones = r#"{"success":true,"result":[{"id":"zone123","name":"example.com"}]}"#;
+        let failure = r#"{"success":false,"errors":[{"code":9109,"message":"Invalid TXT record content"}],"result":null}"#;
+        let (addr, _seen) =
+            mock_server(vec![(200, zones.to_string()), (200, failure.to_string())]).await;
+
+        let cf = CloudflareProvider::with_base_url("tok".into(), format!("http://{addr}"));
+        let err = cf
+            .upsert_txt("_acme-challenge.dev.example.com", "val1")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Invalid TXT record content"),
+            "error should surface Cloudflare's own error message: {err}"
+        );
+        assert!(
+            !err.to_string().contains("tok"),
+            "error must not leak the API token: {err}"
+        );
     }
 }
