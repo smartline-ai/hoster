@@ -35,6 +35,7 @@ the HTTP `Host` header, and keeps each branch on its own Docker network.
   - [Upgrading](#upgrading)
   - [Uninstalling](#uninstalling)
   - [Install from source](#install-from-source)
+- [Setting up a host, end to end](#setting-up-a-host-end-to-end)
 - [Configuration](#configuration)
   - [Environment variables](#environment-variables)
   - [The config file and the service](#the-config-file-and-the-service)
@@ -76,9 +77,19 @@ the HTTP `Host` header, and keeps each branch on its own Docker network.
    works (Docker Engine, Podman with the Docker socket). hoster must run **on
    that host**, next to the daemon — it talks to the Docker socket and dials
    container IPs directly.
-2. **Wildcard DNS** pointing at the host (see [Wildcard DNS](#wildcard-dns)).
+2. **A domain you control**, with **wildcard DNS** pointing at the host (see
+   [Wildcard DNS](#wildcard-dns)).
 3. **A container registry** your CI pushes images to and the host can pull from.
 4. **`curl` or `wget`** on the host (the installer uses whichever is present).
+5. **For built-in TLS only: the domain's DNS zone hosted at Cloudflare.**
+   Certificates are issued over the ACME DNS-01 challenge, and **Cloudflare is
+   the only DNS provider implemented** — hoster needs an API token that can
+   write TXT records in the zone. If your DNS lives elsewhere, terminate TLS in
+   front of hoster instead (see
+   [HTTPS with a reverse proxy](#https-with-a-reverse-proxy)).
+
+New host? Follow [Setting up a host, end to end](#setting-up-a-host-end-to-end)
+rather than assembling the reference sections yourself — the order matters.
 
 ---
 
@@ -152,6 +163,252 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 Then run it directly with the environment variables below, or wire up your own
 systemd unit modelled on [`scripts/install.sh`](scripts/install.sh).
+
+---
+
+## Setting up a host, end to end
+
+The reference sections below document each knob on its own. This is the order
+to turn them in, going from a fresh Linux host to branch environments served
+over HTTPS. **The order matters for TLS**: Let's Encrypt counts failed
+validations, and a misconfiguration discovered against production instead of
+staging can lock you out for a week. Prove each layer works before adding the
+next one.
+
+### 1. Check the prerequisites
+
+A Linux host with Docker and systemd, a domain, and — only if you want hoster
+to manage its own certificates — that domain's DNS zone at Cloudflare. See
+[Prerequisites](#prerequisites) for the full list.
+
+### 2. Install hoster
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/smartline-ai/hoster/main/scripts/install.sh | sudo sh
+```
+
+This installs the binary, creates a `hoster` system user in the `docker`
+group, writes `/etc/hoster/hoster.env` (generating a random `HOSTER_TOKEN` if
+you don't pass one), installs `/etc/systemd/system/hoster.service`, and runs
+`systemctl enable --now hoster`. Details in
+[What the installer does](#what-the-installer-does).
+
+Confirm it came up:
+
+```bash
+sudo systemctl status hoster
+curl -s http://127.0.0.1:8081/healthz            # -> ok
+```
+
+### 3. Configure the essentials
+
+Edit `/etc/hoster/hoster.env`. Four settings matter now:
+
+```bash
+HOSTER_TOKEN=paste-a-long-random-secret-here      # the only required variable
+HOSTER_LISTEN=0.0.0.0:80                          # public proxy (installer default)
+HOSTER_API_LISTEN=127.0.0.1:8081                  # control API + dashboard — keep private
+HOSTER_HOSTNAME_TEMPLATE={service}-{branch}.dev.example.com
+HOSTER_DASHBOARD_PASSWORD=another-long-secret     # enables the dashboard
+```
+
+- `HOSTER_TOKEN` is the **one shared token** every CI caller sends. The
+  installer generates one; keep it or replace it with your own long random
+  string.
+- `HOSTER_HOSTNAME_TEMPLATE` must contain `{branch}`, must include a parent
+  domain, and **every placeholder must sit inside the template's first label**.
+  That last rule exists because a TLS wildcard certificate matches exactly one
+  label: `*.dev.example.com` covers `backend-main.dev.example.com` but nothing
+  with a further dot in it. `{service}` is optional, so
+  `{branch}.dev.example.com` is fine for a single-service project. Templates
+  breaking these rules are rejected.
+- `HOSTER_DASHBOARD_PASSWORD` is what enables the dashboard. Leave it unset and
+  the dashboard routes return `503 dashboard not configured` — you will want it
+  on before the TLS step, because that is where the ACME settings live.
+- Ports: keep the control API on `127.0.0.1` or a private interface. See
+  [Ports and binding](#ports-and-binding).
+
+Apply the changes — configuration is read at startup only:
+
+```bash
+sudo systemctl restart hoster
+```
+
+### 4. Point wildcard DNS at the host
+
+One record covers every branch, because every hostname resolves to the same
+IP. For the template above:
+
+```
+*.dev.example.com   A   <the host's public IP>
+```
+
+More in [Wildcard DNS](#wildcard-dns).
+
+### 5. Verify routing over plain HTTP
+
+Do this **before** TLS is in the picture. If routing is broken, you want to
+find out now, not while also debugging certificate issuance.
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8081/deploy \
+  -H "Authorization: Bearer $HOSTER_TOKEN" \
+  -d '{"branch":"demo","tag":"latest","sha":"x","config":{
+        "project":"p","services":{
+          "web":{"image":"nginx:alpine","expose":{"port":80}}}}}'
+
+# from another machine, over real DNS:
+curl -s http://web-demo.dev.example.com/ | head -1
+
+curl -s -X DELETE http://127.0.0.1:8081/deploy/demo -H "Authorization: Bearer $HOSTER_TOKEN"
+```
+
+nginx's welcome page means DNS, the proxy, and Docker networking all work.
+See [Verifying your setup](#verifying-your-setup) for the localhost-only
+variant.
+
+### 6. Turn on TLS
+
+Skip this whole step if you terminate TLS with your own reverse proxy — see
+[HTTPS with a reverse proxy](#https-with-a-reverse-proxy) instead. TLS is
+**entirely opt-in**: with `HOSTER_HTTPS_LISTEN` unset there is no HTTPS
+listener, no renewal loop, and no issuance at all, so upgrading an existing
+install changes nothing.
+
+**6a. Create a Cloudflare API token.** In the Cloudflare dashboard, scope it to
+`Zone:DNS:Edit` on **just the zones hoster serves** — not a global API key.
+This token can rewrite DNS for every zone it covers, so the scope is the whole
+of your blast radius. hoster only ever creates and deletes `_acme-challenge`
+TXT records.
+
+**6b. Enter the ACME settings in the dashboard.** Open `/settings` on the
+control API listener and use the **TLS & DNS** panel:
+
+- **ACME account** — your email, and optionally a *control hostname* (a plain,
+  non-wildcard name such as `hoster.example.com`). hoster issues a certificate
+  for that name and serves the API and dashboard on it over the HTTPS listener.
+- **DNS provider** — `cloudflare` and the token from 6a.
+
+The token is written to `HOSTER_PROJECTS_FILE` under mode `0600` and is
+**never displayed again**; the dashboard and `GET /acme/status` only report
+that a provider is configured. The same fields are available over the
+bearer-token API — see [Built-in TLS](#built-in-tls).
+
+**6c. Set `HOSTER_HTTPS_LISTEN` to a high port first.** Start on `:8443` so
+hoster's HTTPS listener runs *alongside* whatever already owns `:443` rather
+than fighting it for the port:
+
+```bash
+sudoedit /etc/hoster/hoster.env      # HOSTER_HTTPS_LISTEN=0.0.0.0:8443
+sudo systemctl restart hoster
+```
+
+This starts the listener and the renewal loop, which issues a certificate for
+every domain hoster wants one for: the global hostname template, every
+project's domain override, and the control hostname if set.
+
+**6d. Watch the certificate table — and expect a browser warning.** The
+**Certificates** panel on `/settings` lists one row per domain, each with a
+state of `pending`, `valid until <date>`, or `failed: <reason>`. `GET
+/acme/status` returns the same rows as JSON.
+
+**Staging is the default.** Until you set `HOSTER_ACME_PRODUCTION`, hoster
+requests certificates from Let's Encrypt's *staging* environment, and staging
+certificates are deliberately **not trusted by browsers**. When a domain reads
+`valid until …` and your browser still shows a certificate warning, that is
+the flow working, not failing: it proves DNS-01, the Cloudflare token, and the
+renewal loop all function before production's rate limits are at stake.
+
+Confirm the certificate is real, warning notwithstanding:
+
+```bash
+openssl s_client -connect <host>:8443 -servername backend-main.dev.example.com </dev/null \
+  | openssl x509 -noout -text | grep -A1 "Subject Alternative Name"
+```
+
+A renewal pass runs every six hours, which is far too slow to test a token you
+just pasted. Use **Retry now** in the TLS & DNS panel (or `POST /acme/renew`)
+to run a pass immediately and clear the backoff from failures the old
+configuration caused. Requests are rate-limited to **one every 20 minutes**;
+one that arrives sooner is rejected with `429` and the number of seconds to
+wait, rather than silently doing nothing.
+
+Why the caution: Let's Encrypt allows **5 failed validations per identifier
+per hour** and **50 certificates per registered domain per week**. Burn those
+on production while your token scope is wrong and recovery takes hours to a
+week. Staging costs you nothing.
+
+**6e. Switch to production.** Only once every domain you care about reads
+`valid` on staging:
+
+```bash
+sudoedit /etc/hoster/hoster.env      # HOSTER_ACME_PRODUCTION=1
+sudo systemctl restart hoster
+```
+
+Accepted values are `1`, `true`, or `yes`. Watch the table again; this time
+the browser warning should be gone.
+
+**6f. Move to `:443` and retire the old terminator.**
+
+```bash
+sudoedit /etc/hoster/hoster.env      # HOSTER_HTTPS_LISTEN=0.0.0.0:443
+sudo systemctl restart hoster
+sudo systemctl stop nginx && sudo systemctl disable nginx
+```
+
+Binding `:443` as the non-root `hoster` user works because the installed unit
+grants `CAP_NET_BIND_SERVICE`.
+
+Throughout, remember the failure mode: **a domain whose certificate could not
+be obtained keeps serving plain HTTP rather than going dark.** One bad token
+or typoed hostname degrades one domain instead of taking every branch offline
+— but it also means nothing crashes to tell you. The **Certificates** panel on
+`/settings` is where you see it, so check it after changing DNS credentials or
+adding a domain.
+
+### 7. Give a project its own domain (optional)
+
+A project can override the global template so one hoster serves
+`dev.example.com` for one project and `demo.example.com` for another. Set it
+in that project's **Domain** panel at `/p/<project>`, or:
+
+```bash
+curl -fsS -X PUT "$API/projects/myproj/domain" \
+  -H "Authorization: Bearer $HOSTER_TOKEN" \
+  -d '{"hostname_template":"{branch}.demo.example.com"}'
+```
+
+**Each domain needs its own wildcard DNS record** (`*.demo.example.com`) and
+its own certificate. With built-in TLS on, the renewal loop picks the new
+domain up on its next pass — no restart — and a new row appears in the
+certificate table. The same first-label rule applies. Detail in
+[Per-project domains](#per-project-domains).
+
+### 8. Add project environment variables and registry credentials
+
+A real deployment usually needs both, and both are per-project:
+
+- **Environment variables** — API keys and config you don't want in an image or
+  in `hoster.json`. Set them in the **Environment** panel at `/p/<project>` or
+  with `PUT /projects/<project>/vars/<KEY>`. They are injected on every deploy,
+  target specific services or all of them, and **override** the same key in
+  `hoster.json`. See [Project environment & secrets](#project-environment--secrets).
+- **Registry credential** — one per project, used only when the image's
+  registry host matches the stored one. Set it in the **Registry credential**
+  panel or with `PUT /projects/<project>/registry`. See
+  [Private registry credentials](#private-registry-credentials).
+
+The project name must match `project` in that branch's `hoster.json`.
+
+### 9. Deploy from CI
+
+Each branch ships a `hoster.json`; CI builds and pushes the image, then makes
+one `POST /deploy` call with the file's contents. A GitHub Actions example and
+the full field reference are in [Deploying a project](#deploying-a-project).
+
+If something misbehaves at any step, [Troubleshooting](#troubleshooting) lists
+the failure modes by symptom.
 
 ---
 
@@ -261,19 +518,34 @@ Redirect `:80` to `:443` in a separate server block if you want to force HTTPS.
 ### The dashboard
 
 Setting `HOSTER_DASHBOARD_PASSWORD` enables a small server-rendered web
-dashboard, **grouped by project**. Each project card shows its deployments
-(branch, status, URLs, and an expandable **config** view of the `hoster.json`
-each branch was deployed from), its [managed environment](#project-environment--secrets),
-and its [registry credential](#private-registry-credentials).
+dashboard with a navigation rail listing every project. It has three kinds of
+page:
+
+- **Overview** (`/`) — counts of projects, deployments, and running
+  deployments, then **All deployments**: every branch with its status and URLs,
+  each linking to its project page.
+- **Project** (`/p/<project>`) — a **Deployments** panel (branch, status, URLs,
+  and an expandable **config** view of the `hoster.json` each branch was
+  deployed from), plus **Environment**, **Domain**, and **Registry credential**
+  panels.
+- **Settings** (`/settings`) — the **TLS & DNS** panel (ACME account, DNS
+  provider, **Retry now**) and the **Certificates** table.
+
 It is served on the **control API listener** (`HOSTER_API_LISTEN`) at:
 
 - `GET /login`, `POST /login` — password login (sets a session cookie)
-- `GET /` — the project-grouped dashboard
+- `GET /` — the overview
+- `GET /p/<project>` — a project's page
+- `GET /settings` — TLS & DNS and the certificate table
 - `POST /ui/destroy/<branch>` — tear a branch down from the UI
 - `POST /ui/projects/<project>/vars` — add/replace a managed env var
 - `POST /ui/projects/<project>/vars/<key>/delete` — delete one
 - `POST /ui/projects/<project>/registry` — set/replace the registry credential
 - `POST /ui/projects/<project>/registry/delete` — remove it
+- `POST /ui/projects/<project>/domain` — set the project's hostname template
+- `POST /ui/projects/<project>/domain/delete` — revert to the global default
+- `POST /ui/acme/config`, `POST /ui/acme/dns`, `POST /ui/acme/dns/delete`,
+  `POST /ui/acme/renew` — the TLS & DNS forms
 - `POST /logout`
 
 Because it lives on the private API listener, reach it the same way you reach
@@ -408,13 +680,22 @@ Certificates are issued via the ACME **DNS-01** challenge, so they can be
 wildcards — one certificate per domain covers every branch's hostname.
 **Only Cloudflare is supported as a DNS provider today.**
 
+This section is the reference. For the order to do it in on a new host — plain
+HTTP first, then staging on a high port, then production — follow
+[Setting up a host, end to end](#setting-up-a-host-end-to-end).
+
+> **Not yet exercised in production.** hoster's ACME client has not been run
+> against a live Let's Encrypt server. Treat the first issuance on any host as
+> something to watch, start on staging, and check the certificate table before
+> assuming it worked.
+
 **1. Create a Cloudflare API token.** In the Cloudflare dashboard, scope it to
 `Zone:DNS:Edit` on just the zone(s) hoster needs, not a global API key. hoster
 only ever creates and deletes `_acme-challenge` TXT records.
 
 **2. Enter the ACME email, control hostname, and token in the dashboard.**
-Open the dashboard's **TLS & DNS** panel (requires
-[`HOSTER_DASHBOARD_PASSWORD`](#the-dashboard)) and fill in:
+Open `/settings` and use the **TLS & DNS** panel (requires
+[`HOSTER_DASHBOARD_PASSWORD`](#the-dashboard)) to fill in:
 
 - **ACME account** — your email and, optionally, a control hostname (a plain,
   non-wildcard hostname such as `hoster.example.com`). hoster issues a
@@ -463,7 +744,7 @@ HTTP from an HTTPS page.
 
 **Retrying after a configuration change.** A pass runs every six hours, which
 is far too slow to tell you whether the token you just pasted works. The
-certificate table has a **Retry now** button that runs a pass immediately and
+**TLS & DNS** panel has a **Retry now** button that runs a pass immediately and
 clears the backoff accumulated by failures the old configuration caused. The
 same trigger is available for scripting:
 
@@ -471,36 +752,47 @@ same trigger is available for scripting:
 curl -fsS -X POST "$API/acme/renew" -H "Authorization: Bearer $HOSTER_TOKEN"
 ```
 
-Failures *after* a manual retry back off exactly as before — Let's Encrypt's
-rate limits apply no matter who asked for the attempt.
+Manual triggers are limited to **one every 20 minutes**, so a retry loop can't
+spend the rate-limit budget faster than the backoff would. A request that
+lands sooner returns `429` with the seconds remaining; one sent while TLS is
+off returns `503 TLS is not enabled (HOSTER_HTTPS_LISTEN is unset)`. Failures
+*after* a manual retry back off exactly as before — Let's Encrypt's rate
+limits apply no matter who asked for the attempt.
 
-**Staging by default.** Until you set `HOSTER_ACME_PRODUCTION`, hoster
-requests certificates from Let's Encrypt's **staging** environment, whose
-certificates are **not trusted by browsers** — you'll see a certificate
-warning until you switch to production. That's deliberate, not a wart: it
-proves DNS-01, your Cloudflare token, and the renewal loop all work end to
-end before you're spending production's much tighter rate limits (five
-failed authorizations per hour) on a configuration that might still be wrong.
-Once a staging certificate issues cleanly, switch over:
+**Staging by default.** Until you set `HOSTER_ACME_PRODUCTION` (to `1`,
+`true`, or `yes`), hoster requests certificates from Let's Encrypt's
+**staging** environment, whose certificates are **not trusted by browsers** —
+you'll see a certificate warning until you switch to production. That's
+deliberate, not a wart: it proves DNS-01, your Cloudflare token, and the
+renewal loop all work end to end before you're spending production's rate
+limits on a configuration that might still be wrong. Those limits are **5
+failed validations per identifier per hour** and **50 certificates per
+registered domain per week** — an hour's lockout for a bad token, up to a week
+if you also burn the weekly budget reissuing. Once a staging certificate
+issues cleanly, switch over:
 
 ```bash
 sudoedit /etc/hoster/hoster.env      # HOSTER_ACME_PRODUCTION=1
 sudo systemctl restart hoster
 ```
 
-**4. Watch certificates appear in the dashboard's certificate table.** The
-**TLS & DNS** panel lists one row per domain hoster wants a certificate for,
-with a plain-language state: `pending`, `valid until <date>`, or `failed:
-<reason>` (`GET /acme/status` returns the same data as JSON). **A domain
-without a valid certificate keeps serving plain HTTP rather than going
-dark** — that is the deliberate failure mode, so a bad token or a typoed
-hostname degrades one domain instead of taking every branch down. The
-certificate table is where you'll see it, so check it after changing DNS
-credentials or adding a domain.
+**4. Watch certificates appear in the certificate table.** The
+**Certificates** panel on `/settings` lists one row per domain hoster wants a
+certificate for, with a plain-language state: `pending`, `valid until <date>`,
+or `failed: <reason>` (`GET /acme/status` returns the same rows as JSON, each
+with a `severity` of `pending`, `valid`, or `failed`). **A domain without a
+valid certificate keeps serving plain HTTP rather than going dark** — that is
+the deliberate failure mode, so a bad token or a typoed hostname degrades one
+domain instead of taking every branch down. The **Certificates** panel is the
+only place you'll see it, so check it after changing DNS credentials or adding
+a domain.
 
 #### Cutting over from nginx
 
-To move an existing nginx-terminated install to built-in TLS without a gap:
+The same sequence as steps 6c–6f of
+[Setting up a host, end to end](#setting-up-a-host-end-to-end), condensed for
+an install that already serves traffic. To move an existing nginx-terminated
+install to built-in TLS without a gap:
 
 1. Set `HOSTER_HTTPS_LISTEN=0.0.0.0:8443` (or any free port) so hoster runs
    its HTTPS listener *alongside* nginx, which keeps `:443` for now.
@@ -647,7 +939,8 @@ Known and deliberate for this build — plan around them:
   unset and hoster serves plain HTTP, as before. Set it, and hoster
   terminates TLS and manages Let's Encrypt certificates itself — but only
   Cloudflare is supported as a DNS provider, and each domain still needs its
-  own wildcard DNS record and its own certificate. See
+  own wildcard DNS record and its own certificate. Issuance has **not yet been
+  exercised against a live ACME server**, so start on staging. See
   [Built-in TLS](#built-in-tls).
 - **One shared token.** Every CI caller uses the same `HOSTER_TOKEN`. Keep the
   control API off the public internet.
@@ -676,3 +969,10 @@ Known and deliberate for this build — plan around them:
 | Everything 404s from outside the host | `HOSTER_LISTEN` is `127.0.0.1` (localhost only). Bind `0.0.0.0:<port>` and confirm wildcard DNS points at the host. |
 | Deploys fail with a Docker error | Docker not running, or the `hoster` user isn't in the `docker` group: `sudo usermod -aG docker hoster && sudo systemctl restart hoster`. |
 | Dashboard returns `503 dashboard not configured` | `HOSTER_DASHBOARD_PASSWORD` is unset or empty. |
+| Certificate row reads `failed: …` mentioning authentication or a `403` | The Cloudflare token is wrong, revoked, or lacks `Zone:DNS:Edit`. A token scoped read-only, or to the wrong permission group, cannot write the `_acme-challenge` TXT record. Re-create it, save it in **TLS & DNS**, then **Retry now**. |
+| Certificate row reads `failed: no zone found` | The domain's zone isn't in the Cloudflare account the token belongs to, or the token is scoped to other zones only. Confirm the zone is at Cloudflare and included in the token's scope. |
+| `HOSTER_HTTPS_LISTEN` set, listener up, but every row stays `pending` and nothing issues | No DNS credential saved. The **TLS & DNS** panel shows `no token set` and issuance is skipped every pass. Add the ACME account *and* the Cloudflare token. |
+| A row is stuck on `pending` | Issuance hasn't succeeded yet. A scheduled pass runs every six hours and failures back off, so click **Retry now** (at most one every 20 minutes) and check `journalctl -u hoster -f` for the ACME error. |
+| Browser warns the certificate is untrusted, but the row reads `valid until …` | Expected on staging — Let's Encrypt staging certificates are deliberately not browser-trusted. Set `HOSTER_ACME_PRODUCTION=1` and restart once staging issues cleanly. |
+| `POST /acme/renew` returns `503 TLS is not enabled` | `HOSTER_HTTPS_LISTEN` is unset, so no renewal loop is running to trigger. |
+| `POST /acme/renew` returns `429` | A pass was requested less than 20 minutes ago; the response says how many seconds to wait. |
