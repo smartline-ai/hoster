@@ -654,6 +654,9 @@ mod tests {
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
             public_ip: None,
+            proxy_mode: crate::settings::ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         })
     }
 

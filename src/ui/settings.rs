@@ -418,6 +418,7 @@ fn cert_state_parts(row: &CertRow) -> (&'static str, &str, Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::ProxyMode;
 
     fn settings() -> Settings {
         Settings {
@@ -430,6 +431,9 @@ mod tests {
             https_listen: None,
             cert_dir: "/var/lib/hoster/certs".into(),
             public_ip: None,
+            proxy_mode: ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         }
     }
 

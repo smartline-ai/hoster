@@ -12,7 +12,7 @@ use hoster::renewal;
 use hoster::routing::{RoutingTable, SharedRoutes};
 use hoster::secrets::Store;
 use hoster::session::Sessions;
-use hoster::settings::Settings;
+use hoster::settings::{ProxyMode, Settings};
 use hoster::tls::{CertResolver, SharedCerts};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -191,6 +191,9 @@ async fn main() -> anyhow::Result<()> {
         public_ip: std::env::var("HOSTER_PUBLIC_IP")
             .ok()
             .filter(|v| !v.trim().is_empty()),
+        proxy_mode: ProxyMode::parse(&env_or("HOSTER_PROXY_MODE", "standalone"))?,
+        nginx_conf_path: env_or("HOSTER_NGINX_CONF", "/etc/nginx/conf.d/hoster.conf"),
+        nginx_reload_cmd: env_or("HOSTER_NGINX_RELOAD_CMD", "systemctl reload nginx"),
     });
 
     let runtime = Arc::new(DockerRuntime::connect().context("connect to Docker")?);
@@ -351,6 +354,9 @@ mod store_issuer_tests {
             https_listen: None,
             cert_dir: "/tmp".into(),
             public_ip: None,
+            proxy_mode: ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         })
     }
 

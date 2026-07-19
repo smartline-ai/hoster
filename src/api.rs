@@ -1254,6 +1254,7 @@ mod tests {
     use crate::runtime::FakeRuntime;
     use crate::secrets::{DnsProviderConfig, Store};
     use crate::session::Sessions;
+    use crate::settings::ProxyMode;
 
     /// A minimal Cloudflare-shaped `DnsProviderConfig` for tests that only
     /// care about the token.
@@ -1310,6 +1311,9 @@ mod tests {
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
             public_ip: None,
+            proxy_mode: ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         });
         let engine = Engine::with_readiness(
             rt,
@@ -1420,6 +1424,9 @@ mod tests {
             https_listen: None,
             cert_dir: "/tmp/hoster-test-certs".into(),
             public_ip: None,
+            proxy_mode: ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         });
         let engine = Arc::new(
             Engine::with_readiness(

@@ -1,3 +1,27 @@
+/// Which reverse-proxy topology hoster runs in.
+///
+/// `Standalone` is today's behavior: hoster binds `:80`/`:443` and is the edge
+/// proxy. `Nginx` puts nginx in front as the TLS-terminating edge, proxying to
+/// hoster's plain HTTP listener; hoster stops binding `:443` and instead
+/// generates nginx config.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProxyMode {
+    Standalone,
+    Nginx,
+}
+
+impl ProxyMode {
+    pub fn parse(s: &str) -> anyhow::Result<ProxyMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "standalone" => Ok(ProxyMode::Standalone),
+            "nginx" => Ok(ProxyMode::Nginx),
+            other => anyhow::bail!(
+                "unknown HOSTER_PROXY_MODE {other:?}; valid values are \"standalone\" and \"nginx\""
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Settings {
     pub listen: String,
@@ -15,6 +39,13 @@ pub struct Settings {
     /// The box's public IP, published as the wildcard A record's target.
     /// Required once any non-manual DNS provider is configured.
     pub public_ip: Option<String>,
+    /// Reverse-proxy topology. `Standalone` (default) = hoster is the edge.
+    pub proxy_mode: ProxyMode,
+    /// nginx mode only: the config file hoster generates.
+    pub nginx_conf_path: String,
+    /// nginx mode only: the shell command hoster runs to reload nginx after a
+    /// successful `nginx -t`.
+    pub nginx_reload_cmd: String,
 }
 
 impl Settings {
@@ -56,6 +87,9 @@ impl std::fmt::Debug for Settings {
             .field("https_listen", &self.https_listen)
             .field("cert_dir", &self.cert_dir)
             .field("public_ip", &self.public_ip)
+            .field("proxy_mode", &self.proxy_mode)
+            .field("nginx_conf_path", &self.nginx_conf_path)
+            .field("nginx_reload_cmd", &self.nginx_reload_cmd)
             .finish()
     }
 }
@@ -353,6 +387,9 @@ mod tests {
             https_listen: https_listen.map(str::to_string),
             cert_dir: "/tmp/hoster-test-certs".into(),
             public_ip: None,
+            proxy_mode: ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         }
     }
 
@@ -693,6 +730,9 @@ branch_len={branch_len}: label {label:?} has an invalid byte"
             https_listen: None,
             cert_dir: "/tmp".into(),
             public_ip: Some("1.2.3.4".into()),
+            proxy_mode: ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         };
         assert_eq!(s.public_ip.as_deref(), Some("1.2.3.4"));
     }
@@ -709,6 +749,9 @@ branch_len={branch_len}: label {label:?} has an invalid byte"
             https_listen: None,
             cert_dir: "/var/lib/hoster/certs".to_string(),
             public_ip: None,
+            proxy_mode: ProxyMode::Standalone,
+            nginx_conf_path: "/etc/nginx/conf.d/hoster.conf".into(),
+            nginx_reload_cmd: "systemctl reload nginx".into(),
         };
         let dbg = format!("{settings:?}");
         assert!(
@@ -722,6 +765,29 @@ branch_len={branch_len}: label {label:?} has an invalid byte"
         assert!(
             dbg.contains("127.0.0.1:8080"),
             "non-secret fields should still be visible: {dbg}"
+        );
+    }
+
+    #[test]
+    fn proxy_mode_parses_known_values_case_insensitively() {
+        assert_eq!(
+            ProxyMode::parse("standalone").unwrap(),
+            ProxyMode::Standalone
+        );
+        assert_eq!(ProxyMode::parse("nginx").unwrap(), ProxyMode::Nginx);
+        assert_eq!(ProxyMode::parse("NGINX").unwrap(), ProxyMode::Nginx);
+    }
+
+    #[test]
+    fn proxy_mode_rejects_unknown_value_with_a_clear_message() {
+        let err = ProxyMode::parse("caddy").unwrap_err().to_string();
+        assert!(
+            err.contains("caddy"),
+            "message should name the bad value: {err}"
+        );
+        assert!(
+            err.contains("standalone") && err.contains("nginx"),
+            "message should list valid values: {err}"
         );
     }
 }
